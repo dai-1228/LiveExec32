@@ -13,6 +13,8 @@ NSString * const MPMediaItemPropertyComposer = @"composer";
 NSString * const MPMediaItemPropertyGenre = @"genre";
 NSString * const MPMediaItemPropertyTitle = @"title";
 
+NSString * const MPMediaPlaybackIsPreparedToPlayDidChangeNotification =
+    @"MPMediaPlaybackIsPreparedToPlayDidChangeNotification";
 NSString * const MPMoviePlayerContentPreloadDidFinishNotification =
     @"MPMoviePlayerContentPreloadDidFinishNotification";
 NSString * const MPMovieDurationAvailableNotification =

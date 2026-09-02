@@ -201,12 +201,12 @@ GUEST_LIBRARY_PROJECTS := $(abspath ../GuestLibraries/libiconv)
 lc32-guest-libraries:
 	@set -e; \
 	for project in $(GUEST_LIBRARY_PROJECTS); do \
-		$(MAKE) --no-print-directory -C "$$project" all; \
+		THEOS_PROJECT_DIR= $(MAKE) --no-print-directory -C "$$project" all; \
 	done
 lc32-guest-libraries-clean:
 	@set -e; \
 	for project in $(GUEST_LIBRARY_PROJECTS); do \
-		$(MAKE) --no-print-directory -C "$$project" clean; \
+		THEOS_PROJECT_DIR= $(MAKE) --no-print-directory -C "$$project" clean; \
 	done
 
 ifeq ($(THEOS_CURRENT_INSTANCE),)
