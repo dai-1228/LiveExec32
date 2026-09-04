@@ -118,11 +118,50 @@ NSRunLoopMode const UITrackingRunLoopMode = @"UITrackingRunLoopMode";
 static pthread_once_t LC32LegacyAdMobOnce = PTHREAD_ONCE_INIT;
 static pthread_once_t LC32VoiceOverOnce = PTHREAD_ONCE_INIT;
 static uint64_t LC32HostUIAccessibilityIsVoiceOverRunning;
+static pthread_once_t LC32AccessibilityPostOnce = PTHREAD_ONCE_INIT;
+static uint64_t LC32HostUIAccessibilityPostNotification;
 static pthread_once_t LC32GuidedAccessOnce = PTHREAD_ONCE_INIT;
 static uint64_t LC32HostUIAccessibilityIsGuidedAccessEnabled;
 static pthread_once_t LC32LegacyIPadCanvasOnce = PTHREAD_ONCE_INIT;
 static BOOL LC32LegacyIPadCanvasRequired;
 static BOOL LC32LegacyIPadStatusBarHidden;
+static pthread_once_t LC32LegacyUniqueIdentifierOnce = PTHREAD_ONCE_INIT;
+static NSString *LC32LegacyUniqueIdentifierFallback;
+
+static void LC32ResolveLegacyUniqueIdentifierFallback(void) {
+    static NSString *const preferenceKey =
+        @"LC32LegacyUIDeviceUniqueIdentifier";
+    NSString *applicationID = NSBundle.mainBundle.bundleIdentifier;
+    NSString *identifier = nil;
+
+    if(applicationID.length) {
+        CFPropertyListRef stored = CFPreferencesCopyAppValue(
+            (__bridge CFStringRef)preferenceKey,
+            (__bridge CFStringRef)applicationID);
+        id storedObject = CFBridgingRelease(stored);
+        if([storedObject isKindOfClass:NSString.class] &&
+                [storedObject length]) {
+            identifier = storedObject;
+        }
+    }
+
+    if(!identifier.length) {
+        identifier = NSUUID.UUID.UUIDString;
+        if(applicationID.length && identifier.length) {
+            CFPreferencesSetAppValue(
+                (__bridge CFStringRef)preferenceKey,
+                (__bridge CFStringRef)identifier,
+                (__bridge CFStringRef)applicationID);
+            CFPreferencesAppSynchronize(
+                (__bridge CFStringRef)applicationID);
+        }
+    }
+
+    /* NSUUID should not fail, but old callers generally assume this API can
+     * never return nil and often pass UTF8String straight to strcpy. */
+    LC32LegacyUniqueIdentifierFallback = [(identifier.length
+        ? identifier : @"00000000-0000-0000-0000-000000000000") copy];
+}
 
 static void LC32ResolveLegacyIPadCanvas(void) {
     NSDictionary *info = NSBundle.mainBundle.infoDictionary;
@@ -180,6 +219,26 @@ BOOL UIAccessibilityIsVoiceOverRunning(void) {
     if(!LC32HostUIAccessibilityIsVoiceOverRunning) return NO;
     return (BOOL)LC32InvokeHostCRet32(
         LC32HostUIAccessibilityIsVoiceOverRunning);
+}
+
+static void LC32ResolveAccessibilityPostFunction(void) {
+    LC32HostUIAccessibilityPostNotification =
+        LC32Dlsym("LC32_UIKit_UIAccessibilityPostNotification", YES);
+}
+
+void UIAccessibilityPostNotification(
+        UIAccessibilityNotifications notification, id argument) {
+    pthread_once(&LC32AccessibilityPostOnce,
+        LC32ResolveAccessibilityPostFunction);
+    if(!LC32HostUIAccessibilityPostNotification) return;
+    /* The payload is an Objective-C object, so translate its guest proxy
+     * before forwarding instead of exposing the ARM32 pointer to UIKit.
+     * Spell the host pointer as two words: SVC 1002 forwards only r2/r3
+     * directly, then gives the wrapper the guest stack pointer. */
+    const uint64_t hostArgument = [argument host_self];
+    (void)LC32InvokeHostCRet32(LC32HostUIAccessibilityPostNotification,
+        (uint32_t)notification, (uint32_t)hostArgument,
+        (uint32_t)(hostArgument >> 32));
 }
 
 static void LC32ResolveGuidedAccessFunction(void) {
@@ -430,6 +489,11 @@ CGContextRef UIGraphicsGetCurrentContext(void) {
         : NULL;
 }
 
+void UIRectFill(CGRect rect) {
+    CGContextRef context = UIGraphicsGetCurrentContext();
+    if(context) CGContextFillRect(context, rect);
+}
+
 UIImage *UIGraphicsGetImageFromCurrentImageContext(void) {
     pthread_once(&LC32UIKitGeometryOnce,
         LC32UIKitResolveGeometryFunctions);
@@ -589,8 +653,14 @@ compatibleWithTraitCollection:nil];
     /* uniqueIdentifier was removed from UIDevice in iOS 7. Legacy apps call
      * it to fingerprint the install; synthesize one from the modern
      * identifierForVendor (stable per vendor per device), which both
-     * forwarding shims already provide for the guest. */
-    return self.identifierForVendor.UUIDString;
+     * forwarding shims already provide for the guest. Ad-hoc injected apps
+     * can receive nil here, so persist a per-app fallback for those hosts. */
+    NSString *identifier = self.identifierForVendor.UUIDString;
+    if(identifier != nil) return identifier;
+
+    pthread_once(&LC32LegacyUniqueIdentifierOnce,
+        LC32ResolveLegacyUniqueIdentifierFallback);
+    return LC32LegacyUniqueIdentifierFallback;
 }
 
 @end

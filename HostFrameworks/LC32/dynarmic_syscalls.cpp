@@ -911,6 +911,99 @@ guest_mach_msg_trap(u32 guest_msg,
             Mess->Out.msgh_body.msgh_descriptor_count = 1;
             break;
         }
+        case 216: {
+            /*
+             * host_statistics uses the same variable-length CountInOut wire
+             * convention as host_info, but it occupies a separate MIG slot.
+             * Keep the iOS 10 ARM32 layout explicit instead of overlaying the
+             * current host SDK's generated request/reply union.
+             */
+            struct __attribute__((packed, aligned(4)))
+                    HostStatisticsRequest32 {
+                mach_msg_header_t Head;
+                NDR_record_t NDR;
+                host_flavor_t flavor;
+                mach_msg_type_number_t host_info_outCnt;
+            };
+            struct __attribute__((packed, aligned(4)))
+                    HostStatisticsReply32 {
+                mach_msg_header_t Head;
+                NDR_record_t NDR;
+                kern_return_t RetCode;
+                mach_msg_type_number_t host_info_outCnt;
+                integer_t host_info_out[68];
+            };
+            static_assert(sizeof(HostStatisticsRequest32) == 40,
+                "unexpected ARM32 host_statistics request layout");
+            static_assert(offsetof(HostStatisticsReply32, host_info_out) ==
+                    40,
+                "unexpected ARM32 host_statistics reply payload offset");
+            static_assert(sizeof(HostStatisticsReply32) == 312,
+                "unexpected ARM32 host_statistics reply layout");
+
+            const auto writeError = [&](kern_return_t errorCode) {
+                if (rcv_size < sizeof(mig_reply_error_t)) {
+                    host_header->msgh_size = sizeof(mig_reply_error_t);
+                    result = MACH_RCV_TOO_LARGE;
+                    return;
+                }
+                auto *error = reinterpret_cast<mig_reply_error_t *>(
+                    host_header);
+                host_header->msgh_size = sizeof(*error);
+                error->NDR = NDR_record;
+                error->RetCode = errorCode;
+            };
+
+            if (send_size != sizeof(HostStatisticsRequest32)) {
+                writeError(MIG_BAD_ARGUMENTS);
+                break;
+            }
+
+            const auto request =
+                *reinterpret_cast<const HostStatisticsRequest32 *>(
+                    host_header);
+            constexpr mach_msg_type_number_t MaxHostStatisticsCount = 68;
+            if (request.host_info_outCnt > MaxHostStatisticsCount) {
+                writeError(MIG_ARRAY_TOO_LARGE);
+                break;
+            }
+
+            std::array<integer_t, MaxHostStatisticsCount> statistics = {};
+            mach_msg_type_number_t count = request.host_info_outCnt;
+            const kern_return_t kr = host_statistics(
+                request.Head.msgh_request_port, request.flavor,
+                statistics.data(), &count);
+            if (kr != KERN_SUCCESS) {
+                writeError(kr);
+                break;
+            }
+            if (count > MaxHostStatisticsCount ||
+                    count > request.host_info_outCnt) {
+                writeError(MIG_ARRAY_TOO_LARGE);
+                break;
+            }
+
+            const mach_msg_size_t replySize =
+                offsetof(HostStatisticsReply32, host_info_out) +
+                sizeof(statistics[0]) * count;
+            if (rcv_size < replySize) {
+                host_header->msgh_size = replySize;
+                result = MACH_RCV_TOO_LARGE;
+                break;
+            }
+
+            auto *reply = reinterpret_cast<HostStatisticsReply32 *>(
+                host_header);
+            reply->NDR = NDR_record;
+            reply->RetCode = KERN_SUCCESS;
+            reply->host_info_outCnt = count;
+            if (count != 0) {
+                memcpy(reply->host_info_out, statistics.data(),
+                    sizeof(statistics[0]) * count);
+            }
+            host_header->msgh_size = replySize;
+            break;
+        }
         case 217: {
             MACH_MSG_UNION(host_request_notification, Mess);
             host_header->msgh_size = sizeof(Mess->Out);
@@ -1485,6 +1578,100 @@ guest_mach_msg_trap(u32 guest_msg,
             reply->NDR = NDR_record;
             reply->RetCode = KERN_SUCCESS;
             reply->old_stateCnt = stateCount;
+            host_header->msgh_size = replySize;
+            break;
+        }
+        case 3612: { // thread_info
+            /*
+             * iOS 10 thread_info has a 40-byte simple request and a
+             * variable CountInOut reply. Keep that ARM32 MIG layout
+             * explicit: the current SDK's generated structures are a host
+             * implementation detail and synthetic ports must first be
+             * resolved to registered guest-thread metadata.
+             */
+            struct __attribute__((packed, aligned(4)))
+                    ThreadInfoRequest32 {
+                mach_msg_header_t Head;
+                NDR_record_t NDR;
+                thread_flavor_t flavor;
+                mach_msg_type_number_t thread_info_outCnt;
+            };
+            struct __attribute__((packed, aligned(4)))
+                    ThreadInfoReply32 {
+                mach_msg_header_t Head;
+                NDR_record_t NDR;
+                kern_return_t RetCode;
+                mach_msg_type_number_t thread_info_outCnt;
+                integer_t thread_info_out[THREAD_INFO_MAX];
+            };
+            static_assert(sizeof(ThreadInfoRequest32) == 40,
+                "unexpected ARM32 thread_info request layout");
+            static_assert(offsetof(
+                    ThreadInfoReply32, thread_info_out) == 40,
+                "unexpected ARM32 thread_info reply payload offset");
+            static_assert(sizeof(ThreadInfoReply32) == 168,
+                "unexpected ARM32 thread_info reply layout");
+
+            const auto writeError = [&](kern_return_t errorCode) {
+                if (rcv_size < sizeof(mig_reply_error_t)) {
+                    host_header->msgh_size = sizeof(mig_reply_error_t);
+                    result = MACH_RCV_TOO_LARGE;
+                    return;
+                }
+                auto *error = reinterpret_cast<mig_reply_error_t *>(
+                    host_header);
+                host_header->msgh_size = sizeof(*error);
+                error->NDR = NDR_record;
+                error->RetCode = errorCode;
+            };
+
+            if (send_size != sizeof(ThreadInfoRequest32)) {
+                writeError(MIG_BAD_ARGUMENTS);
+                break;
+            }
+
+            const auto request =
+                *reinterpret_cast<const ThreadInfoRequest32 *>(
+                    host_header);
+            if (request.thread_info_outCnt > THREAD_INFO_MAX) {
+                writeError(MIG_ARRAY_TOO_LARGE);
+                break;
+            }
+
+            std::array<integer_t, THREAD_INFO_MAX> info = {};
+            mach_msg_type_number_t count =
+                request.thread_info_outCnt;
+            const kern_return_t kr = CopyGuestThreadInfo(
+                request.Head.msgh_request_port, request.flavor,
+                request.thread_info_outCnt, info.data(), &count);
+            if (kr != KERN_SUCCESS) {
+                writeError(kr);
+                break;
+            }
+            if (count > THREAD_INFO_MAX ||
+                    count > request.thread_info_outCnt) {
+                writeError(MIG_ARRAY_TOO_LARGE);
+                break;
+            }
+
+            const mach_msg_size_t replySize =
+                offsetof(ThreadInfoReply32, thread_info_out) +
+                sizeof(info[0]) * count;
+            if (rcv_size < replySize) {
+                host_header->msgh_size = replySize;
+                result = MACH_RCV_TOO_LARGE;
+                break;
+            }
+
+            auto *reply = reinterpret_cast<ThreadInfoReply32 *>(
+                host_header);
+            reply->NDR = NDR_record;
+            reply->RetCode = KERN_SUCCESS;
+            reply->thread_info_outCnt = count;
+            if (count != 0) {
+                memcpy(reply->thread_info_out, info.data(),
+                    sizeof(info[0]) * count);
+            }
             host_header->msgh_size = replySize;
             break;
         }
@@ -4051,9 +4238,8 @@ int guest_fcntl(int fildes, int cmd, u32 guest_r2) {
                 return_with_carry_direct(EINTR, true));
         case F_ADDFILESIGS_RETURN:
         {
-            /* fsignatures_t contains native-sized pointer and size fields.
-             * Decode dyld's 32-bit ABI explicitly; fs_blob_start is a file
-             * offset for F_ADDFILESIGS_RETURN, not a guest pointer. */
+            /* Decode dyld's 32-bit ABI so an incomplete guest structure is
+             * rejected even though its signature inputs are not forwarded. */
             struct GuestFSignatures {
                 int64_t fileStart;
                 u32 blobStart;
@@ -4067,68 +4253,35 @@ int guest_fcntl(int fildes, int cmd, u32 guest_r2) {
                 return return_with_carry_direct(EFAULT, true);
             }
 
-            fsignatures_t hostSignatures = {};
-            hostSignatures.fs_file_start = guestSignatures.fileStart;
-            hostSignatures.fs_blob_start =
-                reinterpret_cast<void *>(
-                    static_cast<uintptr_t>(
-                        guestSignatures.blobStart));
-            hostSignatures.fs_blob_size = guestSignatures.blobSize;
-            /* Use the public entry point here rather than a raw syscall.
-             * Jailbreaks interpose fcntl to trust and, on TXM systems,
-             * normalize the signature before asking XNU to attach it. */
-            errno = 0;
-            const int result = fcntl(
-                fildes, cmd, &hostSignatures);
-            const int savedErrno = errno;
+            /* Guest images are translated by Dynarmic and are never mapped
+             * executable by the host, so attaching their signatures to the
+             * native process has no benefit. It can also associate another
+             * platform-main-binary signature with the host pmap and panic the
+             * kernel when its address-space layout differs. The one signature
+             * registration needed by FairPlay is performed separately for the
+             * main ARM32 image in LC32MapFile before mremap_encrypted.
+             *
+             * dyld still expects successful F_ADDFILESIGS_RETURN coverage.
+             * Validate the descriptor, report the entire file as covered, and
+             * leave the host kernel untouched. The returned off_t is the first
+             * field in both the 32-bit and native fsignatures_t layouts. */
             struct stat fileStatus = {};
-            const bool hostRegistrationComplete =
-                result == 0 && fstat(fildes, &fileStatus) == 0 &&
-                hostSignatures.fs_file_start >=
-                    fileStatus.st_size;
-            if(!hostRegistrationComplete) {
-                /*
-                 * Guest code is never executed on the host CPU: Dynarmic
-                 * translates it, and Dynarmic_mmap deliberately strips
-                 * host PROT_EXEC, so the kernel never enforces a code
-                 * signature on guest-mapped images. Only LC32MapFile
-                 * mappings (the FairPlay main executable) need a genuine
-                 * host-side registration, and those are registered there
-                 * directly rather than through this guest syscall.
-                 *
-                 * The guest dyld nevertheless halts with "code signature
-                 * invalid" as soon as this fcntl fails or reports a
-                 * signature that does not cover the whole image, which
-                 * rejects the locally built shim frameworks whose ad-hoc
-                 * signatures the host kernel or interposition refuses to
-                 * attach. Report full-file coverage to the guest instead
-                 * so dyld proceeds with mapping the emulated image.
-                 */
-                if(fstat(fildes, &fileStatus) == -1) {
-                    const int statErrno = errno;
-                    return return_with_carry_direct(
-                        statErrno == 0 ? EIO : statErrno, true);
-                }
-                if(result == -1) {
-                    printf("LC32: host rejected code signature "
-                        "registration for fd %d (%s); reporting "
-                        "full coverage to guest\n",
-                        fildes, strerror(savedErrno));
-                }
-                guestSignatures.fileStart = fileStatus.st_size;
-            } else {
-                guestSignatures.fileStart =
-                    hostSignatures.fs_file_start;
+            if(fstat(fildes, &fileStatus) == -1) {
+                const int savedErrno = errno;
+                return return_with_carry_direct(
+                    savedErrno == 0 ? EIO : savedErrno, true);
             }
-            /* XNU exposes only the returned coverage through the off_t
-             * field; the pointer and size remain input-only. */
+            if(fileStatus.st_size < 0) {
+                return return_with_carry_direct(EIO, true);
+            }
+
+            guestSignatures.fileStart = fileStatus.st_size;
             if(!write_guest_memory_with_permissions(
                     guest_r2, &guestSignatures.fileStart,
                     sizeof(guestSignatures.fileStart), PROT_WRITE)) {
                 return return_with_carry_direct(EFAULT, true);
             }
-            return return_with_carry_direct(
-                hostRegistrationComplete ? result : 0, false);
+            return return_with_carry_direct(0, false);
         }
         case F_CHECK_LV:
             return 0;
