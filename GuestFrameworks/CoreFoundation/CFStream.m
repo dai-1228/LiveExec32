@@ -7,6 +7,15 @@ enum {
     LC32CFStreamMaximumTransferLength = 64 * 1024 * 1024,
 };
 
+CFReadStreamRef CFReadStreamCreateWithFile(CFAllocatorRef allocator,
+        CFURLRef fileURL) {
+    (void)allocator;
+    if(!fileURL) return NULL;
+    return (CFReadStreamRef)LC32_CF_CALL(
+        LC32CoreFoundationOpReadStreamCreateWithFile,
+        LC32_CF_HOST(fileURL));
+}
+
 Boolean CFReadStreamOpen(CFReadStreamRef stream) {
     return stream && LC32_CF_CALL(
         LC32CoreFoundationOpReadStreamOpen, LC32_CF_HOST(stream));

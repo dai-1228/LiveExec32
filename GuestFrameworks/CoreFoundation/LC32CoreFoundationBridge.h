@@ -105,6 +105,7 @@ typedef enum : uint32_t {
     LC32CoreFoundationOpURLCreateFromFileSystemRepresentationRelativeToBase = 79,
     LC32CoreFoundationOpBundlePreflightExecutable = 80,
     LC32CoreFoundationOpBundleLoadExecutableAndReturnError = 81,
+    LC32CoreFoundationOpURLCreatePropertyFromResource = 82,
 
     /* String operations use an isolated range so parallel bridge work can
      * add lower-valued opcode families without changing this guest ABI. */
@@ -212,6 +213,7 @@ typedef enum : uint32_t {
     LC32CoreFoundationOpWriteStreamGetError = 522,
     LC32CoreFoundationOpWriteStreamSetClient = 523,
     LC32CoreFoundationOpStreamCreatePairWithSocket = 524,
+    LC32CoreFoundationOpReadStreamCreateWithFile = 525,
 
     /* Non-callback CFRunLoop operations used by legacy YouTube.  The timer
      * and source creators live in a separate callback-aware bridge. */
@@ -231,6 +233,8 @@ typedef enum : uint32_t {
     LC32CoreFoundationOpRunLoopTimerCreate = 613,
     LC32CoreFoundationOpRunLoopSourceCreate = 614,
     LC32CoreFoundationOpRunLoopAddCommonMode = 615,
+    LC32CoreFoundationOpRunLoopContainsTimer = 616,
+    LC32CoreFoundationOpRunLoopTimerIsValid = 617,
 
     /* Callback-aware socket operations used by legacy YouTube. */
     LC32CoreFoundationOpSocketCreate = 700,

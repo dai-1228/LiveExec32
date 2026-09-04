@@ -66,6 +66,13 @@ void CFRunLoopRemoveTimer(CFRunLoopRef runLoop, CFRunLoopTimerRef timer,
         LC32_CF_HOST(runLoop), LC32_CF_HOST(timer), LC32_CF_HOST(mode));
 }
 
+Boolean CFRunLoopContainsTimer(CFRunLoopRef runLoop, CFRunLoopTimerRef timer,
+        CFRunLoopMode mode) {
+    if(!runLoop || !timer || !mode) return false;
+    return LC32_CF_CALL(LC32CoreFoundationOpRunLoopContainsTimer,
+        LC32_CF_HOST(runLoop), LC32_CF_HOST(timer), LC32_CF_HOST(mode)) != 0;
+}
+
 void CFRunLoopRun(void) {
     LC32_CF_CALL0(LC32CoreFoundationOpRunLoopRun);
 }
@@ -131,6 +138,12 @@ void CFRunLoopTimerInvalidate(CFRunLoopTimerRef timer) {
     if(!timer) return;
     LC32_CF_CALL(LC32CoreFoundationOpRunLoopTimerInvalidate,
         LC32_CF_HOST(timer));
+}
+
+Boolean CFRunLoopTimerIsValid(CFRunLoopTimerRef timer) {
+    if(!timer) return false;
+    return LC32_CF_CALL(LC32CoreFoundationOpRunLoopTimerIsValid,
+        LC32_CF_HOST(timer)) != 0;
 }
 
 CFRunLoopTimerRef CFRunLoopTimerCreate(

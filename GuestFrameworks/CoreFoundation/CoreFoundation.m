@@ -336,6 +336,19 @@ Boolean CFURLSetResourcePropertyForKey(
         LC32_CF_HOST(propertyValue), LC32_CF_U32((uintptr_t)error));
 }
 
+CFTypeRef CFURLCreatePropertyFromResource(CFAllocatorRef allocator,
+        CFURLRef url, CFStringRef property, SInt32 *errorCode) {
+    (void)allocator;
+    if(!url || !property) {
+        if(errorCode) *errorCode = -15;
+        return NULL;
+    }
+    return (CFTypeRef)LC32_CF_CALL(
+        LC32CoreFoundationOpURLCreatePropertyFromResource,
+        LC32_CF_HOST(url), LC32_CF_HOST(property),
+        LC32_CF_U32((uintptr_t)errorCode));
+}
+
 void CFRelease(CFTypeRef ref) {
     [(id)ref release];
 }

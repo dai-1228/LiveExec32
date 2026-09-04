@@ -1936,6 +1936,25 @@ u32 LC32_CoreFoundation_Dispatch(u32 opcodeValue, u32 guestCall, u32) {
                     kCFAllocatorDefault, pathBytes, pathLength,
                     SlotU32(call, 2) != 0, baseURL));
         }
+        case LC32CoreFoundationOpURLCreatePropertyFromResource: {
+            if(!RequireSlots(call, 3)) return 0;
+            CFURLRef url = SlotHostObject<CFURLRef>(call, 0);
+            CFStringRef property = SlotHostObject<CFStringRef>(call, 1);
+            const u32 guestError = SlotU32(call, 2);
+            if(!url || !property ||
+                (guestError && !GuestRangeIsValid(guestError, sizeof(int32_t)))) {
+                return 0;
+            }
+            SInt32 localError = 0;
+            CFTypeRef result = CFURLCreatePropertyFromResource(
+                kCFAllocatorDefault, url, property,
+                guestError ? &localError : nullptr);
+            if(guestError && !WriteGuestValue(guestError, localError)) {
+                if(result) CFRelease(result);
+                return 0;
+            }
+            return GuestForCreatedObject(result);
+        }
         case LC32CoreFoundationOpBundlePreflightExecutable:
         case LC32CoreFoundationOpBundleLoadExecutableAndReturnError: {
             if(!RequireSlots(call, 2)) return 0;
@@ -2096,6 +2115,17 @@ u32 LC32_CoreFoundation_Dispatch(u32 opcodeValue, u32 guestCall, u32) {
             CFRunLoopRemoveTimer(runLoop, timer, mode);
             return 1;
         }
+        case LC32CoreFoundationOpRunLoopContainsTimer: {
+            if(!RequireSlots(call, 3)) return 0;
+            CFRunLoopRef runLoop =
+                SlotHostObject<CFRunLoopRef>(call, 0);
+            CFRunLoopTimerRef timer =
+                SlotHostObject<CFRunLoopTimerRef>(call, 1);
+            CFRunLoopMode mode =
+                SlotHostObject<CFRunLoopMode>(call, 2);
+            if(!runLoop || !timer || !mode) return 0;
+            return CFRunLoopContainsTimer(runLoop, timer, mode) ? 1 : 0;
+        }
         case LC32CoreFoundationOpRunLoopRun:
             if(!RequireSlots(call, 0)) return 0;
             CFRunLoopRun();
@@ -2186,6 +2216,13 @@ u32 LC32_CoreFoundation_Dispatch(u32 opcodeValue, u32 guestCall, u32) {
             if(!timer) return 0;
             CFRunLoopTimerInvalidate(timer);
             return 1;
+        }
+        case LC32CoreFoundationOpRunLoopTimerIsValid: {
+            if(!RequireSlots(call, 1)) return 0;
+            CFRunLoopTimerRef timer =
+                SlotHostObject<CFRunLoopTimerRef>(call, 0);
+            if(!timer) return 0;
+            return CFRunLoopTimerIsValid(timer) ? 1 : 0;
         }
         case LC32CoreFoundationOpRunLoopTimerCreate: {
             if(!RequireSlots(call, 8)) return 0;
@@ -3171,6 +3208,13 @@ u32 LC32_CoreFoundation_Dispatch(u32 opcodeValue, u32 guestCall, u32) {
             }
             return WriteGuestCreatedObject(
                 guestWriteStream, writeStream);
+        }
+        case LC32CoreFoundationOpReadStreamCreateWithFile: {
+            if(!RequireSlots(call, 1)) return 0;
+            CFURLRef url = SlotHostObject<CFURLRef>(call, 0);
+            if(!url) return 0;
+            return GuestForCreatedObject(
+                CFReadStreamCreateWithFile(kCFAllocatorDefault, url));
         }
         case LC32CoreFoundationOpGetTypeID: {
             if(!RequireSlots(call, 1)) return 0;
