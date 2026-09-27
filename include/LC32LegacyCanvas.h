@@ -2,7 +2,9 @@
 #define LC32_LEGACY_CANVAS_H
 
 #import <Foundation/Foundation.h>
+#import <CoreGraphics/CoreGraphics.h>
 
+#include <math.h>
 #include <stdint.h>
 
 typedef enum {
@@ -301,6 +303,55 @@ static inline BOOL LC32BundleMayRetainLegacyLandscapePhoneCanvas(
     return LC32BundleContainsTallPhoneLaunchArt(bundle, info) &&
         LC32BundleUsesLandscapeOnlyPhonePolicy(bundle) &&
         LC32BundleDeclaresStableLandscapeSide(bundle);
+}
+
+/* A pre-iOS-4 phone bundle has no orientation-policy vocabulary: such an
+ * application declares its interface orientation at runtime through the
+ * status-bar API instead, exactly like the documented iPhoneOS 2.x
+ * contract, and is therefore a fixed 320x480-screen application.  This is
+ * the runtime-declared sibling of LC32BundleUsesFixedLandscapePhoneCanvas:
+ * there is no plist orientation policy to read, so the caller supplies the
+ * bundle's device families, whether either orientation-policy key exists,
+ * and the raw UIInterfaceOrientation value of the recorded runtime request
+ * (3 == UIInterfaceOrientationLandscapeRight, 4 == UIInterfaceOrientationLeft).
+ * sdkVersion is the executable's own SDK; a binary without a version marker
+ * records zero and still qualifies, while SDK-8+ executables never do,
+ * even when the effective process SDK is older.  Bundles declaring either
+ * orientation key keep their existing classified behavior. */
+static inline BOOL LC32UsesRuntimeLandscapePhoneCanvas(
+        uint32_t sdkVersion, BOOL supportsPhone, BOOL supportsPad,
+        BOOL declaresOrientationPolicyKeys,
+        NSInteger requestedInterfaceOrientation) {
+    if(sdkVersion >= 0x00080000) return NO;
+    if(!supportsPhone || supportsPad) return NO;
+    if(declaresOrientationPolicyKeys) return NO;
+    return requestedInterfaceOrientation == 3 ||
+           requestedInterfaceOrientation == 4;
+}
+
+/* Compose the presentation transform of a canonical phone canvas inside a
+ * viewport rect that is already expressed in the canvas' own coordinate
+ * space (the window-content space that hosts the canvas at its origin).
+ * The result maps the canvas rect (0, 0, canvasWidth, canvasHeight) to the
+ * largest uniformly scaled, centered rect that fits inside the viewport:
+ * the canvas' long edge pairs with the viewport's long edge through the
+ * coordinate conversion, so every device aspect gets the aspect-correct
+ * 3:2 letterbox (MIN scale, never a stretch).  Degenerate or non-finite
+ * viewports return the identity transform; callers gate on that. */
+static inline CGAffineTransform LC32PhoneCanvasFitTransform(
+        CGRect viewport, CGFloat canvasWidth, CGFloat canvasHeight) {
+    if(!(viewport.size.width > 0) || !(viewport.size.height > 0) ||
+            !(canvasWidth > 0) || !(canvasHeight > 0) ||
+            !isfinite(viewport.size.width) ||
+            !isfinite(viewport.size.height)) {
+        return CGAffineTransformIdentity;
+    }
+    const CGFloat scale = MIN(viewport.size.width / canvasWidth,
+                              viewport.size.height / canvasHeight);
+    if(!(scale > 0) || !isfinite(scale)) return CGAffineTransformIdentity;
+    return CGAffineTransformMake(scale, 0, 0, scale,
+        CGRectGetMidX(viewport) - scale * canvasWidth * 0.5,
+        CGRectGetMidY(viewport) - scale * canvasHeight * 0.5);
 }
 
 #endif
