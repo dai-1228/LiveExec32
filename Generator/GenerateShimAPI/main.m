@@ -17,6 +17,10 @@ typedef NS_ENUM(NSUInteger, LC32KnownStruct) {
     LC32KnownStructCGSize,
     LC32KnownStructNSRange,
     LC32KnownStructUIEdgeInsets,
+    /* CMTime loses its typedef name in runtime encodings and appears as the
+     * anonymous aggregate {?=qiIq}.  Every field is fixed-width, so the
+     * guest and host layouts match and the bridge copies it verbatim. */
+    LC32KnownStructCMTime,
 };
 
 static const char *LC32UnqualifiedEncoding(const char *encoding) {
@@ -76,6 +80,12 @@ static LC32KnownStruct LC32KnownStructForEncoding(const char *encoding) {
     }
     if(!strncmp(encoding, "{UIEdgeInsets=", sizeof("{UIEdgeInsets=") - 1)) {
         return LC32KnownStructUIEdgeInsets;
+    }
+    /* The CoreMedia time value is the only fixed-width anonymous aggregate
+     * in the supported API surface; match its exact encoding so CMTime
+     * methods emit the aggregate transports instead of remaining disabled. */
+    if(!strncmp(encoding, "{?=qiIq}", sizeof("{?=qiIq}") - 1)) {
+        return LC32KnownStructCMTime;
     }
     return LC32KnownStructNone;
 }
@@ -1235,6 +1245,7 @@ static BOOL LC32MethodHasIndirectObjectBuffer(NSString *className,
     [string appendFormat:@"#endif\n"];
     [string appendFormat:@"#import <LC32/LC32.h>\n"];
     [string appendFormat:@"#import <CoreGraphics/CoreGraphics+LC32.h>\n"];
+    [string appendFormat:@"#import <CoreMedia/CMTime+LC32.h>\n"];
     [string appendFormat:@"#import <UIKit/UIKit+LC32.h>\n"];
     [string appendString:
         @"// Proxy methods intentionally forward across an ABI boundary; "

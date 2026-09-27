@@ -413,6 +413,12 @@ NSString *LC32ReadableTypeForEncoding(const char *encoding) {
         case ':': return @"SEL";
         case '?': return @"?";
         case '{': {
+            /* CMTime appears as the anonymous fixed-width aggregate
+             * {?=qiIq}; name it so generated signatures use the real
+             * typedef and the aggregate transports can find its helpers. */
+            if(!strncmp(encoding, "{?=qiIq}", sizeof("{?=qiIq}") - 1)) {
+                return @"CMTime";
+            }
             const char *nameStart = encoding + 1;
             const char *equals = strchr(nameStart, '=');
             if(!equals) return @(encoding);
