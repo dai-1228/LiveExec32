@@ -2077,6 +2077,20 @@ void LC32FitNativeLegacyCanvasWindow(UIWindow *window) {
         return;
     }
 
+    /* Core Animation applies sublayerTransform relative to the layer's
+     * anchor point, not the bounds origin (Core Animation Programming
+     * Guide: "applies the parent layer's sublayerTransform to each
+     * sublayer relative to the parent layer's anchor point"). The intended
+     * origin-based mapping p -> scale*p + t must therefore be delivered as
+     * scale*p + (t - (scale-1)*anchor); without the compensation the fit
+     * lands offset by (1-scale)*anchor, which presents as the canvas pinned
+     * into a corner of the rotated scene. */
+    const CGPoint layerAnchor = {
+        windowLayer.bounds.origin.x +
+            windowLayer.anchorPoint.x * windowLayer.bounds.size.width,
+        windowLayer.bounds.origin.y +
+            windowLayer.anchorPoint.y * windowLayer.bounds.size.height,
+    };
     const CGFloat contentWidth = contentRect.size.width;
     const CGFloat contentHeight = contentRect.size.height;
     const CGFloat scale = MIN(viewport.size.width / contentWidth,
@@ -2084,8 +2098,10 @@ void LC32FitNativeLegacyCanvasWindow(UIWindow *window) {
     const CGAffineTransform target = (!(scale > 0) || !isfinite(scale))
         ? CGAffineTransformIdentity
         : CGAffineTransformMake(scale, 0, 0, scale,
-              CGRectGetMidX(viewport) - scale * CGRectGetMidX(contentRect),
-              CGRectGetMidY(viewport) - scale * CGRectGetMidY(contentRect));
+              CGRectGetMidX(viewport) - scale * CGRectGetMidX(contentRect) -
+                  (1 - scale) * layerAnchor.x,
+              CGRectGetMidY(viewport) - scale * CGRectGetMidY(contentRect) -
+                  (1 - scale) * layerAnchor.y);
     if(!(scale > 0) || !isfinite(scale) || !isfinite(target.tx) ||
             !isfinite(target.ty)) {
         if(!CATransform3DEqualToTransform(

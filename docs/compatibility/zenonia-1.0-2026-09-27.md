@@ -391,6 +391,12 @@ message "Present the native legacy canvas measured to the live viewport":
   the viewport, per pass, self-correcting on every rotation or viewport
   event.
 
-Status: correction committed and CI-verified; awaiting the next device
-retest. Full analysis: `/tmp/opencode/wave5-canvas-centering-fix.md`
-(session-local).
+A second device run after that correction showed the canvas scaled up but
+still pinned bottom-left. Root cause per Apple's Core Animation
+Programming Guide: CoreAnimation applies `sublayerTransform` **relative to
+the layer's anchor point**, not the bounds origin, so the origin-based
+translation was offset by exactly `(1-scale)*anchor` — the anchor
+compensation is now included (same math the canvas-mode direct compositor
+already used). Status: committed and CI-verified; awaiting the next
+device retest. Full analysis:
+`/tmp/opencode/wave5-canvas-centering-fix.md` (session-local).
