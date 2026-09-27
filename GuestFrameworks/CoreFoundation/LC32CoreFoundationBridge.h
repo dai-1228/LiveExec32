@@ -258,7 +258,6 @@ typedef enum : uint32_t {
     LC32CoreFoundationOpWriteStreamSetClient = 523,
     LC32CoreFoundationOpStreamCreatePairWithSocket = 524,
     LC32CoreFoundationOpStreamCreatePairWithSocketToHost = 525,
-    LC32CoreFoundationOpReadStreamCreateWithFile = 526,
 
     /* Non-callback CFRunLoop operations used by legacy YouTube.  The timer
      * and source creators live in a separate callback-aware bridge. */
