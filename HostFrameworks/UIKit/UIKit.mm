@@ -86,7 +86,9 @@ typedef NS_ENUM(NSUInteger, LC32LegacyIPadGeometryMode) {
     CATransform3D appliedSublayerTransform;
     CGColorRef originalBackground;
     CGColorRef appliedBackground;
+    CGRect originalWindowFrame;
     BOOL hasTransform;
+    BOOL hasWindowFrame;
     BOOL yielded;
 }
 @end
@@ -142,6 +144,8 @@ const void *LC32NativeCanvasFitPendingKey =
     &LC32NativeCanvasFitPendingKey;
 const void *LC32NativeCanvasFitStateKey =
     &LC32NativeCanvasFitStateKey;
+const void *LC32NativeCanvasFitAutoresizingKey =
+    &LC32NativeCanvasFitAutoresizingKey;
 
 struct LC32GuestUIKitPolicy {
     UIInterfaceOrientationMask declaredOrientations;
@@ -1842,6 +1846,59 @@ bool LC32NativeLegacyCanvasWindowEligible(UIWindow *window) {
         !LC32NativeWindowRootViewController(window);
 }
 
+void LC32FreezeNativeLegacyCanvasSubviews(UIWindow *window) {
+    /* The canvas fit grows the window to the live presentation viewport; the
+     * 320x480 canvas subviews must keep their authored geometry through that
+     * resize. Freeze every direct guest subview's autoresizing mask, with the
+     * same ownership semantics as the canvas-mode rootless renderer: a guest
+     * that later claims its own mask (anything other than None) wins and is
+     * never frozen again. */
+    NSMapTable<UIView *, LC32LegacyRendererAutoresizingState *> *saved =
+        objc_getAssociatedObject(
+            window, LC32NativeCanvasFitAutoresizingKey);
+    if(!saved) {
+        /* Weak pointer-identity keys neither extend a removed subview's
+         * lifetime nor call guest -hash/-isEqual: implementations. */
+        saved = [NSMapTable
+            mapTableWithKeyOptions:NSPointerFunctionsWeakMemory |
+                NSPointerFunctionsObjectPointerPersonality
+            valueOptions:NSPointerFunctionsStrongMemory];
+        objc_setAssociatedObject(window, LC32NativeCanvasFitAutoresizingKey,
+            saved, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    for(UIView *view in LC32NativeViewSubviews(window)) {
+        if(!view.guest_selfOrNull || [saved objectForKey:view]) continue;
+        LC32LegacyRendererAutoresizingState *state =
+            [LC32LegacyRendererAutoresizingState new];
+        state.originalMask = LC32NativeViewAutoresizingMask(view);
+        [saved setObject:state forKey:view];
+        [state release];
+        if(LC32NativeViewAutoresizingMask(view) != UIViewAutoresizingNone) {
+            LC32NativeSetViewAutoresizingMask(view, UIViewAutoresizingNone);
+        }
+    }
+}
+
+void LC32RestoreNativeLegacyCanvasSubviews(UIWindow *window) {
+    NSMapTable<UIView *, LC32LegacyRendererAutoresizingState *> *saved =
+        objc_getAssociatedObject(
+            window, LC32NativeCanvasFitAutoresizingKey);
+    for(UIView *view in saved.keyEnumerator) {
+        LC32LegacyRendererAutoresizingState *state = [saved objectForKey:view];
+        if(state.yielded) continue;
+        const UIViewAutoresizing currentMask =
+            LC32NativeViewAutoresizingMask(view);
+        if(currentMask != UIViewAutoresizingNone) {
+            /* A later guest setting took ownership. */
+            state.yielded = YES;
+        } else {
+            LC32NativeSetViewAutoresizingMask(view, state.originalMask);
+        }
+    }
+    objc_setAssociatedObject(window, LC32NativeCanvasFitAutoresizingKey,
+        nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
 void LC32FitNativeLegacyCanvasWindow(UIWindow *window) {
     /* Present the canonical 320x480 canvas of the runtime-declared class
      * rotated by the existing native-mode backing (which already yields the
@@ -1862,7 +1919,17 @@ void LC32FitNativeLegacyCanvasWindow(UIWindow *window) {
         /* The recorded request defines the class; a later non-landscape
          * request must not leave a stale fit behind. Restore only the pieces
          * still ours, mirroring the rootless placement reconciliation. */
-        if(!state || !state->hasTransform) return;
+        if(!state) return;
+        if(!state->hasTransform) {
+            /* The fill transform never engaged; the window growth may still
+             * be ours to undo. */
+            if(state->hasWindowFrame) {
+                LC32RestoreNativeLegacyCanvasSubviews(window);
+                LC32NativeSetWindowFrame(window, state->originalWindowFrame);
+                state->hasWindowFrame = NO;
+            }
+            return;
+        }
         if(!CATransform3DEqualToTransform(
                 windowLayer.sublayerTransform,
                 state->appliedSublayerTransform)) {
@@ -1877,6 +1944,11 @@ void LC32FitNativeLegacyCanvasWindow(UIWindow *window) {
             windowLayer.backgroundColor = state->originalBackground;
         }
         [CATransaction commit];
+        if(state->hasWindowFrame) {
+            LC32RestoreNativeLegacyCanvasSubviews(window);
+            LC32NativeSetWindowFrame(window, state->originalWindowFrame);
+            state->hasWindowFrame = NO;
+        }
         state->hasTransform = NO;
         state->appliedSublayerTransform = CATransform3DIdentity;
         if(state->appliedBackground) {
@@ -1891,56 +1963,151 @@ void LC32FitNativeLegacyCanvasWindow(UIWindow *window) {
     }
 
     const CGRect viewport = LC32LegacyViewportInView(window, window);
-    constexpr CGSize canvasSize = {320, 480};
-    const CGAffineTransform target = LC32PhoneCanvasFitTransform(
-        viewport, canvasSize.width, canvasSize.height);
-    if(!(target.a > 0) || !isfinite(target.a)) return;
-    const CGRect canvasRect = CGRectApplyAffineTransform(
-        CGRectMake(0, 0, canvasSize.width, canvasSize.height), target);
-    const CGRect windowBounds = windowLayer.bounds;
-    if(!isfinite(canvasRect.origin.x) || !isfinite(canvasRect.origin.y) ||
-            !isfinite(windowBounds.origin.x) ||
-            !isfinite(windowBounds.origin.y)) {
-        return;
+    if(!(viewport.size.width > 0) || !(viewport.size.height > 0) ||
+            !isfinite(viewport.size.width) ||
+            !isfinite(viewport.size.height)) return;
+
+    /* A nib-era window can be exactly the 320x480 canvas while the live
+     * presentation viewport is far larger. Content beyond a window's hit
+     * region is not served, so grow the window to cover the viewport before
+     * fitting. Only the host frame changes: the class never reads the window
+     * back, and the frozen direct subviews keep the canvas' authored
+     * geometry through the resize. */
+    if(fabs(viewport.origin.x) < 0.5 && fabs(viewport.origin.y) < 0.5 &&
+            LC32TransformNearlyEquals(LC32NativeViewTransform(window),
+                CGAffineTransformIdentity)) {
+        const CGRect frame = window.frame;
+        if(!state) {
+            /* Another owner already composes this window's sublayers. */
+            if(!CATransform3DIsIdentity(windowLayer.sublayerTransform)) {
+                return;
+            }
+            state = [LC32NativeCanvasFitState new];
+            state->originalSublayerTransform =
+                windowLayer.sublayerTransform;
+            state->appliedSublayerTransform = CATransform3DIdentity;
+            objc_setAssociatedObject(window, LC32NativeCanvasFitStateKey,
+                state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [state release];
+        }
+        if(!state->hasWindowFrame) {
+            state->originalWindowFrame = frame;
+            state->hasWindowFrame = YES;
+        }
+        const bool frameCoversViewport =
+            fabs(frame.size.width - viewport.size.width) < 0.5 &&
+            fabs(frame.size.height - viewport.size.height) < 0.5;
+        if(!frameCoversViewport) {
+            LC32FreezeNativeLegacyCanvasSubviews(window);
+            LC32NativeSetWindowFrame(window, CGRectMake(
+                viewport.origin.x, viewport.origin.y,
+                viewport.size.width, viewport.size.height));
+        } else {
+            LC32FreezeNativeLegacyCanvasSubviews(window);
+        }
     }
-    /* The uniformly scaled canvas must stay inside the window's hit region:
-     * drawing or hit-testing beyond a window's bounds is not served by the
-     * compositor, so a window that does not cover the presentation keeps its
-     * existing layout instead (the caller retries on the next event). */
-    if(!CGRectContainsRect(CGRectInset(windowBounds, -0.5, -0.5),
-                           canvasRect)) {
+
+    /* Resolve compositor ownership before touching the sublayer transform:
+     * a foreign transform wins and permanently yields this window, exactly
+     * like the canvas-mode sublayer compositor's takeover handling. */
+    const CATransform3D currentSublayer = windowLayer.sublayerTransform;
+    CATransform3D measureSublayer = currentSublayer;
+    if(state && state->hasTransform && CATransform3DEqualToTransform(
+            currentSublayer, state->appliedSublayerTransform)) {
+        /* Measure the authored geometry with the previous fit removed, so
+         * repeated passes neither compound nor cancel earlier placements. */
+        measureSublayer = state->originalSublayerTransform;
+    } else if(state) {
+        if(!CATransform3DEqualToTransform(
+                currentSublayer, state->appliedSublayerTransform) &&
+                !CATransform3DEqualToTransform(
+                    currentSublayer, state->originalSublayerTransform)) {
+            state->yielded = YES;
+            return;
+        }
+    } else if(!CATransform3DIsIdentity(currentSublayer)) {
+        /* Another owner already composes this window's sublayers. */
         return;
     }
 
-    const CATransform3D desired =
-        CATransform3DMakeAffineTransform(target);
-    if(!state) {
-        if(!CATransform3DIsIdentity(windowLayer.sublayerTransform)) {
-            /* Another owner already composes this window's sublayers. */
-            return;
-        }
-        state = [LC32NativeCanvasFitState new];
-        state->originalSublayerTransform = windowLayer.sublayerTransform;
-        objc_setAssociatedObject(window, LC32NativeCanvasFitStateKey,
-            state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [state release];
-    } else if(!CATransform3DEqualToTransform(
-                  windowLayer.sublayerTransform,
-                  state->appliedSublayerTransform) &&
-            !CATransform3DEqualToTransform(
-                  windowLayer.sublayerTransform,
-                  state->originalSublayerTransform)) {
-        /* UIKit or another owner replaced the compositor transform; preserve
-         * it and stop fitting this window, exactly like the canvas-mode
-         * sublayer compositor's takeover handling. */
-        state->yielded = YES;
+    /* The uniformly fitted content must stay inside the window's hit
+     * region: the growth above guarantees a window that covers the live
+     * presentation, so a window that still does not (exotic transforms,
+     * unusual scene geometry) keeps its existing layout instead — the
+     * caller retries on the next event. */
+    if(!CGRectContainsRect(CGRectInset(windowLayer.bounds, -0.5, -0.5),
+                           viewport)) {
         return;
     }
 
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    const BOOL changed = !CATransform3DEqualToTransform(
-        windowLayer.sublayerTransform, desired);
+    if(!CATransform3DEqualToTransform(
+            measureSublayer, currentSublayer)) {
+        windowLayer.sublayerTransform = measureSublayer;
+    }
+
+    /* Measure the canvas exactly as the native backing presents it:
+     * converting each direct guest subview layer into the window layer's
+     * space applies the active rotation presentation, so the fit composes
+     * with whatever UIKit actually produced instead of assuming an
+     * axis-aligned canvas rect. */
+    CGRect contentRect = CGRectNull;
+    for(UIView *subview in LC32NativeViewSubviews(window)) {
+        if(!subview.guest_selfOrNull) continue;
+        CALayer *sublayer = LC32NativeViewLayer(subview);
+        if(!sublayer || LC32ObjectUsesGuestClass(sublayer)) continue;
+        const CGRect presented = [windowLayer convertRect:
+            sublayer.bounds fromLayer:sublayer];
+        if(!isfinite(presented.origin.x) ||
+                !isfinite(presented.origin.y) ||
+                !isfinite(presented.size.width) ||
+                !isfinite(presented.size.height) ||
+                !(presented.size.width > 0) ||
+                !(presented.size.height > 0)) continue;
+        contentRect = CGRectIsNull(contentRect)
+            ? presented : CGRectUnion(contentRect, presented);
+    }
+    if(CGRectIsNull(contentRect)) {
+        if(!CATransform3DEqualToTransform(
+                currentSublayer, windowLayer.sublayerTransform)) {
+            windowLayer.sublayerTransform = currentSublayer;
+        }
+        [CATransaction commit];
+        return;
+    }
+
+    const CGFloat contentWidth = contentRect.size.width;
+    const CGFloat contentHeight = contentRect.size.height;
+    const CGFloat scale = MIN(viewport.size.width / contentWidth,
+                              viewport.size.height / contentHeight);
+    const CGAffineTransform target = (!(scale > 0) || !isfinite(scale))
+        ? CGAffineTransformIdentity
+        : CGAffineTransformMake(scale, 0, 0, scale,
+              CGRectGetMidX(viewport) - scale * CGRectGetMidX(contentRect),
+              CGRectGetMidY(viewport) - scale * CGRectGetMidY(contentRect));
+    if(!(scale > 0) || !isfinite(scale) || !isfinite(target.tx) ||
+            !isfinite(target.ty)) {
+        if(!CATransform3DEqualToTransform(
+                currentSublayer, windowLayer.sublayerTransform)) {
+            windowLayer.sublayerTransform = currentSublayer;
+        }
+        [CATransaction commit];
+        return;
+    }
+
+    if(!state) {
+        state = [LC32NativeCanvasFitState new];
+        state->originalSublayerTransform = currentSublayer;
+        state->appliedSublayerTransform = CATransform3DIdentity;
+        objc_setAssociatedObject(window, LC32NativeCanvasFitStateKey,
+            state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [state release];
+    }
+
+    const CATransform3D desired =
+        CATransform3DMakeAffineTransform(target);
+    const BOOL changed = !CATransform3DEqualToTransform(currentSublayer, desired);
     if(changed) {
         windowLayer.sublayerTransform = desired;
     }
