@@ -107,27 +107,12 @@ typedef NS_ENUM(NSUInteger, LC32LegacyIPadGeometryMode) {
 
 /* The declared-universal canvas class records the layer backing the
  * adopted drawable on the owning window; the measured fit below reads it
- * back.  The weak reference never extends the layer's lifetime, so a view
- * that UIKit retires simply leaves the fit without a recorded drawable.
- * The accessors are hand-written: this file is compiled with manual
- * reference counting, where clang refuses to synthesize weak property
- * accessors, while the weak store/load machinery itself is available. */
-@interface LC32NativeCanvasDrawableState : NSObject {
-@private
-    __weak CALayer *_drawableLayer;
-}
-- (CALayer *)drawableLayer;
-- (void)setDrawableLayer:(CALayer *)drawable;
-@end
-
-@implementation LC32NativeCanvasDrawableState
-- (CALayer *)drawableLayer {
-    return _drawableLayer;
-}
-- (void)setDrawableLayer:(CALayer *)drawable {
-    _drawableLayer = drawable;
-}
-@end
+ * back through a weak-value map table.  The record must never extend the
+ * layer's lifetime — a retired view must leave the fit without a dangling
+ * record — and this file is compiled with manual reference counting, where
+ * neither synthesized weak properties nor __weak declarations are
+ * available, so the zeroing happens through NSMapTable's weak-value
+ * option instead. */
 
 /*
 symbol = r0 + r1 << 32
@@ -2007,22 +1992,26 @@ void LC32RecordNativeLegacyCanvasDrawable(UIView *owner, CALayer *drawable) {
             LC32ObjectUsesGuestClass(drawable)) {
         return;
     }
-    LC32NativeCanvasDrawableState *state = objc_getAssociatedObject(
+    NSMapTable<NSNull *, CALayer *> *record = objc_getAssociatedObject(
         window, LC32NativeCanvasDrawableLayerKey);
-    if(!state) {
-        state = [LC32NativeCanvasDrawableState new];
+    if(!record) {
+        /* The factory result is autoreleased and this function does not
+         * own it: the association's retain is the only ownership taken. */
+        record = [NSMapTable mapTableWithKeyOptions:
+            NSPointerFunctionsOpaquePersonality
+            valueOptions:(NSPointerFunctionsWeakMemory |
+                NSPointerFunctionsObjectPersonality)];
         objc_setAssociatedObject(window, LC32NativeCanvasDrawableLayerKey,
-            state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [state release];
+            record, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    state.drawableLayer = drawable;
+    [record setObject:drawable forKey:[NSNull null]];
 }
 
 CGRect LC32NativeLegacyCanvasDrawableContentRect(
         UIWindow *window, CALayer *windowLayer) {
-    LC32NativeCanvasDrawableState *state = objc_getAssociatedObject(
+    NSMapTable<NSNull *, CALayer *> *record = objc_getAssociatedObject(
         window, LC32NativeCanvasDrawableLayerKey);
-    CALayer *drawable = state.drawableLayer;
+    CALayer *drawable = [record objectForKey:[NSNull null]];
     if(!drawable || LC32ObjectUsesGuestClass(drawable)) return CGRectNull;
     CALayer *ancestor = drawable.superlayer;
     while(ancestor && ancestor != windowLayer) {
