@@ -2703,8 +2703,73 @@ static bool LC32SelectorIsInInitializerFamily(SEL selector) {
     return next == '\0' || next < 'a' || next > 'z';
 }
 
+/* An Objective-C exception raised by host framework code during a bridged
+ * guest call previously escaped the emulated CPU's fault machinery and
+ * terminated the process through the unwinder with no report at all: the
+ * guest crash path only covers signals raised inside the JIT.  Convert such
+ * an exception into the guest crash-report channel, with the exception's
+ * own throw-site stack, so host-side failures during guest calls reach the
+ * operator instead of dying silently. */
+static u64 LC32InvokeHostSelectorInner(
+        u64 host_self, u64 host_cmd, u64 va_args);
+
+__attribute__((cold, noreturn)) static void LC32ThrowHostBridgeException(
+        NSException *exception, u64 host_self, u64 host_cmd) {
+    SEL selector = (SEL)(host_cmd &
+        ~(SEL_RETURN_GUEST_OBJECT | SEL_ALLOW_UNMAPPED_RECEIVER |
+          SEL_RETURN_STRUCT));
+    const char *selectorName =
+        selector ? sel_getName(selector) : "(null selector)";
+    const char *exceptionName = exception.name.UTF8String ?: "?";
+    const char *exceptionReason = exception.reason.UTF8String ?: "";
+    /* The receiver identity is deliberately not dereferenced here: its
+     * invocation guard has already unwound, so the host object may be
+     * gone, and the throw-site stack identifies the failure regardless. */
+    std::string report;
+    report.reserve(2048 + 1024 * 16);
+    report += "LiveExec32 host exception during bridged guest call\n";
+    report += "Receiver handle: 0x";
+    char scratch[32];
+    snprintf(scratch, sizeof(scratch), "%llx",
+        (unsigned long long)host_self);
+    report += scratch;
+    report += "\nSelector: ";
+    report += selectorName;
+    report += "\nException: ";
+    report += exceptionName;
+    report += ": ";
+    report += exceptionReason;
+    report += "\nHost throw-site stack:\n";
+    for(NSString *frame in [exception callStackSymbols]) {
+        report += "  ";
+        report += frame.UTF8String ?: "";
+        report += "\n";
+    }
+    std::string compact;
+    compact.reserve(512);
+    compact += "LiveExec32 host exception during bridged call of ";
+    compact += selectorName;
+    compact += ": ";
+    compact += exceptionName;
+    LC32ThrowGuestCrashException(
+        report.data(), report.size(), LC32_OS_REASON_LIBSYSTEM,
+        LC32_GUEST_CRASH_REASON_CODE, compact.c_str());
+}
+
 // guest to host call of objc_msgSend*
 u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
+    @try {
+        return LC32InvokeHostSelectorInner(host_self, host_cmd, va_args);
+    } @catch(NSException *exception) {
+        /* Guest crash exceptions and debugger stops are already reported
+         * through their own machinery and must keep riding the unwind. */
+        if(LC32IsGuestCrashException(exception)) @throw;
+        LC32ThrowHostBridgeException(exception, host_self, host_cmd);
+    }
+}
+
+static u64 LC32InvokeHostSelectorInner(
+        u64 host_self, u64 host_cmd, u64 va_args) {
     /* Shadow any initializer which synchronously called guest code for this
      * entire nested bridge operation—not just its native dispatch. Receiver
      * acquisition, argument/result conversion, and guard destruction can all
