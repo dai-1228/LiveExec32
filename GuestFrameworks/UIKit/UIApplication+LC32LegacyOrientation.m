@@ -34,20 +34,23 @@ static BOOL LC32NeedsLegacyStatusBarOrientationOverride(void) {
         UIInterfaceOrientationUnknown;
 }
 
+static void LC32SwapStatusBarOrientationImplementations(void) {
+    Method original = class_getInstanceMethod(
+        [UIApplication class], @selector(statusBarOrientation));
+    Method compatibility = class_getInstanceMethod(
+        [UIApplication class], @selector(lc32_statusBarOrientation));
+    if(original && compatibility) {
+        method_exchangeImplementations(original, compatibility);
+    }
+}
+
 static void LC32InstallLegacyStatusBarOrientationGetter(void) {
     /* Install the paired getter once. Canvas-paired applications install at
      * load time below; a native-legacy-rotation process cannot know at load
      * time whether the application will declare an orientation, so the
      * setters install the pairing after the first request. */
-    pthread_once(&LC32LegacyStatusBarGetterOnce, ^{
-        Method original = class_getInstanceMethod(
-            [UIApplication class], @selector(statusBarOrientation));
-        Method compatibility = class_getInstanceMethod(
-            [UIApplication class], @selector(lc32_statusBarOrientation));
-        if(original && compatibility) {
-            method_exchangeImplementations(original, compatibility);
-        }
-    });
+    pthread_once(&LC32LegacyStatusBarGetterOnce,
+        LC32SwapStatusBarOrientationImplementations);
 }
 
 static void LC32ForwardLegacyOrientation(
