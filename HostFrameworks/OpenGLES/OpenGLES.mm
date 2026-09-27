@@ -24,6 +24,7 @@
 
 #include "bridge.h"
 #include "../../GuestFrameworks/OpenGLES/LC32OpenGLESBridge.h"
+#include "../UIKit/LC32LegacyRotation.h"
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -2220,6 +2221,15 @@ size_t VertexAttribElementCount(GLenum pname) {
     BOOL requestedRGB565 = NO;
     if([(id)drawable isKindOfClass:CAEAGLLayer.class]) {
         drawableLayer = (CAEAGLLayer *)(id)drawable;
+        /* Supplied by the UIKit adapter (LC32LegacyRotation.h): the
+         * runtime-declared landscape phone-canvas class can reach this
+         * allocation with scene-sized launch bounds, because its first
+         * UIScreen read precedes the status-bar request that defines the
+         * class. The adapter re-fits the drawable view to the canonical
+         * canvas first, so the allocated storage matches the engine's fixed
+         * projection. Cheap for every other process: the class check inside
+         * leaves after two static loads. */
+        LC32UIKitAdoptNativeLegacyCanvasDrawable(drawableLayer);
         NSDictionary *properties = drawableLayer.drawableProperties;
         NSMutableDictionary *normalized =
             [NSMutableDictionary dictionaryWithCapacity:properties.count];

@@ -28,7 +28,7 @@ while [ "$#" -gt 0 ]; do
         --case)
             [ "$#" -ge 2 ] || exit 2
             case "$2" in
-                rootless|explicit|modern|modern-explicit|modern-only|modern-refresh|unregistered|manual|manual-controller|modal|manual-disabled|lifecycle|ownership|replacement|controllerless|statusbar-request)
+                rootless|explicit|modern|modern-explicit|modern-only|modern-refresh|unregistered|manual|manual-controller|modal|manual-disabled|lifecycle|ownership|replacement|controllerless|fixed-canvas|statusbar-request)
                     test_cases="$test_cases $2" ;;
                 *) exit 2 ;;
             esac
@@ -38,13 +38,13 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 [ -n "$sdks" ] || sdks="2 5 6.1 7 8 11"
-[ -n "$test_cases" ] || test_cases="rootless explicit modern modern-explicit modern-only modern-refresh unregistered manual manual-controller modal manual-disabled lifecycle ownership replacement controllerless statusbar-request"
+[ -n "$test_cases" ] || test_cases="rootless explicit modern modern-explicit modern-only modern-refresh unregistered manual manual-controller modal manual-disabled lifecycle ownership replacement controllerless fixed-canvas statusbar-request"
 # The keyless variant reproduces a 2009 orientation-less Info.plist (no
 # UISupportedInterfaceOrientations array, phone-only family). Its default
 # case set covers the status-bar contract that replaces the missing
 # declaration.
 if [ "$keyless" -eq 1 ] && [ "$cases_given" -eq 0 ]; then
-    test_cases="controllerless statusbar-request"
+    test_cases="controllerless fixed-canvas statusbar-request"
 fi
 case "$run_timeout" in ''|*[!0-9]*) echo "invalid timeout" >&2; exit 2 ;; esac
 [ "$run_timeout" -ge 1 ] && [ "$run_timeout" -le 60 ] || exit 2

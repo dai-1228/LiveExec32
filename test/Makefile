@@ -4,6 +4,7 @@ LC32_HOST_TEST_GOALS := check-guest-bootstrap check-memory-hash \
   check-scalar-callback-signature check-guest-timer-queue check-legacy-nib-loading \
   check-mach-exception-ports check-uikit-background-tasks check-mediaplayer-stop \
   check-uikit-legacy-statusbar-orientation \
+  check-uikit-legacy-canvas-fit \
   check-foundation-ports-host
 LC32_HOST_ONLY_BUILD := $(if $(strip $(MAKECMDGOALS)),\
   $(if $(strip $(filter-out $(LC32_HOST_TEST_GOALS),$(MAKECMDGOALS))),,1),)
@@ -20,6 +21,7 @@ LEGACY_NIB_LOADING_HOST_TEST := $(HOST_TEST_OUTPUT_DIR)/legacy-nib-loading-host
 MACH_EXCEPTION_PORTS_HOST_TEST := $(HOST_TEST_OUTPUT_DIR)/mach-exception-ports-host
 UIKIT_BACKGROUND_TASKS_HOST_TEST := $(HOST_TEST_OUTPUT_DIR)/uikit-background-tasks-host
 UIKIT_LEGACY_STATUSBAR_ORIENTATION_HOST_TEST := $(HOST_TEST_OUTPUT_DIR)/uikit-legacy-statusbar-orientation-host
+UIKIT_LEGACY_CANVAS_FIT_HOST_TEST := $(HOST_TEST_OUTPUT_DIR)/uikit-legacy-canvas-fit-host
 MEDIAPLAYER_STOP_HOST_TEST := $(HOST_TEST_OUTPUT_DIR)/mediaplayer-stop-host
 GUEST_TIMER_QUEUE_HOST_TEST := $(HOST_TEST_OUTPUT_DIR)/guest-timer-queue-host
 GUEST_TIMER_QUEUE_HOST_OBJECT := $(HOST_TEST_OUTPUT_DIR)/guest-timer-queue-backend.o
@@ -38,6 +40,7 @@ BUILD_INFO_LOGGING_HOST_TESTS := $(addprefix $(HOST_TEST_OUTPUT_DIR)/build-info-
   check-scalar-callback-signature check-guest-timer-queue check-legacy-nib-loading \
   check-mach-exception-ports check-uikit-background-tasks check-mediaplayer-stop \
   check-uikit-legacy-statusbar-orientation \
+  check-uikit-legacy-canvas-fit \
   check-foundation-ports-host
 check-mediaplayer-stop: $(MEDIAPLAYER_STOP_HOST_TEST)
 	"$(MEDIAPLAYER_STOP_HOST_TEST)"
@@ -67,6 +70,16 @@ $(UIKIT_LEGACY_STATUSBAR_ORIENTATION_HOST_TEST): uikit_legacy_statusbar_orientat
 		uikit_legacy_statusbar_orientation_host.m \
 		../GuestFrameworks/UIKit/UIApplication+LC32LegacyOrientation.m \
 		../GuestFrameworks/UIKit/UIViewController+LC32LegacyOrientation.m -o "$@"
+
+check-uikit-legacy-canvas-fit: $(UIKIT_LEGACY_CANVAS_FIT_HOST_TEST)
+	"$(UIKIT_LEGACY_CANVAS_FIT_HOST_TEST)"
+
+$(UIKIT_LEGACY_CANVAS_FIT_HOST_TEST): uikit_legacy_canvas_fit_host.m \
+  ../include/LC32LegacyCanvas.h
+	@mkdir -p "$(HOST_TEST_OUTPUT_DIR)"
+	$(HOST_CC) -Wall -Wextra -Werror -fobjc-arc -fblocks \
+		-I../include -framework Foundation -framework CoreGraphics \
+		uikit_legacy_canvas_fit_host.m -o "$@"
 
 $(UIKIT_BACKGROUND_TASKS_HOST_TEST): uikit_background_tasks_host.m \
   background-task-stubs/UIKit/UIKit.h background-task-stubs/LC32/LC32.h \
@@ -425,6 +438,9 @@ $(eval $(call lc32_guest_test,lc32-uikit-legacy-device,uikit_legacy_device.m,Fou
 $(eval $(call lc32_guest_test,lc32-uikit-legacy-overlay,uikit_legacy_overlay.m,Foundation UIKit QuartzCore CoreGraphics LC32))
 $(eval $(call lc32_guest_test,lc32-uikit-legacy-root-geometry,uikit_legacy_root_geometry.m,Foundation UIKit QuartzCore CoreGraphics LC32))
 $(eval $(call lc32_guest_test,lc32-uikit-legacy-phone-canvas,uikit_legacy_phone_canvas.m,Foundation UIKit QuartzCore CoreGraphics LC32))
+# Runtime-declared canvas: run keyless under a pre-iOS-8 effective process
+# SDK (native legacy rotation) as described in the fixture header.
+$(eval $(call lc32_guest_test,lc32-uikit-legacy-native-canvas,uikit_legacy_native_canvas.m,Foundation UIKit QuartzCore OpenGLES LC32))
 $(eval $(call lc32_guest_test,lc32-uikit-legacy-rotation-duration,uikit_legacy_rotation_duration.m,Foundation UIKit LC32))
 $(eval $(call lc32_guest_test,lc32-uikit-legacy-nested-renderer,uikit_legacy_nested_renderer.m,Foundation UIKit QuartzCore CoreGraphics LC32))
 $(eval $(call lc32_guest_test,lc32-uikit-legacy-direct-renderer,uikit_legacy_direct_renderer.m,Foundation UIKit QuartzCore CoreGraphics LC32))
@@ -491,6 +507,11 @@ lc32-uikit-legacy-phone-canvas_USE_MODULES := 1
 lc32-uikit-legacy-phone-canvas_CFLAGS := -fno-objc-arc -target armv7s-apple-ios7.0 \
 	-I$(abspath ../GuestFrameworks) -I$(abspath ../include)
 lc32-uikit-legacy-phone-canvas_LDFLAGS += -target armv7s-apple-ios7.0
+# Exercise the runtime-declared canvas in native legacy rotation.
+lc32-uikit-legacy-native-canvas_USE_MODULES := 1
+lc32-uikit-legacy-native-canvas_CFLAGS := -fno-objc-arc -target armv7s-apple-ios7.0 \
+	-I$(abspath ../GuestFrameworks) -I$(abspath ../include)
+lc32-uikit-legacy-native-canvas_LDFLAGS += -target armv7s-apple-ios7.0
 # Run under a launcher with effective SDK < 8 to exercise the native adapter.
 lc32-uikit-legacy-rotation-duration_USE_MODULES := 1
 lc32-uikit-legacy-rotation-duration_CFLAGS := -fno-objc-arc -target armv7s-apple-ios7.0 \

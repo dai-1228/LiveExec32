@@ -34,6 +34,20 @@ BOOL LC32NativeLegacyRotationWindowIsGuest(UIWindow *window) {
     return window != nil && window == controllerlessGuestWindow;
 }
 
+/* Stand-in for the UIKit adapter's fixed-canvas fit scheduler: the adapter
+ * (uncompiled in this fixture) owns class and window eligibility, so the
+ * deterministic probes only observe which production events report to it.
+ * The real adapter coalesces onto the main queue; this stand-in counts
+ * synchronously. */
+static unsigned canvasFitSchedules;
+static unsigned canvasFitSchedulesAfterVisible;
+static __unsafe_unretained UIWindow *lastCanvasFitWindow;
+
+void LC32ScheduleNativeLegacyCanvasFit(UIWindow *window) {
+    ++canvasFitSchedules;
+    lastCanvasFitWindow = window;
+}
+
 static int failures;
 static unsigned legacyQueries;
 static unsigned legacyLandscapeQueries;
@@ -525,7 +539,8 @@ static void nativeOrientationUpdateProbe(RootlessRotationRefreshWindow *window, 
     if([testCase isEqualToString:@"statusbar-request"])
         controllerClass = RootlessRotationRegisteredModernController.class;
     CGRect bounds = UIScreen.mainScreen.bounds;
-    if([testCase isEqualToString:@"controllerless"]) {
+    if([testCase isEqualToString:@"controllerless"] ||
+            [testCase isEqualToString:@"fixed-canvas"]) {
         /* No controller anywhere: a guest window with only a drawable
          * subview, exactly the main-nib games this contract restores. */
         self.window = [[RootlessRotationControllerlessWindow alloc]
@@ -537,7 +552,9 @@ static void nativeOrientationUpdateProbe(RootlessRotationRefreshWindow *window, 
         self.content.backgroundColor = UIColor.blueColor;
         [self.window addSubview:self.content];
         [self dumpState:"before-visible"];
+        canvasFitSchedules = 0;
         [self.window makeKeyAndVisible];
+        canvasFitSchedulesAfterVisible = canvasFitSchedules;
         [self dumpState:"after-visible"];
         self.visibleSubviewCount = self.window.subviews.count;
         [self.window makeKeyAndVisible];
@@ -1187,6 +1204,75 @@ static void nativeOrientationUpdateProbe(RootlessRotationRefreshWindow *window, 
     requestedStatusBarOrientation = UIInterfaceOrientationUnknown;
 }
 
+- (void)checkFixedCanvasScheduling {
+    /* The production unit reports window geometry and orientation events
+     * to the UIKit adapter's fixed-canvas fit scheduler. The adapter itself
+     * (class gates, window eligibility, coalescing, the composed transform)
+     * is not compiled into this fixture; the deterministic checks below pin
+     * the wiring: which events report, that the reporting window is the
+     * controller-less guest window, and that every hook stays disabled once
+     * the effective SDK reaches iOS 8. */
+    SEL transformSelector = sel_registerName("_updateTransformLayer");
+    Method transform = class_getInstanceMethod(UIWindow.class, transformSelector);
+    check("fixed-canvas-transform-entrypoint-present", transform != NULL);
+    if(!transform) return;
+    Dl_info transformInfo = {0};
+    BOOL transformResolved = dladdr(
+        (const void *)method_getImplementation(transform),
+        &transformInfo) != 0;
+    check("fixed-canvas-transform-hook-matches-sdk-gate", transformResolved &&
+        (transformInfo.dli_fbase == _dyld_get_image_header(0)) ==
+            expectedEnabled);
+    if(!expectedEnabled) {
+        check("fixed-canvas-modern-sdk-schedules-nothing",
+            canvasFitSchedulesAfterVisible == 0 && canvasFitSchedules == 0);
+        return;
+    }
+
+    UIWindow *window = self.window;
+    check("fixed-canvas-visibility-scheduled",
+        canvasFitSchedulesAfterVisible >= 1);
+
+    canvasFitSchedules = 0;
+    lastCanvasFitWindow = nil;
+    ((void (*)(id, SEL))objc_msgSend)(
+        window, sel_registerName("_updateTransformLayer"));
+    check("fixed-canvas-transform-sync-scheduled",
+        canvasFitSchedules >= 1 && lastCanvasFitWindow == window);
+
+    /* The controller-less requested turn reports through the same wrapper
+     * (its refresh ordering runs inside the swizzled update). The probe
+     * keeps the compositor out of the deterministic check, as in the
+     * controller-less contract case. */
+    SEL originalSelector =
+        sel_registerName("lc32_updateToInterfaceOrientation:duration:force:");
+    Method original = class_getInstanceMethod(UIWindow.class, originalSelector);
+    check("fixed-canvas-update-entrypoints-present", original != NULL);
+    if(!original) return;
+    IMP saved = method_setImplementation(
+        original, (IMP)nativeControllerlessOrientationUpdateProbe);
+    @try {
+        requestedStatusBarOrientation = UIInterfaceOrientationLandscapeRight;
+        controllerlessUpdateCalls = 0;
+        canvasFitSchedules = 0;
+        lastCanvasFitWindow = nil;
+        LC32NativeLegacyRotationRefreshRequested(UIInterfaceOrientationLandscapeRight);
+        check("fixed-canvas-requested-turn-scheduled",
+            canvasFitSchedules >= 1 && lastCanvasFitWindow == window &&
+            controllerlessUpdateCalls == 1);
+        controllerlessUpdateCalls = 0;
+        canvasFitSchedules = 0;
+        LC32NativeLegacyRotationRefreshRequested(UIInterfaceOrientationPortrait);
+        check("fixed-canvas-ambient-orientation-not-turned",
+            controllerlessUpdateCalls == 0 && canvasFitSchedules == 0);
+        requestedStatusBarOrientation = UIInterfaceOrientationUnknown;
+    } @finally {
+        method_setImplementation(original, saved);
+    }
+    check("fixed-canvas-original-update-imp-restored",
+        method_getImplementation(original) == saved);
+}
+
 - (void)finish {
     if([testCase isEqualToString:@"modern-refresh"] && !self.completedRefreshProbe) {
         [self checkQueuedModernBackingRefresh];
@@ -1272,6 +1358,8 @@ static void nativeOrientationUpdateProbe(RootlessRotationRefreshWindow *window, 
                 CGRectEqualToRect(self.content.bounds, self.initialContentBounds));
         }
         [self checkControllerlessStatusBarContract];
+    } else if([testCase isEqualToString:@"fixed-canvas"]) {
+        [self checkFixedCanvasScheduling];
     } else if([testCase isEqualToString:@"statusbar-request"]) {
         [self checkRequestedOrientationPolicy];
     } else if(expectedEnabled && !explicitRootCase) {
@@ -1338,7 +1426,7 @@ int main(int argc, char **argv) {
         }
         if(![@[@"rootless", @"explicit", @"modern", @"modern-explicit", @"modern-only", @"modern-refresh", @"unregistered", @"manual", @"manual-controller",
                 @"modal", @"manual-disabled", @"lifecycle", @"ownership", @"replacement",
-                @"controllerless", @"statusbar-request"]
+                @"controllerless", @"fixed-canvas", @"statusbar-request"]
                 containsObject:testCase]) return 2;
         manualRotation = [testCase isEqualToString:@"manual"] ||
             [testCase isEqualToString:@"manual-disabled"];

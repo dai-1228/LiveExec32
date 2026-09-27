@@ -469,6 +469,7 @@ extern "C" void LC32NativeLegacyRotationRefreshRequested(
     duration:(NSTimeInterval)duration force:(BOOL)force;
 - (void)lc32_configureRootLayer:(CALayer *)root sceneTransformLayer:(CALayer *)scene
     transformLayer:(CALayer *)transform;
+- (void)lc32_updateTransformLayer;
 - (BOOL)lc32_windowOwnsInterfaceOrientation;
 - (BOOL)lc32_windowOwnsInterfaceOrientationTransform;
 - (BOOL)lc32_shouldAutorotateToInterfaceOrientation:(UIInterfaceOrientation)orientation
@@ -494,6 +495,10 @@ extern "C" void LC32NativeLegacyRotationRefreshRequested(
     if(legacy) ((void (*)(id, SEL))objc_msgSend)(self, refresh);
     [self lc32_updateToInterfaceOrientation:orientation duration:duration force:force];
     if(legacy) ((void (*)(id, SEL))objc_msgSend)(self, refresh);
+    // The fixed-canvas presentation refits around the same turn; its scale
+    // is derived from the live viewport, so this never invents an extra
+    // rotation or a speculative backing refresh.
+    if(legacy) LC32ScheduleNativeLegacyCanvasFit(self);
 }
 - (void)lc32_configureRootLayer:(CALayer *)root sceneTransformLayer:(CALayer *)scene
         transformLayer:(CALayer *)transform {
@@ -515,6 +520,18 @@ extern "C" void LC32NativeLegacyRotationRefreshRequested(
     } @finally {
         configuringLegacyWindow = previous;
     }
+    // A backing reconfiguration is also a viewport event for the fixed-canvas
+    // presentation; the adapter owns eligibility and coalesces the refit.
+    LC32ScheduleNativeLegacyCanvasFit(self);
+}
+- (void)lc32_updateTransformLayer {
+    // UIKit re-syncs the root/transform layers after every window geometry or
+    // orientation change, including the dynamic Classic-Mode viewport changes
+    // that arrive without any turn. That sync is the refit point for the
+    // fixed-canvas presentation; the adapter gates and coalesces the work,
+    // and nothing runs synchronously inside UIKit's own update.
+    [self lc32_updateTransformLayer];
+    LC32ScheduleNativeLegacyCanvasFit(self);
 }
 - (BOOL)lc32_windowOwnsInterfaceOrientation {
     return configuringLegacyWindow == self || [self lc32_windowOwnsInterfaceOrientation];
@@ -531,6 +548,9 @@ extern "C" void LC32NativeLegacyRotationRefreshRequested(
      * renderer is added, so revalidate ownership on the deferred pass. */
     if(!window || !pthread_main_np() || !ControllerlessLegacyWindow(window)) return;
     [ControllerlessWindows() addObject:window];
+    // The window became visible: its renderer is attached and the fixed-canvas
+    // presentation can be fitted against the settled viewport.
+    LC32ScheduleNativeLegacyCanvasFit(window);
     if(!startupFinished) return;
     __weak UIWindow *pendingWindow = window;
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -545,6 +565,8 @@ extern "C" void LC32NativeLegacyRotationRefreshRequested(
         @selector(lc32_updateToInterfaceOrientation:duration:force:));
     Swizzle(self, sel_registerName("_configureRootLayer:sceneTransformLayer:transformLayer:"),
         @selector(lc32_configureRootLayer:sceneTransformLayer:transformLayer:));
+    Swizzle(self, sel_registerName("_updateTransformLayer"),
+        @selector(lc32_updateTransformLayer));
     Swizzle(self, sel_registerName("_windowOwnsInterfaceOrientation"),
         @selector(lc32_windowOwnsInterfaceOrientation));
     Swizzle(self, sel_registerName("_windowOwnsInterfaceOrientationTransform"),

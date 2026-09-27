@@ -98,7 +98,21 @@ orientation, the deprecated
 `application:willChangeStatusBarOrientation:duration:` /
 `application:didChangeStatusBarOrientation:` delegate pair and its
 notifications are delivered again, and runtime `setStatusBarHidden:animated:`
-requests are honored beside the `UIStatusBarHidden` key. The keyless-plist
+requests are honored beside the `UIStatusBarHidden` key. A keyless
+phone-only pre-iOS-8 executable that declares a landscape orientation
+through that runtime status-bar API is a fixed 320x480-screen application in
+the documented iPhoneOS 2.x sense: its guest `UIScreen` answers the canonical
+portrait canvas (with the status-bar-consistent `applicationFrame` and the
+same scale clamp as the plist-declared canvas classes), a launch-sized
+drawable is adopted to that canvas before its renderbuffer storage is
+allocated, and the controller-less window presents the canvas rotated by
+the existing native rotation and uniformly scaled (MIN, centered, 3:2
+letterbox) onto the live viewport. The presentation refits on window
+visibility, orientation updates, and transform-layer syncs, so dynamic
+Classic-Mode viewport changes are followed; the classifier is the shared
+`LC32UsesRuntimeLandscapePhoneCanvas` inline, and SDK-8+ executables,
+key-declaring bundles, and iPad-idiom apps never enter the class. The
+keyless-plist
 status-bar contract has its own opt-in simulator regression:
 `sh test/uikit_legacy_rootless_rotation.sh --device UDID --keyless`.
 Pre-iOS-11 processes also repair nonfinite preferred-font results from

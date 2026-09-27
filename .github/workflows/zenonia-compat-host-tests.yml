@@ -31,6 +31,10 @@ jobs:
       shell: bash
       run: gmake -C test check-uikit-legacy-statusbar-orientation
 
+    - name: Run legacy canvas fit host test
+      shell: bash
+      run: gmake -C test check-uikit-legacy-canvas-fit
+
     - name: Run legacy nib loading host test
       shell: bash
       run: gmake -C test check-legacy-nib-loading

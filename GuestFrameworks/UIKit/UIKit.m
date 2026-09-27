@@ -220,6 +220,30 @@ static void LC32ResolveLegacyCanvas(void) {
         @"UIStatusBarHidden"] boolValue];
 }
 
+static pthread_once_t LC32NativeLegacyPhoneCanvasOnce = PTHREAD_ONCE_INIT;
+static uint64_t LC32HostNativeFixedPhoneCanvas;
+static BOOL LC32LegacyNativePhoneCanvasStatusBarHidden;
+
+static void LC32ResolveNativeLegacyPhoneCanvas(void) {
+    /* The runtime-declared canvas class is decided on the host from the
+     * recorded status-bar request; an older host without the classifier
+     * keeps the modern answer. The status-bar preference snapshot follows
+     * the canvas-mode model: the plist key only, read once. */
+    LC32HostNativeFixedPhoneCanvas = LC32Dlsym(
+        "LC32UIKitUsesNativeFixedPhoneCanvas", YES);
+    LC32LegacyNativePhoneCanvasStatusBarHidden = [[NSBundle.mainBundle
+        objectForInfoDictionaryKey:@"UIStatusBarHidden"] boolValue];
+}
+
+static BOOL LC32RequiresNativeLegacyPhoneCanvas(void) {
+    pthread_once(&LC32NativeLegacyPhoneCanvasOnce,
+        LC32ResolveNativeLegacyPhoneCanvas);
+    /* The recorded request can arrive between two reads, so this stays a
+     * live query rather than a once-cached classifier. */
+    return LC32HostNativeFixedPhoneCanvas &&
+        LC32InvokeHostCRet32(LC32HostNativeFixedPhoneCanvas) != 0;
+}
+
 static BOOL LC32RequiresLegacyIPadCanvas(void) {
     pthread_once(&LC32LegacyCanvasOnce, LC32ResolveLegacyCanvas);
     return LC32LegacyIPadCanvasRequired;
@@ -751,6 +775,13 @@ compatibleWithTraitCollection:nil];
          * engines rotate within this surface while the host wrapper presents
          * it as a 480x320 landscape canvas. */
         bounds = CGRectMake(0, 0, 320, 480);
+    } else if(LC32RequiresNativeLegacyPhoneCanvas()) {
+        /* The keyless runtime-landscape class: the same fixed 2009 screen,
+         * declared through the status-bar API instead of the Info.plist.
+         * The host presents this canvas rotated and uniformly scaled onto
+         * the live viewport, so the engine's internal geometry contract
+         * stays exactly what it was authored against. */
+        bounds = CGRectMake(0, 0, 320, 480);
     }
     return bounds;
 }
@@ -765,6 +796,12 @@ compatibleWithTraitCollection:nil];
             : CGRectMake(0, 20, 768, 1004);
     } else if(LC32RequiresFixedLandscapePhoneCanvas()) {
         frame = LC32LegacyIPadStatusBarHidden
+            ? CGRectMake(0, 0, 320, 480)
+            : CGRectMake(0, 20, 320, 460);
+    } else if(LC32RequiresNativeLegacyPhoneCanvas()) {
+        /* Status-bar-consistent variant of the same runtime-declared canvas,
+         * following the canvas-mode model exactly. */
+        frame = LC32LegacyNativePhoneCanvasStatusBarHidden
             ? CGRectMake(0, 0, 320, 480)
             : CGRectMake(0, 20, 320, 460);
     }
@@ -782,7 +819,8 @@ compatibleWithTraitCollection:nil];
         &hostSelector, _cmd, NO);
     CGFloat scale = (CGFloat)LC32HostFloatingResult(LC32InvokeHostSelector(
         self.host_self, selector, (uint64_t)0));
-    if(LC32RequiresFixedLandscapePhoneCanvas() && scale > 2.0f) {
+    if(scale > 2.0f && (LC32RequiresFixedLandscapePhoneCanvas() ||
+                        LC32RequiresNativeLegacyPhoneCanvas())) {
         scale = 2.0f;
     }
     return scale;

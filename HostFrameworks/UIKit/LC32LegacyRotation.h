@@ -2,6 +2,10 @@
 
 #import <UIKit/UIKit.h>
 
+/* CAEAGLLayer is declared by QuartzCore/OpenGLES; this header only needs
+ * the object type for the drawable-adoption hook below. */
+@class CAEAGLLayer;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -25,6 +29,25 @@ UIInterfaceOrientation LC32LegacyRequestedStatusBarOrientation(void);
  * from a pre-iOS-8 executable (a missing SDK version marker counts as
  * pre-iOS-8). Native UIKit-internal windows answer NO. */
 BOOL LC32NativeLegacyRotationWindowIsGuest(UIWindow *window);
+
+/* Supplied by the UIKit adapter: schedule the fixed-canvas presentation fit
+ * (uniform MIN scale plus centering composed onto the window layer's
+ * sublayer transform) for a window that just reported a geometry or
+ * orientation event.  The adapter re-checks the runtime-declared landscape
+ * phone-canvas class, the controller-less shape, and the live viewport, and
+ * coalesces the work onto the main queue; the call is cheap for processes
+ * outside the class, which never leave the static gates. */
+void LC32ScheduleNativeLegacyCanvasFit(UIWindow *window);
+
+/* Supplied by the UIKit adapter: adopt the canonical 320x480 canvas bounds
+ * for the drawable view that is about to allocate CAEAGLLayer renderbuffer
+ * storage.  The runtime-declared canvas class can reach this allocation
+ * with scene-sized launch bounds because the application's first UIScreen
+ * read precedes the status-bar request that defines the class; the adapter
+ * re-fits the view before storage is allocated so the renderbuffer, the
+ * read-back viewport, and the engine's fixed projection agree.  Returns
+ * whether the view was re-fitted. */
+BOOL LC32UIKitAdoptNativeLegacyCanvasDrawable(CAEAGLLayer *drawable);
 
 /* React to a newly recorded pre-iOS-8 status-bar request. Safe to call from
  * the guest's setter bridge: startup, main-thread, and declared-mask gates

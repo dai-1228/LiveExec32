@@ -75,6 +75,33 @@ typedef NS_ENUM(NSUInteger, LC32LegacyIPadGeometryMode) {
 @end
 
 /*
+ * Presentation state for a controller-less window of the runtime-declared
+ * landscape phone-canvas class.  The window layer's sublayer transform and
+ * background are the only owned pieces; everything else about the window is
+ * left exactly as the application and UIKit authored it.
+ */
+@interface LC32NativeCanvasFitState : NSObject {
+@public
+    CATransform3D originalSublayerTransform;
+    CATransform3D appliedSublayerTransform;
+    CGColorRef originalBackground;
+    CGColorRef appliedBackground;
+    BOOL hasTransform;
+    BOOL yielded;
+}
+@end
+
+@implementation LC32NativeCanvasFitState
+
+- (void)dealloc {
+    if(originalBackground) CGColorRelease(originalBackground);
+    if(appliedBackground) CGColorRelease(appliedBackground);
+    [super dealloc];
+}
+
+@end
+
+/*
 symbol = r0 + r1 << 32
 r0 = r2
 r1 = r3
@@ -111,6 +138,10 @@ const void *LC32LegacyOverlayLayoutPendingKey =
     &LC32LegacyOverlayLayoutPendingKey;
 const void *LC32LegacyRootWindowGeometryKey =
     &LC32LegacyRootWindowGeometryKey;
+const void *LC32NativeCanvasFitPendingKey =
+    &LC32NativeCanvasFitPendingKey;
+const void *LC32NativeCanvasFitStateKey =
+    &LC32NativeCanvasFitStateKey;
 
 struct LC32GuestUIKitPolicy {
     UIInterfaceOrientationMask declaredOrientations;
@@ -772,6 +803,11 @@ bool LC32FitLegacyDirectWindowLayers(UIWindow *window);
 void LC32RestoreRootlessRendererAutoresizing(UIWindow *window);
 bool LC32TransformNearlyEquals(
     CGAffineTransform left, CGAffineTransform right);
+bool LC32ObjectUsesGuestClass(id object);
+bool LC32NativeLegacyFixedPhoneCanvasClassActive(void);
+LC32SupportedDeviceFamilies LC32NativeLegacyCanvasBundleFamilies(void);
+bool LC32NativeLegacyCanvasWindowEligible(UIWindow *window);
+void LC32FitNativeLegacyCanvasWindow(UIWindow *window);
 UIInterfaceOrientation LC32LegacyRootWindowGeometry(
     UIView *view, bool requireGuestLandscapeBounds,
     UIWindow *installingWindow = nil, UIViewController *installingRoot = nil);
@@ -1756,6 +1792,184 @@ CGRect LC32LegacyViewportInView(UIWindow *window, UIView *view) {
            isfinite(viewport.size.height) &&
            viewport.size.width > 0 && viewport.size.height > 0
         ? viewport : fallback;
+}
+
+LC32SupportedDeviceFamilies LC32NativeLegacyCanvasBundleFamilies(void) {
+    static LC32SupportedDeviceFamilies families = {NO, NO};
+    /* UIKit can create internal windows while the shim dylib is loading.
+     * Do not consume the cache until LC32RunGuest has published the guest. */
+    const char *guestExecutable = getenv("LC32_GUEST_EXECUTABLE");
+    if(!guestExecutable || !guestExecutable[0]) return families;
+
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSString *path = [NSString stringWithUTF8String:
+            getenv("LC32_GUEST_EXECUTABLE")];
+        NSBundle *bundle = [NSBundle bundleWithPath:
+            path.stringByDeletingLastPathComponent];
+        families = LC32BundleSupportedDeviceFamilies(bundle);
+    });
+    return families;
+}
+
+bool LC32NativeLegacyFixedPhoneCanvasClassActive(void) {
+    /* The runtime-declared landscape phone canvas class: a keyless pre-iOS-8
+     * phone bundle that declared its interface orientation through the
+     * status-bar API. Gate order matters — every process outside the class
+     * (modern executables, key-declaring bundles, apps that never made a
+     * runtime request) leaves after the static and atomic loads. */
+    if(!LC32NativeLegacyRotationEnabled()) return false;
+    const UIInterfaceOrientation requested = (UIInterfaceOrientation)
+        LC32LegacyRequestedOrientation.load(std::memory_order_relaxed);
+    if(!UIInterfaceOrientationIsLandscape(requested)) return false;
+    const LC32GuestUIKitPolicy &policy = LC32GuestInterfacePolicy();
+    const LC32SupportedDeviceFamilies families =
+        LC32NativeLegacyCanvasBundleFamilies();
+    return LC32UsesRuntimeLandscapePhoneCanvas(
+        LC32GetGuestExecutableSDKVersion(), families.supportsPhone,
+        families.supportsPad,
+        policy.constrainsControllerOrientations ||
+            policy.usesLegacyInitialOrientation,
+        (NSInteger)requested);
+}
+
+bool LC32NativeLegacyCanvasWindowEligible(UIWindow *window) {
+    /* Only the controller-less shape that native legacy rotation already
+     * serves: a guest window with no root view controller. The rotation
+     * unit's controller-less turn and legacy backing keep producing the
+     * upright presentation; this presentation only adds the fill scale. */
+    return window && window.guest_selfOrNull && window.windowScene &&
+        !LC32NativeWindowRootViewController(window);
+}
+
+void LC32FitNativeLegacyCanvasWindow(UIWindow *window) {
+    /* Present the canonical 320x480 canvas of the runtime-declared class
+     * rotated by the existing native-mode backing (which already yields the
+     * upright content) and uniformly scaled to fill the live viewport.  The
+     * composed transform sits on the window layer's sublayer transform:
+     * the window keeps its exact UIView-level bounds, frame, and transform,
+     * the rotation lifecycle never inspects it, and UIKit hit-testing applies
+     * its inverse before delivering touches, exactly as for the canvas-mode
+     * rootless compositor. */
+    if(!LC32NativeLegacyCanvasWindowEligible(window)) return;
+    CALayer *windowLayer = LC32NativeViewLayer(window);
+    if(!windowLayer || LC32ObjectUsesGuestClass(windowLayer)) return;
+
+    LC32NativeCanvasFitState *state = objc_getAssociatedObject(
+        window, LC32NativeCanvasFitStateKey);
+    if(state && state->yielded) return;
+    if(!LC32NativeLegacyFixedPhoneCanvasClassActive()) {
+        /* The recorded request defines the class; a later non-landscape
+         * request must not leave a stale fit behind. Restore only the pieces
+         * still ours, mirroring the rootless placement reconciliation. */
+        if(!state || !state->hasTransform) return;
+        if(!CATransform3DEqualToTransform(
+                windowLayer.sublayerTransform,
+                state->appliedSublayerTransform)) {
+            state->yielded = YES;
+            return;
+        }
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        windowLayer.sublayerTransform = state->originalSublayerTransform;
+        if(state->appliedBackground && windowLayer.backgroundColor ==
+                state->appliedBackground) {
+            windowLayer.backgroundColor = state->originalBackground;
+        }
+        [CATransaction commit];
+        state->hasTransform = NO;
+        state->appliedSublayerTransform = CATransform3DIdentity;
+        if(state->appliedBackground) {
+            CGColorRelease(state->appliedBackground);
+            state->appliedBackground = NULL;
+        }
+        if(state->originalBackground) {
+            CGColorRelease(state->originalBackground);
+            state->originalBackground = NULL;
+        }
+        return;
+    }
+
+    const CGRect viewport = LC32LegacyViewportInView(window, window);
+    constexpr CGSize canvasSize = {320, 480};
+    const CGAffineTransform target = LC32PhoneCanvasFitTransform(
+        viewport, canvasSize.width, canvasSize.height);
+    if(!(target.a > 0) || !isfinite(target.a)) return;
+    const CGRect canvasRect = CGRectApplyAffineTransform(
+        CGRectMake(0, 0, canvasSize.width, canvasSize.height), target);
+    const CGRect windowBounds = windowLayer.bounds;
+    if(!isfinite(canvasRect.origin.x) || !isfinite(canvasRect.origin.y) ||
+            !isfinite(windowBounds.origin.x) ||
+            !isfinite(windowBounds.origin.y)) {
+        return;
+    }
+    /* The uniformly scaled canvas must stay inside the window's hit region:
+     * drawing or hit-testing beyond a window's bounds is not served by the
+     * compositor, so a window that does not cover the presentation keeps its
+     * existing layout instead (the caller retries on the next event). */
+    if(!CGRectContainsRect(CGRectInset(windowBounds, -0.5, -0.5),
+                           canvasRect)) {
+        return;
+    }
+
+    const CATransform3D desired =
+        CATransform3DMakeAffineTransform(target);
+    if(!state) {
+        if(!CATransform3DIsIdentity(windowLayer.sublayerTransform)) {
+            /* Another owner already composes this window's sublayers. */
+            return;
+        }
+        state = [LC32NativeCanvasFitState new];
+        state->originalSublayerTransform = windowLayer.sublayerTransform;
+        objc_setAssociatedObject(window, LC32NativeCanvasFitStateKey,
+            state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [state release];
+    } else if(!CATransform3DEqualToTransform(
+                  windowLayer.sublayerTransform,
+                  state->appliedSublayerTransform) &&
+            !CATransform3DEqualToTransform(
+                  windowLayer.sublayerTransform,
+                  state->originalSublayerTransform)) {
+        /* UIKit or another owner replaced the compositor transform; preserve
+         * it and stop fitting this window, exactly like the canvas-mode
+         * sublayer compositor's takeover handling. */
+        state->yielded = YES;
+        return;
+    }
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    const BOOL changed = !CATransform3DEqualToTransform(
+        windowLayer.sublayerTransform, desired);
+    if(changed) {
+        windowLayer.sublayerTransform = desired;
+    }
+    state->appliedSublayerTransform = desired;
+    state->hasTransform = YES;
+    if(!state->appliedBackground) {
+        /* The letterbox area only ever shows the window background; the
+         * compatibility container paints it black, so match that here.  The
+         * original is restored if the class deactivates or never engages. */
+        state->originalBackground = windowLayer.backgroundColor;
+        if(state->originalBackground) {
+            CGColorRetain(state->originalBackground);
+        }
+        state->appliedBackground = [UIColor blackColor].CGColor;
+        CGColorRetain(state->appliedBackground);
+        windowLayer.backgroundColor = state->appliedBackground;
+    }
+    [CATransaction commit];
+
+    /* The live viewport can keep settling after any single event (the
+     * Classic-Mode startup expansions). Revalidate once more whenever this
+     * pass actually moved the canvas; the chain terminates as soon as the
+     * viewport stabilizes, because an unchanged transform schedules
+     * nothing. */
+    if(changed) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            LC32FitNativeLegacyCanvasWindow(window);
+        });
+    }
 }
 
 UIInterfaceOrientation LC32WindowSceneOrientation(
@@ -3300,6 +3514,72 @@ extern "C" BOOL LC32NativeLegacyRotationWindowIsGuest(UIWindow *window) {
      * effective process SDK does, so it counts as pre-iOS-8 here. */
     return window && window.guest_selfOrNull &&
         LC32GetGuestExecutableSDKVersion() < 0x80000;
+}
+
+extern "C" BOOL LC32UIKitUsesNativeFixedPhoneCanvas(void) {
+    /* Serves the guest UIScreen overrides: the recorded runtime status-bar
+     * request can arrive between two reads, so the answer must stay live
+     * instead of being cached once like the plist-declared classifiers. */
+    return LC32NativeLegacyFixedPhoneCanvasClassActive();
+}
+
+extern "C" void LC32ScheduleNativeLegacyCanvasFit(UIWindow *window) {
+    if(!LC32NativeLegacyCanvasWindowEligible(window)) return;
+    if(!LC32NativeLegacyFixedPhoneCanvasClassActive() &&
+            !objc_getAssociatedObject(window, LC32NativeCanvasFitStateKey)) {
+        return;
+    }
+    if(objc_getAssociatedObject(window, LC32NativeCanvasFitPendingKey)) {
+        return;
+    }
+    objc_setAssociatedObject(window, LC32NativeCanvasFitPendingKey,
+        @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        objc_setAssociatedObject(window, LC32NativeCanvasFitPendingKey,
+            nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        LC32FitNativeLegacyCanvasWindow(window);
+    });
+}
+
+extern "C" BOOL LC32UIKitAdoptNativeLegacyCanvasDrawable(CAEAGLLayer *drawable) {
+    /* The application sizes its renderer from the spoofed UIScreen bounds.
+     * For this class the defining status-bar request is still in the future
+     * at that first read, so the drawable can arrive scene-sized.  Re-fit
+     * the owning view to the canonical canvas before storage is allocated:
+     * the renderbuffer, the read-back viewport, and the engine's fixed
+     * 320x480 projection then agree exactly as they would have on the
+     * 2009-era device whose geometry the class reproduces.  Only native
+     * UIView implementations are invoked; engines of this shape never
+     * re-read their own view geometry after the drawable exists. */
+    if(!drawable || !LC32NativeLegacyFixedPhoneCanvasClassActive()) return NO;
+    UIView *owner = (UIView *)drawable.delegate;
+    if(![owner isKindOfClass:UIView.class] ||
+            !LC32ObjectUsesGuestClass(owner)) {
+        return NO;
+    }
+    const CGRect bounds = LC32NativeViewBounds(owner);
+    if(!LC32TransformNearlyEquals(LC32NativeViewTransform(owner),
+                                  CGAffineTransformIdentity)) {
+        return NO;
+    }
+    constexpr CGFloat epsilon = 0.5;
+    /* Portrait-ordered launch bounds that cover the canonical canvas but
+     * are not already exactly it. */
+    if(!(bounds.size.height > bounds.size.width) ||
+            bounds.size.width < 320 - epsilon ||
+            bounds.size.height < 480 - epsilon ||
+            (fabs(bounds.size.width - 320) < epsilon &&
+             fabs(bounds.size.height - 480) < epsilon)) {
+        return NO;
+    }
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    LC32NativeSetViewBounds(owner, CGRectMake(
+        bounds.origin.x, bounds.origin.y, 320, 480));
+    LC32NativeSetViewCenter(owner, CGPointMake(
+        bounds.origin.x + 160, bounds.origin.y + 240));
+    [CATransaction commit];
+    return YES;
 }
 
 extern "C" u32 LC32UIKitGetLegacyControllerOrientation(
