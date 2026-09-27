@@ -10,6 +10,7 @@
 
 @interface LC32LegacyRotationState : NSObject
 @property(nonatomic, weak) UIViewController *initializedController;
+@property(nonatomic) BOOL initializedControllerless;
 @end
 @implementation LC32LegacyRotationState
 @end
@@ -78,6 +79,13 @@ NSHashTable<UIViewController *> *Controllers() {
     static dispatch_once_t once;
     dispatch_once(&once, ^{ controllers = [NSHashTable weakObjectsHashTable]; });
     return controllers;
+}
+
+NSHashTable<UIWindow *> *ControllerlessWindows() {
+    static NSHashTable<UIWindow *> *windows;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ windows = [NSHashTable weakObjectsHashTable]; });
+    return windows;
 }
 
 UIView *NativeView(UIViewController *controller) {
@@ -160,6 +168,24 @@ UIViewController *ControllerForWindow(UIWindow *window, bool forBacking = false)
     return candidate;
 }
 
+bool ControllerlessLegacyWindow(UIWindow *window) {
+    /* Main-nib applications from the controller-less era archived their
+     * drawable directly under the window: no root controller, no
+     * renderer-owned controller, only subviews. Their pre-iOS-8 coordinates
+     * still need the inverse root-layer rotation whenever the scene turns,
+     * but nothing in their hierarchy may be asked a rotation-policy
+     * question, so they cannot enter through the controller table. */
+    if(!window || NativeRoot(window)) return false;
+    if(ControllerForWindow(window, true)) return false;
+    return LC32NativeLegacyRotationWindowIsGuest(window);
+}
+
+bool WindowNeedsLegacyBacking(UIWindow *window) {
+    if(!window) return false;
+    if(ControllerForWindow(window, true)) return true;
+    return ControllerlessLegacyWindow(window);
+}
+
 UIInterfaceOrientation OrientationNamed(id name) {
     if([name isEqual:@"UIInterfaceOrientationPortrait"]) return UIInterfaceOrientationPortrait;
     if([name isEqual:@"UIInterfaceOrientationPortraitUpsideDown"]) return UIInterfaceOrientationPortraitUpsideDown;
@@ -191,7 +217,13 @@ UIInterfaceOrientationMask DeclaredOrientations() {
 
 UIInterfaceOrientation PreferredOrientation() {
     UIInterfaceOrientationMask mask = DeclaredOrientations();
-    UIInterfaceOrientation current = UIApplication.sharedApplication.statusBarOrientation;
+    // A pre-iOS-8 application can declare its interface orientation through
+    // the status-bar API instead of the Info.plist. Mirror the canvas-mode
+    // target resolution: the explicit runtime request wins over the status
+    // bar, the plist hint, and the first declared name.
+    UIInterfaceOrientation current = LC32LegacyRequestedStatusBarOrientation();
+    if(OrientationBit(current) & mask) return current;
+    current = UIApplication.sharedApplication.statusBarOrientation;
     if(OrientationBit(current) & mask) return current;
     current = OrientationNamed(NSBundle.mainBundle.infoDictionary[@"UIInterfaceOrientation"]);
     if(OrientationBit(current) & mask) return current;
@@ -221,11 +253,43 @@ BOOL QueryRotation(UIWindow *window, UIViewController *controller,
         @selector(shouldAutorotateToInterfaceOrientation:), orientation);
 }
 
+void UpdateControllerlessWindow(UIWindow *window,
+        UIInterfaceOrientation orientation, bool initialOnly) {
+    /* A controller-less window follows the pre-iOS-8 status-bar contract:
+     * the application declared its interface orientation exclusively through
+     * setStatusBarOrientation: and rotates its content itself. Turn the
+     * window only to that explicitly requested orientation; ambient device
+     * and plist fallbacks must not invent turns for a hierarchy that has no
+     * rotation policy to consult. */
+    const UIInterfaceOrientation requested =
+        LC32LegacyRequestedStatusBarOrientation();
+    if(!OrientationBit(requested) || orientation != requested) return;
+    LC32LegacyRotationState *state = WindowState(window);
+    const bool initializing = !state.initializedControllerless;
+    if(initialOnly && !initializing) return;
+    // The swizzled update refreshes the restored backing on both sides of
+    // the turn, keeping the window extent and its inverse root-layer
+    // rotation in the same order as the explicit-root path.
+    SEL rotate = sel_registerName("_updateToInterfaceOrientation:duration:force:");
+    if([window respondsToSelector:rotate]) {
+        ((void (*)(id, SEL, UIInterfaceOrientation, NSTimeInterval, BOOL))objc_msgSend)(
+            window, rotate, orientation, 0, YES);
+    } else {
+        [UIViewController attemptRotationToDeviceOrientation];
+    }
+    state.initializedControllerless = YES;
+}
+
 void UpdateWindow(UIWindow *window, UIInterfaceOrientation orientation,
         bool initialOnly) {
     if(!pthread_main_np() || !startupFinished) return;
     UIViewController *controller = ControllerForWindow(window, true);
-    if(!controller || !(OrientationBit(orientation) & DeclaredOrientations())) return;
+    if(!controller && !ControllerlessLegacyWindow(window)) return;
+    if(!(OrientationBit(orientation) & DeclaredOrientations())) return;
+    if(!controller) {
+        UpdateControllerlessWindow(window, orientation, initialOnly);
+        return;
+    }
     UIView *view = NativeView(controller);
     if(!view || NativeWindow(view) != window) return;
     // Synchronize the portrait window extent before a guest rotation callback
@@ -298,6 +362,11 @@ void UpdateWindows(UIInterfaceOrientation orientation, bool initialOnly) {
         UIWindow *window = view ? NativeWindow(view) : nil;
         if(window) [windows addObject:window];
     }
+    // Controller-less guest windows have no registered controller to
+    // enumerate from; the visibility observer records them instead.
+    for(UIWindow *window in ControllerlessWindows()) {
+        if(window) [windows addObject:window];
+    }
     for(UIWindow *window in windows) UpdateWindow(window, orientation, initialOnly);
 }
 
@@ -341,6 +410,17 @@ extern "C" void LC32FinishNativeLegacyRotationStartup(void) {
     if(!LC32NativeLegacyRotationEnabled()) return;
     startupFinished = true;
     UpdateWindows(PreferredOrientation(), true);
+}
+
+extern "C" void LC32NativeLegacyRotationRefreshRequested(
+        UIInterfaceOrientation orientation) {
+    if(!LC32NativeLegacyRotationEnabled()) return;
+    /* The bridge invokes this while the guest's status-bar setter is still
+     * on the JIT stack; UpdateWindow applies the startup, main-thread, and
+     * declared-mask gates, and never asks this guest hierarchy a policy
+     * question. */
+    if(!OrientationBit(orientation)) return;
+    UpdateWindows(orientation, false);
 }
 
 @interface UIViewController (LC32NativeLegacyRotation)
@@ -393,6 +473,7 @@ extern "C" void LC32FinishNativeLegacyRotationStartup(void) {
 - (BOOL)lc32_windowOwnsInterfaceOrientationTransform;
 - (BOOL)lc32_shouldAutorotateToInterfaceOrientation:(UIInterfaceOrientation)orientation
     checkForDismissal:(BOOL)check isRotationDisabled:(BOOL *)disabled;
++ (void)lc32_nativeLegacyWindowDidBecomeVisible:(NSNotification *)notification;
 + (void)lc32_nativeLegacyDeviceOrientationChanged:(NSNotification *)notification;
 @end
 
@@ -405,8 +486,10 @@ extern "C" void LC32FinishNativeLegacyRotationStartup(void) {
     // Old-policy rootless controllers retain their renderer-owned turn
     // lifecycle. Controllers without that policy only need backing updates.
     UIViewController *backingController = ControllerForWindow(self, true);
-    BOOL legacy = backingController && (NativeRoot(self) ||
-        !UsesLegacyRotationPolicy(object_getClass(backingController)));
+    BOOL legacy = backingController
+        ? (NativeRoot(self) ||
+           !UsesLegacyRotationPolicy(object_getClass(backingController)))
+        : ControllerlessLegacyWindow(self);
     SEL refresh = sel_registerName("_updateTransformLayer");
     if(legacy) ((void (*)(id, SEL))objc_msgSend)(self, refresh);
     [self lc32_updateToInterfaceOrientation:orientation duration:duration force:force];
@@ -416,7 +499,7 @@ extern "C" void LC32FinishNativeLegacyRotationStartup(void) {
         transformLayer:(CALayer *)transform {
     // A presented overlay suspends the renderer's rotation queries, not the
     // backing coordinate system of the window beneath it.
-    if(!ControllerForWindow(self, true)) {
+    if(!WindowNeedsLegacyBacking(self)) {
         [self lc32_configureRootLayer:root sceneTransformLayer:scene transformLayer:transform];
         return;
     }
@@ -438,6 +521,23 @@ extern "C" void LC32FinishNativeLegacyRotationStartup(void) {
 }
 - (BOOL)lc32_windowOwnsInterfaceOrientationTransform {
     return configuringLegacyWindow == self || [self lc32_windowOwnsInterfaceOrientationTransform];
+}
++ (void)lc32_nativeLegacyWindowDidBecomeVisible:(NSNotification *)notification {
+    UIWindow *window = [notification.object isKindOfClass:UIWindow.class]
+        ? (UIWindow *)notification.object : nil;
+    /* Only controller-less guest windows need this discovery: every window
+     * with a registered controller is already enumerated through the
+     * controller table. A main-nib window can become visible before its
+     * renderer is added, so revalidate ownership on the deferred pass. */
+    if(!window || !pthread_main_np() || !ControllerlessLegacyWindow(window)) return;
+    [ControllerlessWindows() addObject:window];
+    if(!startupFinished) return;
+    __weak UIWindow *pendingWindow = window;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *target = pendingWindow;
+        if(target && ControllerlessLegacyWindow(target))
+            UpdateWindow(target, PreferredOrientation(), true);
+    });
 }
 + (void)load {
     if(!LC32NativeLegacyRotationEnabled()) return;
@@ -468,6 +568,9 @@ extern "C" void LC32FinishNativeLegacyRotationStartup(void) {
     [NSNotificationCenter.defaultCenter addObserver:self
         selector:@selector(lc32_nativeLegacyDeviceOrientationChanged:)
         name:UIDeviceOrientationDidChangeNotification object:nil];
+    [NSNotificationCenter.defaultCenter addObserver:self
+        selector:@selector(lc32_nativeLegacyWindowDidBecomeVisible:)
+        name:UIWindowDidBecomeVisibleNotification object:nil];
 }
 
 - (BOOL)lc32_shouldAutorotateToInterfaceOrientation:(UIInterfaceOrientation)orientation

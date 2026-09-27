@@ -1,0 +1,40 @@
+name: Zenonia compat host tests
+
+on:
+  push:
+    branches: [zenonia-compat]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-tests:
+    runs-on: macos-26
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        submodules: recursive
+        persist-credentials: false
+
+    - name: Install GNU make
+      shell: bash
+      run: brew install make
+
+    - name: Run legacy status-bar orientation host test
+      shell: bash
+      run: gmake -C test check-uikit-legacy-statusbar-orientation
+
+    - name: Run legacy nib loading host test
+      shell: bash
+      run: gmake -C test check-legacy-nib-loading
+
+    - name: Run UIKit background tasks host test
+      shell: bash
+      run: gmake -C test check-uikit-background-tasks

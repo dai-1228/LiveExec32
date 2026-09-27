@@ -10,14 +10,17 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 device=booted
 build_only=0
 keep=0
+keyless=0
 sdks=
 test_cases=
+cases_given=0
 run_timeout=${LC32_ROOTLESS_ROTATION_TIMEOUT:-30}
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --device) [ "$#" -ge 2 ] || exit 2; device=$2; shift 2 ;;
         --build-only) build_only=1; keep=1; shift ;;
         --keep) keep=1; shift ;;
+        --keyless) keyless=1; shift ;;
         --sdk)
             [ "$#" -ge 2 ] || exit 2
             case "$2" in 2|5|6.1|7|8|11) sdks="$sdks $2" ;; *) exit 2 ;; esac
@@ -25,16 +28,24 @@ while [ "$#" -gt 0 ]; do
         --case)
             [ "$#" -ge 2 ] || exit 2
             case "$2" in
-                rootless|explicit|modern|modern-explicit|modern-only|modern-refresh|unregistered|manual|manual-controller|modal|manual-disabled|lifecycle|ownership|replacement)
+                rootless|explicit|modern|modern-explicit|modern-only|modern-refresh|unregistered|manual|manual-controller|modal|manual-disabled|lifecycle|ownership|replacement|controllerless|statusbar-request)
                     test_cases="$test_cases $2" ;;
                 *) exit 2 ;;
             esac
+            cases_given=1
             shift 2 ;;
-        *) echo "usage: $0 [--device UDID] [--build-only] [--keep] [--sdk 2|5|6.1|7|8|11] [--case NAME]" >&2; exit 2 ;;
+        *) echo "usage: $0 [--device UDID] [--build-only] [--keep] [--keyless] [--sdk 2|5|6.1|7|8|11] [--case NAME]" >&2; exit 2 ;;
     esac
 done
 [ -n "$sdks" ] || sdks="2 5 6.1 7 8 11"
-[ -n "$test_cases" ] || test_cases="rootless explicit modern modern-explicit modern-only modern-refresh unregistered manual manual-controller modal manual-disabled lifecycle ownership replacement"
+[ -n "$test_cases" ] || test_cases="rootless explicit modern modern-explicit modern-only modern-refresh unregistered manual manual-controller modal manual-disabled lifecycle ownership replacement controllerless statusbar-request"
+# The keyless variant reproduces a 2009 orientation-less Info.plist (no
+# UISupportedInterfaceOrientations array, phone-only family). Its default
+# case set covers the status-bar contract that replaces the missing
+# declaration.
+if [ "$keyless" -eq 1 ] && [ "$cases_given" -eq 0 ]; then
+    test_cases="controllerless statusbar-request"
+fi
 case "$run_timeout" in ''|*[!0-9]*) echo "invalid timeout" >&2; exit 2 ;; esac
 [ "$run_timeout" -ge 1 ] && [ "$run_timeout" -le 60 ] || exit 2
 temp_base=$(CDPATH= cd -- "${TMPDIR:-/tmp}" && pwd -P)
@@ -78,6 +89,12 @@ for sdk in $sdks; do
     esac
     app="$workdir/sdk$sdk.app"
     bundle="org.liveexec32.test.rootlessrotation.$run_id.sdk$sdk"
+    variant=""
+    if [ "$keyless" -eq 1 ]; then
+        variant="-keyless"
+        app="$workdir/sdk$sdk$variant.app"
+        bundle="$bundle$variant"
+    fi
     mkdir "$app"
     plist="$app/Info.plist"
     plutil -create xml1 "$plist"
@@ -89,11 +106,19 @@ for sdk in $sdks; do
     plutil -insert CFBundleShortVersionString -string 1.0 "$plist"
     plutil -insert MinimumOSVersion -string 11.0 "$plist"
     plutil -insert LSRequiresIPhoneOS -bool YES "$plist"
-    plutil -insert UIDeviceFamily -json '[1,2]' "$plist"
+    if [ "$keyless" -eq 1 ]; then
+        # 2009 shape: phone-only family, no orientation keys at all. The
+        # game declares its orientation through the status-bar API.
+        plutil -insert UIDeviceFamily -json '[1]' "$plist"
+    else
+        plutil -insert UIDeviceFamily -json '[1,2]' "$plist"
+    fi
     plutil -insert CFBundleSupportedPlatforms -json '["iPhoneSimulator"]' "$plist"
     plutil -insert UIStatusBarHidden -bool YES "$plist"
-    plutil -insert UISupportedInterfaceOrientations -json \
-        '["UIInterfaceOrientationLandscapeRight","UIInterfaceOrientationLandscapeLeft"]' "$plist"
+    if [ "$keyless" -ne 1 ]; then
+        plutil -insert UISupportedInterfaceOrientations -json \
+            '["UIInterfaceOrientationLandscapeRight","UIInterfaceOrientationLandscapeLeft"]' "$plist"
+    fi
     plutil -insert LC32ExpectedSDK -integer "$sdk_value" "$plist"
     xcrun vtool -set-build-version 7 11.0 "$sdk_version" -replace \
         -output "$app/RootlessRotation" "$workdir/test"

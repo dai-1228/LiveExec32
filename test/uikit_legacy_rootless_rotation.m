@@ -19,6 +19,21 @@
 static BOOL guestCallsAllowed = YES;
 BOOL LC32NativeLegacyRotationCanCallGuest(void) { return guestCallsAllowed; }
 
+/* Stand-ins for the UIKit-adapter-supplied hooks declared in
+ * LC32LegacyRotation.h: an explicit recorded status-bar request and an
+ * explicit guest-window classification replace the uncompiled adapter. */
+static UIInterfaceOrientation requestedStatusBarOrientation =
+    UIInterfaceOrientationUnknown;
+static __unsafe_unretained UIWindow *controllerlessGuestWindow;
+
+UIInterfaceOrientation LC32LegacyRequestedStatusBarOrientation(void) {
+    return requestedStatusBarOrientation;
+}
+
+BOOL LC32NativeLegacyRotationWindowIsGuest(UIWindow *window) {
+    return window != nil && window == controllerlessGuestWindow;
+}
+
 static int failures;
 static unsigned legacyQueries;
 static unsigned legacyLandscapeQueries;
@@ -187,6 +202,68 @@ static uint32_t executableSDK(void) {
     }
 }
 @end
+
+/* The 2009 main-nib shape: a guest window whose only content is a drawable
+ * subview with no view controller anywhere. Refresh counters let the
+ * deterministic probes observe production backing updates without asking
+ * the compositor to rotate. */
+@interface RootlessRotationControllerlessWindow : RootlessRotationWindow
+@property(nonatomic) BOOL recordRefreshes;
+@property(nonatomic) unsigned refreshes;
+@end
+@implementation RootlessRotationControllerlessWindow
+- (void)_updateTransformLayer {
+    if(self.recordRefreshes) ++self.refreshes;
+    else {
+        struct objc_super parent = {self, UIWindow.class};
+        ((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(
+            &parent, sel_registerName("_updateTransformLayer"));
+    }
+}
+@end
+
+static unsigned controllerlessUpdateCalls;
+static unsigned controllerlessUpdateDurationZero;
+static BOOL controllerlessUpdateForced;
+static UIInterfaceOrientation controllerlessUpdateOrientation;
+static __unsafe_unretained UIWindow *controllerlessUpdateWindow;
+static void nativeControllerlessOrientationUpdateProbe(
+        UIWindow *window, SEL selector, UIInterfaceOrientation orientation,
+        NSTimeInterval duration, BOOL force) {
+    (void)selector;
+    ++controllerlessUpdateCalls;
+    controllerlessUpdateWindow = window;
+    controllerlessUpdateOrientation = orientation;
+    controllerlessUpdateDurationZero += duration == 0;
+    controllerlessUpdateForced = force;
+}
+
+static UIInterfaceOrientation fixtureOrientationNamed(NSString *name) {
+    if([name isEqualToString:@"UIInterfaceOrientationPortrait"])
+        return UIInterfaceOrientationPortrait;
+    if([name isEqualToString:@"UIInterfaceOrientationPortraitUpsideDown"])
+        return UIInterfaceOrientationPortraitUpsideDown;
+    if([name isEqualToString:@"UIInterfaceOrientationLandscapeLeft"])
+        return UIInterfaceOrientationLandscapeLeft;
+    if([name isEqualToString:@"UIInterfaceOrientationLandscapeRight"])
+        return UIInterfaceOrientationLandscapeRight;
+    return UIInterfaceOrientationUnknown;
+}
+
+/* The production unit reads the same Info.plist; an orientation-less bundle
+ * (the --keyless app variant) falls back to AllButUpsideDown. */
+static UIInterfaceOrientationMask fixtureDeclaredOrientationMask(void) {
+    NSArray *names = [NSBundle.mainBundle objectForInfoDictionaryKey:
+        @"UISupportedInterfaceOrientations"];
+    if(![names isKindOfClass:NSArray.class] || !names.count)
+        return UIInterfaceOrientationMaskAllButUpsideDown;
+    UIInterfaceOrientationMask mask = 0;
+    for(id value in names) {
+        mask |= (UIInterfaceOrientationMask)1 <<
+            (NSUInteger)fixtureOrientationNamed(value);
+    }
+    return mask ?: UIInterfaceOrientationMaskAllButUpsideDown;
+}
 
 static unsigned updateProbeCalls;
 static unsigned updateProbeRefreshes;
@@ -445,12 +522,38 @@ static void nativeOrientationUpdateProbe(RootlessRotationRefreshWindow *window, 
         controllerClass = RootlessRotationUnregisteredController.class;
     if([testCase isEqualToString:@"manual-controller"])
         controllerClass = RootlessRotationManualController.class;
+    if([testCase isEqualToString:@"statusbar-request"])
+        controllerClass = RootlessRotationRegisteredModernController.class;
     CGRect bounds = UIScreen.mainScreen.bounds;
+    if([testCase isEqualToString:@"controllerless"]) {
+        /* No controller anywhere: a guest window with only a drawable
+         * subview, exactly the main-nib games this contract restores. */
+        self.window = [[RootlessRotationControllerlessWindow alloc]
+            initWithFrame:bounds];
+        controllerlessGuestWindow = self.window;
+        self.content = [[RootlessRotationGuestView alloc] initWithFrame:bounds];
+        self.initialContentFrame = self.content.frame;
+        self.initialContentBounds = self.content.bounds;
+        self.content.backgroundColor = UIColor.blueColor;
+        [self.window addSubview:self.content];
+        [self dumpState:"before-visible"];
+        [self.window makeKeyAndVisible];
+        [self dumpState:"after-visible"];
+        self.visibleSubviewCount = self.window.subviews.count;
+        [self.window makeKeyAndVisible];
+        check("controllerless-repeated-visible-is-idempotent",
+            self.window.subviews.count == self.visibleSubviewCount);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
+            dispatch_get_main_queue(), ^{
+                [self finishStartupAndScheduleChecks];
+            });
+        return YES;
+    }
     self.window = [[RootlessRotationWindow alloc] initWithFrame:bounds];
     self.controller = [[controllerClass alloc] init];
     if(expectedEnabled && self.controller && controllerClass == RootlessRotationLegacyController.class) {
         check("legacy-supported-mask", self.controller.supportedInterfaceOrientations ==
-            UIInterfaceOrientationMaskLandscape);
+            fixtureDeclaredOrientationMask());
         check("policy-query-does-not-probe-legacy-callback", legacyQueries == 0);
     }
     self.content = [[UIView alloc] initWithFrame:bounds];
@@ -943,6 +1046,147 @@ static void nativeOrientationUpdateProbe(RootlessRotationRefreshWindow *window, 
         CGPointEqualToPoint(transform.position, center) &&
         CGPointEqualToPoint(windowLayer.position, center));
 }
+- (void)checkControllerlessStatusBarContract {
+    /* The controller-less pre-iOS-8 status-bar contract: a guest window with
+     * no controller turns only to its explicitly requested orientation, and
+     * only after startup settles. Deterministic probes replace the native
+     * orientation update so the compositor is never asked to rotate. */
+    SEL originalSelector =
+        sel_registerName("lc32_updateToInterfaceOrientation:duration:force:");
+    SEL selector = sel_registerName("_updateToInterfaceOrientation:duration:force:");
+    Method update = class_getInstanceMethod(UIWindow.class, selector);
+    Method original = class_getInstanceMethod(UIWindow.class, originalSelector);
+    check("controllerless-update-entrypoints-present", update && original);
+    if(!update || !original) return;
+    Dl_info updateInfo = {0};
+    BOOL resolved = dladdr((const void *)method_getImplementation(update),
+        &updateInfo) != 0;
+    check("controllerless-update-hook-matches-sdk-gate", resolved &&
+        (updateInfo.dli_fbase == _dyld_get_image_header(0)) == expectedEnabled);
+    if(!expectedEnabled) return;
+
+    UIWindow *window = self.window;
+    check("controllerless-window-has-no-root", window.rootViewController == nil);
+    IMP saved = method_setImplementation(
+        original, (IMP)nativeControllerlessOrientationUpdateProbe);
+    @try {
+        requestedStatusBarOrientation = UIInterfaceOrientationLandscapeRight;
+        controllerlessUpdateCalls = 0;
+        LC32FinishNativeLegacyRotationStartup();
+        check("controllerless-requested-turn-delivered",
+            controllerlessUpdateCalls == 1 &&
+            controllerlessUpdateWindow == window &&
+            controllerlessUpdateOrientation == UIInterfaceOrientationLandscapeRight &&
+            controllerlessUpdateDurationZero == 1 &&
+            controllerlessUpdateForced);
+        controllerlessUpdateCalls = 0;
+        LC32FinishNativeLegacyRotationStartup();
+        check("controllerless-startup-turn-once", controllerlessUpdateCalls == 0);
+        requestedStatusBarOrientation = UIInterfaceOrientationLandscapeLeft;
+        controllerlessUpdateCalls = 0;
+        LC32NativeLegacyRotationRefreshRequested(UIInterfaceOrientationLandscapeLeft);
+        check("controllerless-changed-request-turned",
+            controllerlessUpdateCalls == 1 &&
+            controllerlessUpdateOrientation == UIInterfaceOrientationLandscapeLeft);
+        controllerlessUpdateCalls = 0;
+        LC32NativeLegacyRotationRefreshRequested(UIInterfaceOrientationPortrait);
+        check("controllerless-ambient-orientation-not-turned",
+            controllerlessUpdateCalls == 0);
+        requestedStatusBarOrientation = UIInterfaceOrientationUnknown;
+    } @finally {
+        method_setImplementation(original, saved);
+    }
+    check("controllerless-original-update-imp-restored",
+        method_getImplementation(original) == saved);
+
+    /* Legacy backing selection must cover the controller-less guest window
+     * while leaving an unmarked native window untouched. The ownership probe
+     * replaces only the saved original alias during a synchronous call. */
+    SEL configure = sel_registerName("_configureRootLayer:sceneTransformLayer:transformLayer:");
+    SEL originalConfigure =
+        sel_registerName("lc32_configureRootLayer:sceneTransformLayer:transformLayer:");
+    SEL originalOwnership = sel_registerName("lc32_windowOwnsInterfaceOrientation");
+    SEL originalTransform = sel_registerName("lc32_windowOwnsInterfaceOrientationTransform");
+    Method configureMethod = class_getInstanceMethod(UIWindow.class, configure);
+    Method savedConfigureMethod = class_getInstanceMethod(UIWindow.class, originalConfigure);
+    Method savedOwnershipMethod = class_getInstanceMethod(UIWindow.class, originalOwnership);
+    Method savedTransformMethod = class_getInstanceMethod(UIWindow.class, originalTransform);
+    check("controllerless-backing-entrypoints-present", configureMethod &&
+        savedConfigureMethod && savedOwnershipMethod && savedTransformMethod);
+    if(!configureMethod || !savedConfigureMethod || !savedOwnershipMethod ||
+            !savedTransformMethod) return;
+    UIWindow *unmarkedWindow = [[UIWindow alloc] initWithFrame:window.frame];
+    for(unsigned attempt = 0; attempt < 2; ++attempt) {
+        UIWindow *subject = attempt ? unmarkedWindow : window;
+        CALayer *root = CALayer.layer;
+        CALayer *scene = CALayer.layer;
+        CALayer *transform = CALayer.layer;
+        ownershipOtherWindow = attempt ? window : unmarkedWindow;
+        ownershipExpectedRoot = root;
+        ownershipExpectedScene = scene;
+        ownershipExpectedTransform = transform;
+        ownershipThrow = NO;
+        ownershipCalls = 0;
+        ownershipObservedOrientation = NO;
+        ownershipObservedTransform = NO;
+        ownershipObservedOtherOrientation = YES;
+        ownershipObservedOtherTransform = YES;
+        IMP savedConfigure = method_setImplementation(
+            savedConfigureMethod, (IMP)nativeConfigureOwnershipProbe);
+        IMP savedOrientation = method_setImplementation(
+            savedOwnershipMethod, (IMP)nativeDoesNotOwnOrientation);
+        IMP savedTransform = method_setImplementation(
+            savedTransformMethod, (IMP)nativeDoesNotOwnOrientation);
+        @try {
+            ((void (*)(id, SEL, CALayer *, CALayer *, CALayer *))objc_msgSend)(
+                subject, configure, ownershipExpectedRoot,
+                ownershipExpectedScene, ownershipExpectedTransform);
+        } @finally {
+            method_setImplementation(savedConfigureMethod, savedConfigure);
+            method_setImplementation(savedOwnershipMethod, savedOrientation);
+            method_setImplementation(savedTransformMethod, savedTransform);
+        }
+        const BOOL selected = attempt == 0;
+        check(selected ? "controllerless-backing-selected" :
+                "controllerless-unmarked-window-unchanged",
+            ownershipObservedOrientation == selected &&
+            ownershipObservedTransform == selected &&
+            !ownershipObservedOtherOrientation &&
+            !ownershipObservedOtherTransform &&
+            ownershipArgumentsPreserved && ownershipCalls == 1);
+    }
+    ownershipOtherWindow = nil;
+    ownershipExpectedRoot = nil;
+    ownershipExpectedScene = nil;
+    ownershipExpectedTransform = nil;
+    unmarkedWindow.hidden = YES;
+}
+
+- (void)checkRequestedOrientationPolicy {
+    /* PreferredOrientation is not exported; the policy adapter installed by
+     * LC32PrepareNativeLegacyRotationClass on a class without its own
+     * preferred method is its deterministic oracle. A keyless Info.plist must
+     * keep the permissive AllButUpsideDown default instead of clamping to
+     * Portrait, and a recorded status-bar request must win over the status
+     * bar and the plist. */
+    const UIInterfaceOrientationMask expectedMask = expectedEnabled
+        ? fixtureDeclaredOrientationMask()
+        : UIInterfaceOrientationMaskAllButUpsideDown;
+    RootlessRotationLegacyController *policyController =
+        [[RootlessRotationLegacyController alloc] init];
+    check("statusbar-request-declared-mask",
+        policyController.supportedInterfaceOrientations == expectedMask);
+    requestedStatusBarOrientation = UIInterfaceOrientationLandscapeRight;
+    const UIInterfaceOrientation expectedPreferred = expectedEnabled
+        ? UIInterfaceOrientationLandscapeRight : UIInterfaceOrientationPortrait;
+    check("statusbar-request-preferred-honored",
+        policyController.preferredInterfaceOrientationForPresentation ==
+            expectedPreferred);
+    check("statusbar-request-explicit-root-preserved",
+        self.window.rootViewController == self.controller);
+    requestedStatusBarOrientation = UIInterfaceOrientationUnknown;
+}
+
 - (void)finish {
     if([testCase isEqualToString:@"modern-refresh"] && !self.completedRefreshProbe) {
         [self checkQueuedModernBackingRefresh];
@@ -1019,6 +1263,17 @@ static void nativeOrientationUpdateProbe(RootlessRotationRefreshWindow *window, 
             check("unregistered-controller-not-adopted", self.window.rootViewController == nil);
             check("unregistered-controller-not-queried", legacyQueries == 0);
         }
+    } else if([testCase isEqualToString:@"controllerless"]) {
+        if(expectedEnabled) {
+            check("controllerless-no-rotation-callbacks",
+                legacyQueries == 0 && willRotateCalls == 0 && didRotateCalls == 0);
+            check("controllerless-renderer-frame-and-bounds-preserved",
+                CGRectEqualToRect(self.content.frame, self.initialContentFrame) &&
+                CGRectEqualToRect(self.content.bounds, self.initialContentBounds));
+        }
+        [self checkControllerlessStatusBarContract];
+    } else if([testCase isEqualToString:@"statusbar-request"]) {
+        [self checkRequestedOrientationPolicy];
     } else if(expectedEnabled && !explicitRootCase) {
         RootlessRotationTrackingController *controller = (id)self.controller;
         check("rootless-no-root-adoption", self.window.rootViewController == nil);
@@ -1082,7 +1337,8 @@ int main(int argc, char **argv) {
             if(!strcmp(argv[index], "--case")) testCase = @(argv[index + 1]);
         }
         if(![@[@"rootless", @"explicit", @"modern", @"modern-explicit", @"modern-only", @"modern-refresh", @"unregistered", @"manual", @"manual-controller",
-                @"modal", @"manual-disabled", @"lifecycle", @"ownership", @"replacement"]
+                @"modal", @"manual-disabled", @"lifecycle", @"ownership", @"replacement",
+                @"controllerless", @"statusbar-request"]
                 containsObject:testCase]) return 2;
         manualRotation = [testCase isEqualToString:@"manual"] ||
             [testCase isEqualToString:@"manual-disabled"];
@@ -1092,7 +1348,8 @@ int main(int argc, char **argv) {
             [testCase isEqualToString:@"modern-refresh"] ||
             [testCase isEqualToString:@"modal"] ||
             [testCase isEqualToString:@"manual-disabled"] ||
-            [testCase isEqualToString:@"ownership"];
+            [testCase isEqualToString:@"ownership"] ||
+            [testCase isEqualToString:@"statusbar-request"];
         NSSetUncaughtExceptionHandler(uncaught);
         return UIApplicationMain(argc, argv, nil,
             NSStringFromClass(RootlessRotationDelegate.class));

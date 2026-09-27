@@ -123,9 +123,13 @@ struct LC32GuestUIKitPolicy {
 const LC32GuestUIKitPolicy& LC32GuestInterfacePolicy(void);
 UIInterfaceOrientation LC32FirstOrientationInMask(
     UIInterfaceOrientationMask mask);
+UIInterfaceOrientationMask LC32LegacyGuestDeclaredOrientations(void);
 id LC32ObjectProperty(id object, const char *name);
 
 std::atomic<NSInteger> LC32LegacyRequestedOrientation{
+    UIInterfaceOrientationUnknown};
+std::atomic<NSInteger> LC32LegacyRequestedStatusBarHidden{-1};
+std::atomic<NSInteger> LC32LegacyAnnouncedStatusBarOrientation{
     UIInterfaceOrientationUnknown};
 thread_local bool LC32SuppressGuestOrientationQuery = false;
 thread_local bool LC32AllowGuestOrientationQuery = false;
@@ -155,6 +159,16 @@ public:
 private:
     bool previous_;
 };
+
+bool LC32LegacyStatusBarHidden(void) {
+    /* Pre-iOS-7 applications set status-bar visibility at runtime as often
+     * as in the Info.plist. The runtime request wins once the application
+     * made one; bundles without either source keep their plist answer. */
+    const NSInteger requested =
+        LC32LegacyRequestedStatusBarHidden.load(std::memory_order_relaxed);
+    if(requested >= 0) return requested != 0;
+    return LC32GuestInterfacePolicy().statusBarHidden;
+}
 
 /*
  * Do not replace these calls with ordinary Objective-C messages. A view can
@@ -307,7 +321,7 @@ UIInterfaceOrientationMask LC32CachedGuestOrientationMask(
     NSNumber *cached = controller ? objc_getAssociatedObject(
         controller, LC32LegacyOrientationMaskKey) : nil;
     return cached ? (UIInterfaceOrientationMask)cached.unsignedLongLongValue
-                  : LC32GuestInterfacePolicy().declaredOrientations;
+                  : LC32LegacyGuestDeclaredOrientations();
 }
 
 UIInterfaceOrientation LC32InterfaceOrientationFromName(NSString *name) {
@@ -342,15 +356,38 @@ UIInterfaceOrientationMask LC32MaskForInterfaceOrientation(
 UIInterfaceOrientationMask LC32ConstrainGuestOrientationMask(
         UIInterfaceOrientationMask mask) {
     const LC32GuestUIKitPolicy &policy = LC32GuestInterfacePolicy();
-    if(!mask) return policy.declaredOrientations;
+    if(!mask) return LC32LegacyGuestDeclaredOrientations();
     if(!policy.constrainsControllerOrientations) return mask;
 
     /* A real supported-orientations array is an outer constraint on every
      * controller. UIInterfaceOrientation is only an initial-side hint and is
      * handled later, where the active window scene is known. */
     const UIInterfaceOrientationMask constrained =
-        mask & policy.declaredOrientations;
-    return constrained ? constrained : policy.declaredOrientations;
+        mask & LC32LegacyGuestDeclaredOrientations();
+    return constrained ? constrained : LC32LegacyGuestDeclaredOrientations();
+}
+
+UIInterfaceOrientationMask LC32LegacyGuestDeclaredOrientations(void) {
+    const LC32GuestUIKitPolicy &policy = LC32GuestInterfacePolicy();
+    /* Pre-iOS-4 bundles had no orientation-policy vocabulary: a keyless
+     * Info.plist fell back to every orientation except upside down, exactly
+     * like the native rotation unit's own plist reading. The Portrait-only
+     * fallback above only suits bundles that can declare keys. Once such a
+     * pre-iOS-8 executable declares an orientation through the runtime
+     * status-bar API, honor that request instead of clamping it to
+     * Portrait. Bundles with a real array or an initial-orientation key,
+     * and SDK-8+ executables, keep their existing policy untouched. */
+    const UIInterfaceOrientation requested = (UIInterfaceOrientation)
+        LC32LegacyRequestedOrientation.load(std::memory_order_relaxed);
+    const UIInterfaceOrientationMask requestedMask =
+        LC32MaskForInterfaceOrientation(requested);
+    if(requestedMask && !policy.constrainsControllerOrientations &&
+            !policy.usesLegacyInitialOrientation &&
+            policy.declaredOrientations == UIInterfaceOrientationMaskPortrait &&
+            LC32GetGuestExecutableSDKVersion() < 0x80000) {
+        return requestedMask | UIInterfaceOrientationMaskAllButUpsideDown;
+    }
+    return policy.declaredOrientations;
 }
 
 const LC32GuestUIKitPolicy& LC32GuestInterfacePolicy(void) {
@@ -460,7 +497,7 @@ UIInterfaceOrientationMask LC32GuestSupportedInterfaceOrientations(
     if(!LC32AllowGuestOrientationQuery || !LC32CanQueryGuestOrientation()) {
         return cached
             ? (UIInterfaceOrientationMask)cached.unsignedLongLongValue
-            : LC32GuestInterfacePolicy().declaredOrientations;
+            : LC32LegacyGuestDeclaredOrientations();
     }
 
     using SupportedOrientations =
@@ -662,7 +699,7 @@ UIInterfaceOrientationMask LC32LegacySupportedInterfaceOrientations(
         NSNumber *cached = objc_getAssociatedObject(
             controller, LC32LegacyOrientationMaskKey);
         return cached ? (UIInterfaceOrientationMask)cached.unsignedLongLongValue
-                      : LC32GuestInterfacePolicy().declaredOrientations;
+                      : LC32LegacyGuestDeclaredOrientations();
     }
 
     UIInterfaceOrientationMask mask = 0;
@@ -705,7 +742,7 @@ UIInterfaceOrientation LC32LegacyPreferredInterfaceOrientation(
 }
 
 BOOL LC32LegacyPrefersStatusBarHidden(UIViewController *, SEL) {
-    return LC32GuestInterfacePolicy().statusBarHidden;
+    return LC32LegacyStatusBarHidden();
 }
 
 void LC32ScaleLegacyIPadWindow(UIWindow *window);
@@ -879,7 +916,7 @@ UIInterfaceOrientation LC32LegacyTargetOrientation(
     if(LC32MaskForInterfaceOrientation(policy.preferredOrientation)) {
         return policy.preferredOrientation;
     }
-    return LC32FirstOrientationInMask(policy.declaredOrientations);
+    return LC32FirstOrientationInMask(LC32LegacyGuestDeclaredOrientations());
 }
 
 UIViewController *LC32GuestWindowRootViewController(UIWindow *window) {
@@ -1680,7 +1717,7 @@ bool LC32UsesClassicFullScreenViewport(UIWindow *window) {
         screenBounds.size.width, screenBounds.size.height);
     return (LC32GuestNeedsLegacyIPadCanvas() ||
             LC32GuestUsesFixedLandscapePhoneCanvas()) &&
-           LC32GuestInterfacePolicy().statusBarHidden &&
+           LC32LegacyStatusBarHidden() &&
            screenShortEdge > 0 && screenShortEdge < 600;
 }
 
@@ -1936,7 +1973,7 @@ UIInterfaceOrientation LC32LegacyRootWindowGeometry(
         NSNumber *cached = objc_getAssociatedObject(root, LC32LegacyOrientationMaskKey);
         const UIInterfaceOrientationMask mask = cached
             ? (UIInterfaceOrientationMask)cached.unsignedLongLongValue
-            : LC32GuestInterfacePolicy().declaredOrientations;
+            : LC32LegacyGuestDeclaredOrientations();
         if(UIInterfaceOrientationIsLandscape(current) &&
                 (LC32MaskForInterfaceOrientation(current) & mask))
             orientation = current;
@@ -2123,7 +2160,7 @@ UIInterfaceOrientationMask LC32SupportedOrientationsForController(
         UIViewController *controller) {
     const LC32GuestUIKitPolicy &policy = LC32GuestInterfacePolicy();
     if(!controller || !LC32ObjectUsesGuestClass(controller)) {
-        return policy.declaredOrientations;
+        return LC32LegacyGuestDeclaredOrientations();
     }
     if(LC32GuestUsesFixedLandscapePhoneCanvas()) {
         const UIInterfaceOrientation requested = (UIInterfaceOrientation)
@@ -2138,20 +2175,20 @@ UIInterfaceOrientationMask LC32SupportedOrientationsForController(
         }
         /* Renderer-era shouldAutorotate implementations can consult GL state
          * which is not initialized while UIKit installs the root. */
-        return policy.declaredOrientations;
+        return LC32LegacyGuestDeclaredOrientations();
     }
 
     NSNumber *cached = objc_getAssociatedObject(
         controller, LC32LegacyOrientationMaskKey);
     if(!LC32CanQueryGuestOrientation()) {
         return cached ? (UIInterfaceOrientationMask)cached.unsignedLongLongValue
-                      : policy.declaredOrientations;
+                      : LC32LegacyGuestDeclaredOrientations();
     }
 
     const Class cls = object_getClass(controller);
     if(!LC32GuestClassHierarchyDefinesSelector(
             cls, @selector(supportedInterfaceOrientations))) {
-        return policy.declaredOrientations;
+        return LC32LegacyGuestDeclaredOrientations();
     }
     using SupportedOrientations =
         UIInterfaceOrientationMask (*)(id, SEL);
@@ -2159,7 +2196,7 @@ UIInterfaceOrientationMask LC32SupportedOrientationsForController(
     UIInterfaceOrientationMask mask =
         reinterpret_cast<SupportedOrientations>(objc_msgSend)(
             controller, @selector(supportedInterfaceOrientations));
-    if(!mask) mask = policy.declaredOrientations;
+    if(!mask) mask = LC32LegacyGuestDeclaredOrientations();
     objc_setAssociatedObject(controller, LC32LegacyOrientationMaskKey,
         @(mask), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return mask;
@@ -2209,7 +2246,7 @@ void LC32ApplyLegacyWindowPolicy(UIWindow *window) {
     UIInterfaceOrientationMask orientations =
         LC32SupportedOrientationsForController(orientationController);
     if(!orientations) {
-        orientations = policy.declaredOrientations;
+        orientations = LC32LegacyGuestDeclaredOrientations();
     }
     /* CoreSimulator can expose the opposite provisional landscape side while
      * the key window is being attached. A fixed phone canvas has one exact
@@ -2426,6 +2463,66 @@ void LC32AdoptLegacyRootViewControllers(void) {
     }
 }
 
+/*
+ * Pre-iOS-8 status-bar orientation changes announced themselves twice: the
+ * deprecated UIApplicationDelegate pair and the two NSNotifications. Modern
+ * UIKit dropped both. The names and user-info key are spelled as literals
+ * because their values must match the guest shim's exported definitions
+ * verbatim, while the host headers mark the constants themselves deprecated.
+ * Delivery is main-thread-only and behind the guest-callback guard; only
+ * applications implementing the selectors or observing the notifications
+ * observe any difference.
+ */
+void LC32DeliverLegacyStatusBarOrientationChange(
+        UIApplication *application, UIInterfaceOrientation orientation,
+        NSTimeInterval duration) {
+    if(!application || !pthread_main_np() ||
+            !LC32CanQueryGuestOrientation()) return;
+    id<UIApplicationDelegate> delegate = application.delegate;
+    if(!delegate || !LC32ObjectUsesGuestClass(delegate)) return;
+
+    NSDictionary *userInfo = @{
+        @"UIApplicationStatusBarOrientationUserInfoKey": @(orientation),
+    };
+    [NSNotificationCenter.defaultCenter
+        postNotificationName:@"UIApplicationWillChangeStatusBarOrientationNotification"
+                      object:application userInfo:userInfo];
+    SEL willSelector =
+        @selector(application:willChangeStatusBarOrientation:duration:);
+    if([delegate respondsToSelector:willSelector]) {
+        ((void (*)(id, SEL, id, UIInterfaceOrientation, NSTimeInterval))objc_msgSend)(
+            delegate, willSelector, application, orientation, duration);
+    }
+    [NSNotificationCenter.defaultCenter
+        postNotificationName:@"UIApplicationDidChangeStatusBarOrientationNotification"
+                      object:application userInfo:userInfo];
+    SEL didSelector = @selector(application:didChangeStatusBarOrientation:);
+    if([delegate respondsToSelector:didSelector]) {
+        ((void (*)(id, SEL, id, UIInterfaceOrientation))objc_msgSend)(
+            delegate, didSelector, application, orientation);
+    }
+}
+
+void LC32AnnounceLegacyStatusBarOrientation(
+        UIApplication *application, UIInterfaceOrientation orientation,
+        NSTimeInterval duration, bool onlyIfUnannounced) {
+    if(!pthread_main_np() || !LC32MaskForInterfaceOrientation(orientation) ||
+            !LC32GuestOrientationStartupComplete.load(std::memory_order_acquire)) {
+        return;
+    }
+    if(onlyIfUnannounced) {
+        NSInteger unannounced = UIInterfaceOrientationUnknown;
+        if(!LC32LegacyAnnouncedStatusBarOrientation.compare_exchange_strong(
+                unannounced, (NSInteger)orientation, std::memory_order_relaxed))
+            return;
+    } else if(LC32LegacyAnnouncedStatusBarOrientation.exchange(
+                  (NSInteger)orientation, std::memory_order_relaxed) ==
+              (NSInteger)orientation) {
+        return;
+    }
+    LC32DeliverLegacyStatusBarOrientationChange(application, orientation, duration);
+}
+
 void LC32FinishGuestOrientationStartupAfterLaunch(void) {
     // FinishLaunching is posted after the launch delegate returns, but that
     // delegate may have queued the renderer's initialization on a zero-delay
@@ -2457,6 +2554,15 @@ void LC32FinishGuestOrientationStartupAfterLaunch(void) {
             } else {
                 LC32AdoptLegacyRootViewControllers();
             }
+            // Mirror the pre-iOS-8 launch announcement: an application that
+            // declared its orientation during the launch delegate (before the
+            // callback guard allowed delivery) still receives exactly one
+            // will/did pair once startup completes.
+            LC32AnnounceLegacyStatusBarOrientation(
+                UIApplication.sharedApplication,
+                (UIInterfaceOrientation)LC32LegacyRequestedOrientation.load(
+                    std::memory_order_relaxed),
+                0, true);
         });
     if(observer) {
         CFRunLoopAddObserver(CFRunLoopGetMain(), observer, kCFRunLoopCommonModes);
@@ -2624,7 +2730,7 @@ extern "C" bool LC32UIKitGetViewDuringGuestLoad(
 }
 
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-    return LC32GuestInterfacePolicy().declaredOrientations;
+    return LC32LegacyGuestDeclaredOrientations();
 }
 
 - (UIInterfaceOrientation)preferredInterfaceOrientationForPresentation {
@@ -2636,7 +2742,7 @@ extern "C" bool LC32UIKitGetViewDuringGuestLoad(
 }
 
 - (BOOL)prefersStatusBarHidden {
-    return LC32GuestInterfacePolicy().statusBarHidden;
+    return LC32LegacyStatusBarHidden();
 }
 
 - (BOOL)shouldAutomaticallyForwardRotationMethods {
@@ -2973,7 +3079,7 @@ extern "C" bool LC32UIKitGetViewDuringGuestLoad(
 }
 
 - (BOOL)prefersStatusBarHidden {
-    return LC32GuestInterfacePolicy().statusBarHidden;
+    return LC32LegacyStatusBarHidden();
 }
 
 - (BOOL)shouldAutomaticallyForwardRotationMethods {
@@ -3109,44 +3215,97 @@ extern "C" void LC32UIKitPrepareGuestClass(Class cls) {
 }
 
 /* SVC 1002 forwards the first guest argument in r2, followed by r3 and the
- * guest stack pointer. Keep this exported entry point in that three-word
- * shape even though the UIKit adapter only needs the orientation. */
+ * guest stack pointer. Keep these exported entry points in that three-word
+ * shape even though the UIKit adapters only need one argument. */
 extern "C" u32 LC32UIKitHandleLegacyStatusBarOrientation(
         u32 orientationValue, u32, u32) {
-    if(!LC32UIKitLegacyCompatibilityEnabled()) return 0;
+    const bool canvasMode = LC32UIKitLegacyCompatibilityEnabled();
+    const bool nativeMode = !canvasMode && LC32NativeLegacyRotationEnabled() &&
+        LC32GetGuestExecutableSDKVersion() < 0x80000;
+    if(!canvasMode && !nativeMode) return 0;
     const UIInterfaceOrientation orientation =
         (UIInterfaceOrientation)orientationValue;
     if(!LC32MaskForInterfaceOrientation(orientation)) return 0;
-    LC32LegacyRequestedOrientation.store(
-        orientation, std::memory_order_relaxed);
-    /* Early game engines can keep the native main thread inside their guest
-     * loop indefinitely. Refit synchronously while this legacy setter is
-     * already executing on that thread; queuing the only refit would leave
-     * the old portrait placement in force forever. Scaling itself does not
-     * enter guest code. */
-    if(pthread_main_np()) {
-        UIApplication *application = UIApplication.sharedApplication;
-        UIWindow *keyWindow = application.keyWindow;
-        if(keyWindow) LC32ScaleLegacyIPadWindow(keyWindow);
-        for(UIScene *scene in application.connectedScenes) {
-            if(![scene isKindOfClass:UIWindowScene.class]) continue;
-            for(UIWindow *window in ((UIWindowScene *)scene).windows) {
-                if(window != keyWindow) LC32ScaleLegacyIPadWindow(window);
+    const bool changed = LC32LegacyRequestedOrientation.exchange(
+        (NSInteger)orientation, std::memory_order_relaxed) !=
+        (NSInteger)orientation;
+    if(canvasMode) {
+        /* Early game engines can keep the native main thread inside their
+         * guest loop indefinitely. Refit synchronously while this legacy
+         * setter is already executing on that thread; queuing the only refit
+         * would leave the old portrait placement in force forever. Scaling
+         * itself does not enter guest code. */
+        if(pthread_main_np()) {
+            UIApplication *application = UIApplication.sharedApplication;
+            UIWindow *keyWindow = application.keyWindow;
+            if(keyWindow) LC32ScaleLegacyIPadWindow(keyWindow);
+            for(UIScene *scene in application.connectedScenes) {
+                if(![scene isKindOfClass:UIWindowScene.class]) continue;
+                for(UIWindow *window in ((UIWindowScene *)scene).windows) {
+                    if(window != keyWindow) LC32ScaleLegacyIPadWindow(window);
+                }
             }
         }
+
+        /* Avoid entering guest shouldAutorotate... while its outgoing direct
+         * UIKit host call is still on the JIT stack. */
+        dispatch_async(dispatch_get_main_queue(), ^{
+            LC32AdoptLegacyRootViewControllers();
+            if(changed) LC32AnnounceLegacyStatusBarOrientation(
+                UIApplication.sharedApplication, orientation, 0, false);
+        });
+        return 0;
     }
 
-    /* Avoid entering guest shouldAutorotate... while its outgoing direct
-     * UIKit host call is still on the JIT stack. */
+    /* Native legacy rotation mode: a pre-iOS-8 process gets its orientation
+     * intent recorded and honored by the rotation unit instead of the canvas
+     * adapters. Modern hosts ignore the deprecated setter entirely, so SDK-8+
+     * executables (and the compatibility kill switch) keep exact modern
+     * behavior. The synchronous refresh uses the same reasoning as the canvas
+     * refit above; the launch observer's first-idle pass applies requests
+     * recorded before startup finishes. Neither path enters guest code. */
+    LC32NativeLegacyRotationRefreshRequested(orientation);
+    if(!changed) return 0;
     dispatch_async(dispatch_get_main_queue(), ^{
-        LC32AdoptLegacyRootViewControllers();
+        LC32AnnounceLegacyStatusBarOrientation(
+            UIApplication.sharedApplication, orientation, 0, false);
     });
     return 0;
 }
 
+extern "C" u32 LC32UIKitHandleLegacyStatusBarHidden(
+        u32 hiddenValue, u32, u32) {
+    /* The plist key alone cannot serve runtime setStatusBarHidden: calls,
+     * and modern hosts ignore the setter. Record the runtime request beside
+     * the plist preference so the status-bar adapters and the full-screen
+     * viewport answer it. Only pre-iOS-8 executables in a legacy mode may
+     * store; SDK-8+ apps keep their existing status-bar behavior. */
+    if((!LC32UIKitLegacyCompatibilityEnabled() &&
+            !LC32NativeLegacyRotationEnabled()) ||
+            LC32GetGuestExecutableSDKVersion() >= 0x80000) return 0;
+    LC32LegacyRequestedStatusBarHidden.store(
+        hiddenValue ? 1 : 0, std::memory_order_relaxed);
+    return 0;
+}
+
+extern "C" UIInterfaceOrientation LC32LegacyRequestedStatusBarOrientation(
+        void) {
+    return (UIInterfaceOrientation)LC32LegacyRequestedOrientation.load(
+        std::memory_order_relaxed);
+}
+
+extern "C" BOOL LC32NativeLegacyRotationWindowIsGuest(UIWindow *window) {
+    /* Guest-created windows mirror a guest object. A binary with no SDK
+     * version marker predates the iOS 8 geometry change whenever the
+     * effective process SDK does, so it counts as pre-iOS-8 here. */
+    return window && window.guest_selfOrNull &&
+        LC32GetGuestExecutableSDKVersion() < 0x80000;
+}
+
 extern "C" u32 LC32UIKitGetLegacyControllerOrientation(
         u32 low, u32 high, u32) {
-    if(!LC32UIKitLegacyCompatibilityEnabled())
+    if(!LC32UIKitLegacyCompatibilityEnabled() &&
+            !LC32NativeLegacyRotationEnabled())
         return UIInterfaceOrientationUnknown;
     if(!pthread_main_np() || LC32GetGuestExecutableSDKVersion() >= 0x80000)
         return UIInterfaceOrientationUnknown;
@@ -3176,7 +3335,7 @@ extern "C" u32 LC32UIKitGetLegacyControllerOrientation(
         controller, LC32LegacyOrientationMaskKey);
     const UIInterfaceOrientationMask mask = cached
         ? (UIInterfaceOrientationMask)cached.unsignedLongLongValue
-        : LC32GuestInterfacePolicy().declaredOrientations;
+        : LC32LegacyGuestDeclaredOrientations();
     UIView *view = nil;
     LC32NativeViewIfLoaded(controller, &view);
     using WindowGetter = UIWindow *(*)(id, SEL);
@@ -3220,21 +3379,32 @@ extern "C" u32 LC32UIKitGetLegacyControllerOrientation(
 }
 
 extern "C" u32 LC32UIKitGetLegacyStatusBarOrientation(void) {
-    if(!LC32UIKitLegacyCompatibilityEnabled())
-        return (u32)UIInterfaceOrientationUnknown;
     const LC32GuestUIKitPolicy &policy = LC32GuestInterfacePolicy();
-    if(LC32GuestUsesFixedLandscapePhoneCanvas()) {
-        /* Keep the guest's projection orientation paired with the native
-         * wrapper that turns its fixed portrait canvas into landscape. */
-        return (u32)LC32LegacyTargetOrientation(nil);
-    }
+    if(LC32UIKitLegacyCompatibilityEnabled()) {
+        if(LC32GuestUsesFixedLandscapePhoneCanvas()) {
+            /* Keep the guest's projection orientation paired with the native
+             * wrapper that turns its fixed portrait canvas into landscape. */
+            return (u32)LC32LegacyTargetOrientation(nil);
+        }
 
-    if(!LC32GuestNeedsLegacyIPadCanvas()) {
-        /* Ordinary phone applications should retain the generated shim's
-         * direct UIApplication forwarding behavior. In particular, apps
-         * supporting both landscape sides must not observe our pre-scene
-         * fallback and then a different settled scene orientation. */
-        return (u32)UIInterfaceOrientationUnknown;
+        if(!LC32GuestNeedsLegacyIPadCanvas()) {
+            /* Ordinary phone applications should retain the generated shim's
+             * direct UIApplication forwarding behavior. In particular, apps
+             * supporting both landscape sides must not observe our pre-scene
+             * fallback and then a different settled scene orientation. */
+            return (u32)UIInterfaceOrientationUnknown;
+        }
+    } else {
+        if(!LC32NativeLegacyRotationEnabled())
+            return (u32)UIInterfaceOrientationUnknown;
+        /* Native legacy rotation: the pre-iOS-8 status-bar API is the
+         * application's own orientation declaration. Pair the projection of
+         * an application that made a request; apps which never called the
+         * setter keep the generated forwarder's modern answer. The +load
+         * pairing for fixed canvases stays canvas-only, so no canvas-class
+         * application observes a different value here. */
+        return (u32)LC32LegacyRequestedOrientation.load(
+            std::memory_order_relaxed);
     }
 
     UIApplication *application = UIApplication.sharedApplication;
@@ -3258,19 +3428,20 @@ extern "C" u32 LC32UIKitGetLegacyStatusBarOrientation(void) {
 
     const UIInterfaceOrientationMask currentMask =
         LC32MaskForInterfaceOrientation(current);
-    if(currentMask & policy.declaredOrientations) return (u32)current;
+    const UIInterfaceOrientationMask declaredMask =
+        LC32LegacyGuestDeclaredOrientations();
+    if(currentMask & declaredMask) return (u32)current;
 
     const UIInterfaceOrientation requested = (UIInterfaceOrientation)
         LC32LegacyRequestedOrientation.load(std::memory_order_relaxed);
-    if(LC32MaskForInterfaceOrientation(requested) &
-            policy.declaredOrientations) {
+    if(LC32MaskForInterfaceOrientation(requested) & declaredMask) {
         return (u32)requested;
     }
     if(LC32MaskForInterfaceOrientation(policy.preferredOrientation) &
-            policy.declaredOrientations) {
+            declaredMask) {
         return (u32)policy.preferredOrientation;
     }
-    return (u32)LC32FirstOrientationInMask(policy.declaredOrientations);
+    return (u32)LC32FirstOrientationInMask(declaredMask);
 }
 
 @interface UIWindow (LC32LegacyRootViewController)
