@@ -81,6 +81,16 @@ jobs:
     - name: Build guest frameworks
       run: gmake -C GuestMakefile
 
+    - name: Upload generated guest shims
+      # The generator introspects the host UIKit runtime and can only run on
+      # macOS; publish the generated shim sources so non-macOS builders can
+      # compile the guest frameworks against this exact generation.
+      uses: actions/upload-artifact@v7
+      with:
+        name: guest-generated-shims
+        path: GuestFrameworks/.generated/
+        if-no-files-found: error
+
     - name: Assemble guest root filesystem
       run: bash GuestMakefile/pack-ramdisk.sh
 
