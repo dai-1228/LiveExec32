@@ -2540,6 +2540,19 @@ OSStatus DispatchExtAudioFileSetProperty(
             reinterpret_cast<char *>(bytes.data())) != 0)
         return kAudio_ParamError;
 
+    /*
+     * Older iOS clients build stream descriptions on the stack and leave
+     * the reserved field uninitialized; classic engine decode helpers pass
+     * that garbage straight into ExtAudioFileSetProperty.  Modern hosts
+     * validate reserved fields at the API boundary, so clear it rather than
+     * forwarding guest stack bytes into the native converter setup.
+     */
+    if(byteCount == sizeof(AudioStreamBasicDescription) &&
+       SlotU32(call, 1) == kExtAudioFileProperty_ClientDataFormat) {
+        reinterpret_cast<AudioStreamBasicDescription *>(
+            bytes.data())->mReserved = 0;
+    }
+
     std::lock_guard<std::mutex> lock(entry->mutex);
     if(!entry->file) return kAudio_ParamError;
     return ExtAudioFileSetProperty(entry->file, SlotU32(call, 1),
@@ -3540,6 +3553,9 @@ extern "C" u32 LC32_AudioToolbox_Dispatch(u32 opcode, u32 guestCall, u32) {
                     reinterpret_cast<char *>(&format)) != 0) {
                 return static_cast<u32>(kAudio_ParamError);
             }
+            /* Reserved ASBD fields must be zero at an API boundary; older
+             * clients leave them uninitialized on the stack. */
+            format.mReserved = 0;
             AudioFileID file = nullptr;
             const OSStatus status = AudioFileCreateWithURL(
                 SlotHostObject<CFURLRef>(call, 0), SlotU32(call, 1),

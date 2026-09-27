@@ -25,6 +25,32 @@ log.m_CFLAGS = -include "$(LC32_BUILD_INFO_HEADER)"
 
 DYNARMIC_ROOT := $(abspath ../../External/dynarmic)
 DYNARMIC_BUILD_DIR := $(THEOS_PROJECT_DIR)/.theos/obj/dynarmic
+
+# Host-toolchain selection. macOS keeps the Darwin-driver cc and lets CMake
+# probe compilers through xcrun; other hosts build with Theos's bundled
+# toolchain, whose clang is built without the Darwin driver, so the iOS
+# triple is spelled out explicitly and the toolchain's llvm tools pack
+# Mach-O archives. LC32_HOST_TARGET_FLAGS is empty on macOS so its compile
+# and link lines stay byte-identical.
+LC32_HOST_SYSTEM := $(shell uname -s 2>/dev/null)
+ifeq ($(LC32_HOST_SYSTEM),Darwin)
+    LC32_HOST_MIN_VER := -miphoneos-version-min=15.0
+    LC32_HOST_TARGET_FLAGS :=
+    LC32_HOST_GDBSTUB_CC := cc
+    LC32_HOST_GDBSTUB_AR := ar
+    LC32_DYNARMIC_CMAKE_COMPILERS :=
+else
+    LC32_HOST_TOOLCHAIN_BIN ?= $(THEOS)/toolchain/linux/iphone/bin
+    LC32_HOST_MIN_VER := -miphoneos-version-min=15.0
+    LC32_HOST_TARGET_FLAGS := -target arm64-apple-ios15.0
+    LC32_HOST_GDBSTUB_CC := $(LC32_HOST_TOOLCHAIN_BIN)/clang
+    LC32_HOST_GDBSTUB_AR := $(LC32_HOST_TOOLCHAIN_BIN)/ar
+    LC32_DYNARMIC_CMAKE_COMPILERS := \
+        -DCMAKE_C_COMPILER="$(LC32_HOST_TOOLCHAIN_BIN)/clang" \
+        -DCMAKE_CXX_COMPILER="$(LC32_HOST_TOOLCHAIN_BIN)/clang++" \
+        -DCMAKE_AR="$(LC32_HOST_TOOLCHAIN_BIN)/ar" \
+        -DCMAKE_RANLIB="$(LC32_HOST_TOOLCHAIN_BIN)/ranlib"
+endif
 DYNARMIC_STATIC_LIBS := \
 	$(DYNARMIC_BUILD_DIR)/src/dynarmic/libdynarmic.a \
 	$(DYNARMIC_BUILD_DIR)/externals/mcl/src/libmcl.a \
@@ -58,7 +84,7 @@ endif
 
 LiveExec32Shared_FILES = \
 	LiveExec32Shared.cpp guest_bootstrap.cpp debugger_server.cpp \
-	crash_exception.mm guest_dispatch.mm guest_timer_queue.cpp guest_timers.cpp \
+	crash_exception.mm host_crash_net.mm guest_dispatch.mm guest_timer_queue.cpp guest_timers.cpp \
 	arm_dynarmic_cp15.cpp dynarmic.cpp dynarmic_syscalls.cpp \
 	darwin_file_syscalls.cpp guest_mach_messages.cpp guest_mach_exceptions.cpp \
 	dynarmic_memory.cpp dynarmic_callbacks.cpp dynarmic_thread_state.cpp \
@@ -75,16 +101,19 @@ LiveExec32Shared_FILES = \
 	../OpenAL/OpenAL.mm ../OpenGLES/OpenGLES.mm ../UIKit/UIKit.mm \
 	../UIKit/LegacyAutoLayout.mm ../UIKit/LegacyFonts.mm ../UIKit/LegacyAlerts.mm \
 	../UIKit/LegacyRotation.mm ../UIKit/LegacyNibLoading.mm \
-	../UIKit/UIViewController+LC32LegacyModalPresentation.mm
+	../UIKit/UIViewController+LC32LegacyModalPresentation.mm \
+	../UIKit/UIViewController+LC32GuestNibLoading.mm
 LiveExec32Shared_CFLAGS = \
 	-I. -I$(DYNARMIC_ROOT)/src -I../../include -DDYNARMIC_MASTER \
 	-I../../External/mini-gdbstub/include -DLC32_DEBUG_LOGS=$(LC32_DEBUG_LOGS)
 LiveExec32Shared_CCFLAGS = -std=c++17
 crash_exception.mm_CFLAGS = -fobjc-arc
+host_crash_net.mm_CFLAGS = -fobjc-arc
 ../UIKit/LegacyFonts.mm_CFLAGS = -fobjc-arc
 ../UIKit/LegacyAlerts.mm_CFLAGS = -fobjc-arc
 ../UIKit/LegacyRotation.mm_CFLAGS = -fobjc-arc
 ../UIKit/UIViewController+LC32LegacyModalPresentation.mm_CFLAGS = -fobjc-arc
+../UIKit/UIViewController+LC32GuestNibLoading.mm_CFLAGS = -fobjc-arc
 LiveExec32Shared_OBJ_FILES = $(DYNARMIC_STATIC_LIBS)
 LiveExec32Shared_LDFLAGS = -L../../External/mini-gdbstub/build -Wl,-weak-lMobileGestalt
 LiveExec32Shared_LIBRARIES = gdbstub
@@ -99,7 +128,10 @@ LiveExec32Shared_INSTALL = 0
 # mini-gdbstub is a static dependency of this framework rather than of the
 # launcher, which also keeps direct framework builds complete.
 before-LiveExec32Shared-all:: lc32-build-info lc32-dynarmic-static
-	$(MAKE) -C ../../External/mini-gdbstub ARCH=rv32 CC="cc -isysroot $(ISYSROOT) -miphoneos-version-min=15.0"
+	$(MAKE) -C ../../External/mini-gdbstub ARCH=rv32 \
+		CC="$(LC32_HOST_GDBSTUB_CC) -isysroot $(ISYSROOT) \
+		     $(LC32_HOST_TARGET_FLAGS) $(LC32_HOST_MIN_VER)" \
+		AR="$(LC32_HOST_GDBSTUB_AR)"
 
 .PHONY: lc32-build-info
 lc32-build-info:
@@ -131,6 +163,7 @@ lc32-dynarmic-static:
 	cmake $(DYNARMIC_CMAKE_WARNING_FLAGS) \
 		-S "$(DYNARMIC_ROOT)" -B "$(DYNARMIC_BUILD_DIR)" \
 		$(DYNARMIC_CMAKE_POLICY_FLAGS) \
+		$(LC32_DYNARMIC_CMAKE_COMPILERS) \
 		-DDYNARMIC_USE_BUNDLED_EXTERNALS=ON \
 		-DDYNARMIC_FRONTENDS=A32 \
 		-DBUILD_TESTING=OFF \
@@ -142,7 +175,8 @@ lc32-dynarmic-static:
 		-DCMAKE_OSX_SYSROOT="$(ISYSROOT)" \
 		-DCMAKE_OSX_ARCHITECTURES=arm64 \
 		-DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
-		-DCMAKE_C_FLAGS="-arch arm64"
+		-DCMAKE_C_FLAGS="-arch arm64 $(LC32_HOST_TARGET_FLAGS)" \
+		-DCMAKE_CXX_FLAGS="$(LC32_HOST_TARGET_FLAGS)"
 	env -u MAKEFLAGS cmake --build "$(DYNARMIC_BUILD_DIR)" \
 		--target dynarmic --parallel 4
 	@for archive in $(DYNARMIC_STATIC_LIBS); do \
