@@ -150,6 +150,23 @@ BOOL LC32GuestUIKitLegacyCompatibilityEnabled(void) {
     return LC32LegacyCompatibilityEnabled;
 }
 
+static pthread_once_t LC32NativeLegacyRotationOnce = PTHREAD_ONCE_INIT;
+static uint64_t LC32HostNativeLegacyRotationEnabled;
+
+static void LC32ResolveNativeLegacyRotation(void) {
+    /* An older host cannot export the native rotation experiment switch.
+     * Report it disabled there so guest gates keep their existing answer. */
+    LC32HostNativeLegacyRotationEnabled =
+        LC32Dlsym("LC32NativeLegacyRotationEnabled", YES);
+}
+
+BOOL LC32GuestNativeLegacyRotationEnabled(void) {
+    pthread_once(&LC32NativeLegacyRotationOnce,
+        LC32ResolveNativeLegacyRotation);
+    return LC32HostNativeLegacyRotationEnabled &&
+        LC32InvokeHostCRet32(LC32HostNativeLegacyRotationEnabled) != 0;
+}
+
 static void LC32ResolveLegacyUniqueIdentifierFallback(void) {
     static NSString *const preferenceKey =
         @"LC32LegacyUIDeviceUniqueIdentifier";
@@ -240,13 +257,18 @@ static pthread_once_t LC32LegacyScreenCoordinatesOnce = PTHREAD_ONCE_INIT;
 static BOOL LC32UsesLegacyScreenCoordinates;
 
 static void LC32ResolveLegacyScreenCoordinates(void) {
-    if(!LC32GuestUIKitLegacyCompatibilityEnabled()) return;
     const uint64_t getter = LC32Dlsym(
         "LC32GetGuestExecutableSDKVersion", YES);
     const uint32_t sdkVersion = getter
         ? LC32InvokeHostCRet32(getter) : 0;
-    LC32UsesLegacyScreenCoordinates =
-        sdkVersion != 0 && sdkVersion < 0x00080000;
+    /* Before iOS 8, UIScreen coordinates stayed portrait-ordered. Canvas
+     * hosts keep serving their own adapted geometry to their SDK-1..7
+     * executables; a binary without an SDK version marker inherits the same
+     * portrait-ordered contract whenever the effective process SDK is
+     * pre-iOS-8, because such binaries were never built for anything else. */
+    LC32UsesLegacyScreenCoordinates = LC32GuestSDKUsesLegacyGeometryContract(
+        sdkVersion, LC32GuestUIKitLegacyCompatibilityEnabled(),
+        LC32GuestNativeLegacyRotationEnabled());
 }
 
 static BOOL LC32GuestUsesLegacyScreenCoordinates(void) {

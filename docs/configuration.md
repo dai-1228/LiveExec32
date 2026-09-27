@@ -84,6 +84,23 @@ process environment. This disables the host and guest canvas, orientation,
 and synthetic-root adaptations, but retains the low-SDK Auto Layout fixes,
 missing-API wrappers, and bridge recursion protection. The setting is read
 once at launch; restart without it to restore the SDK-based default.
+A binary whose Mach-O records no SDK version still predates the iOS 8
+geometry change whenever the effective process SDK does. Under native legacy
+rotation such executables inherit the pre-iOS-8 UIKit contract —
+portrait-ordered `UIScreen` coordinates, the paired status-bar orientation
+readback, and the controller `interfaceOrientation` override — while canvas
+hosts keep their existing SDK-1..7 population and SDK-8+ executables are
+untouched. A pre-iOS-8 executable can also declare its interface orientation
+through the runtime status-bar API instead of its Info.plist: the request is
+recorded and honored in native legacy rotation mode, controller-less
+main-nib windows receive the legacy window backing and turn to the requested
+orientation, the deprecated
+`application:willChangeStatusBarOrientation:duration:` /
+`application:didChangeStatusBarOrientation:` delegate pair and its
+notifications are delivered again, and runtime `setStatusBarHidden:animated:`
+requests are honored beside the `UIStatusBarHidden` key. The keyless-plist
+status-bar contract has its own opt-in simulator regression:
+`sh test/uikit_legacy_rootless_rotation.sh --device UDID --keyless`.
 Pre-iOS-11 processes also repair nonfinite preferred-font results from
 CoreText's legacy text-style tables (including Vietnamese line metrics).
 Valid fonts are unchanged. Broken results use their resolved native face

@@ -7,14 +7,23 @@
 
 static uint64_t LC32HostLegacyControllerOrientation;
 
+@interface UIViewController (LC32LegacyOrientation)
+- (UIInterfaceOrientation)lc32_interfaceOrientation;
+@end
+
 @implementation UIViewController (LC32LegacyOrientation)
 
 + (void)load {
-    if(!LC32GuestUIKitLegacyCompatibilityEnabled()) return;
     const uint64_t sdkFunction = LC32Dlsym(
         "LC32GetGuestExecutableSDKVersion", YES);
     const uint32_t sdk = sdkFunction ? LC32InvokeHostCRet32(sdkFunction) : 0;
-    if(!sdk || sdk >= 0x80000) return;
+    /* Canvas hosts pair a controller's orientation with the wrapped scene for
+     * their SDK-1..7 executables, exactly as before. A binary with no SDK
+     * version marker inherits the same contract under native legacy rotation:
+     * modern UIKit reports geometry that such a binary was never built for. */
+    if(!LC32GuestSDKUsesLegacyGeometryContract(
+            sdk, LC32GuestUIKitLegacyCompatibilityEnabled(),
+            LC32GuestNativeLegacyRotationEnabled())) return;
     LC32HostLegacyControllerOrientation = LC32Dlsym(
         "LC32UIKitGetLegacyControllerOrientation", YES);
     if(!LC32HostLegacyControllerOrientation) return;
