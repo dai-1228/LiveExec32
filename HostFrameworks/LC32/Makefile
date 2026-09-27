@@ -74,7 +74,8 @@ LiveExec32Shared_FILES = \
 	../Accelerate/Accelerate.mm \
 	../OpenAL/OpenAL.mm ../OpenGLES/OpenGLES.mm ../UIKit/UIKit.mm \
 	../UIKit/LegacyAutoLayout.mm ../UIKit/LegacyFonts.mm ../UIKit/LegacyAlerts.mm \
-	../UIKit/LegacyRotation.mm ../UIKit/LegacyNibLoading.mm
+	../UIKit/LegacyRotation.mm ../UIKit/LegacyNibLoading.mm \
+	../UIKit/UIViewController+LC32LegacyModalPresentation.mm
 LiveExec32Shared_CFLAGS = \
 	-I. -I$(DYNARMIC_ROOT)/src -I../../include -DDYNARMIC_MASTER \
 	-I../../External/mini-gdbstub/include -DLC32_DEBUG_LOGS=$(LC32_DEBUG_LOGS)
@@ -83,6 +84,7 @@ crash_exception.mm_CFLAGS = -fobjc-arc
 ../UIKit/LegacyFonts.mm_CFLAGS = -fobjc-arc
 ../UIKit/LegacyAlerts.mm_CFLAGS = -fobjc-arc
 ../UIKit/LegacyRotation.mm_CFLAGS = -fobjc-arc
+../UIKit/UIViewController+LC32LegacyModalPresentation.mm_CFLAGS = -fobjc-arc
 LiveExec32Shared_OBJ_FILES = $(DYNARMIC_STATIC_LIBS)
 LiveExec32Shared_LDFLAGS = -L../../External/mini-gdbstub/build -Wl,-weak-lMobileGestalt
 LiveExec32Shared_LIBRARIES = gdbstub
