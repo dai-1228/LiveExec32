@@ -43,6 +43,8 @@ Host-only (no Theos/SDK needed, macOS `xcrun`):
 ```bash
 make -C test check-guest-bootstrap   # guest_bootstrap_host.cpp + HostFrameworks/LC32/guest_bootstrap.cpp
 make -C test check-memory-hash       # guest_memory_hash_host.cpp (khash.h)
+make -C test check-uikit-legacy-statusbar-orientation  # real UIApplication/UIViewController legacy-orientation categories (stub UIKit)
+make -C test check-uikit-legacy-canvas-fit             # runtime-landscape canvas classifier + fit math
 ```
 
 Guest (requires Theos + guest SDK + built frameworks in `GuestMakefile/.theos/obj/armv7s`):

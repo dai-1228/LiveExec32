@@ -107,7 +107,17 @@ same scale clamp as the plist-declared canvas classes), a launch-sized
 drawable is adopted to that canvas before its renderbuffer storage is
 allocated, and the controller-less window presents the canvas rotated by
 the existing native rotation and uniformly scaled (MIN, centered, 3:2
-letterbox) onto the live viewport. The presentation refits on window
+letterbox) onto the live viewport. Because a nib-era window can be exactly
+canvas-sized while the presentation is far larger, the host frame is first
+grown to cover the live viewport (host-only mutation; direct guest subview
+autoresizing masks are frozen for the life of the fit so the canvas keeps
+its authored geometry), and the scale/centering transform is computed
+iteratively from measured geometry — each pass measures the rendered
+content rect and the screen rect through the same CoreAnimation model-tree
+math and composes a correction until they coincide, so the fit is
+independent of where UIKit mounts the rotation and of CoreAnimation's
+anchor-relative sublayerTransform application. The presentation refits on
+window
 visibility, orientation updates, and transform-layer syncs, so dynamic
 Classic-Mode viewport changes are followed; the classifier is the shared
 `LC32UsesRuntimeLandscapePhoneCanvas` inline, and SDK-8+ executables,

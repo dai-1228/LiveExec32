@@ -2,24 +2,30 @@
 
 ## Status
 
-Source-level compatibility pass for **Zenonia 1.0** (com.gamevil.Zenonia, 2009).
-The implementation is complete in the `zenonia-compat` branch: legacy
-status-bar orientation support for SDK-less 32-bit games
-(`f41c4fd`), the upstream merge with the `CFURLCreatePropertyFromResource`
-re-port (`6ef95d1`), and the merge-audit fixes that followed
-(`1e5a06a`, `a951a14`, `0ab6a65`, `3b746a3`). CI at the branch tip is green:
-the full macOS build passed
-([Build LiveExec32 run 36312713886](https://github.com/dai-1228/LiveExec32/actions/runs/36312713886),
-7m29s — guest shims, guest frameworks, ramdisk, rootless deb, IPA) and the
-macOS host unit test passed
-([Zenonia compat host tests run 36312711990](https://github.com/dai-1228/LiveExec32/actions/runs/36312711990),
-18/18 checks under `-Werror`); the same tree also merged into the fork's
-`dev` branch and rebuilt green
-([run 36312713790](https://github.com/dai-1228/LiveExec32/actions/runs/36312713790)).
-Earlier failed runs at intermediate commits are superseded and are not
-claimed as evidence. Nothing in this pass was simulator- or device-verified:
-no launch of the game has been attempted, and there is no audio or gameplay
-certification of any kind.
+**Working on device.** Zenonia 1.0 (com.gamevil.Zenonia, 2009) launches
+and plays under LiveExec32 installed through LiveContainer, verified on a
+physical iPhone Air (iOS 26-era, Classic Mode): upright landscape
+orientation, correct touch axes, and the 320×480 canvas presented centered
+and filling the screen height with correct 3:2 aspect. The implementation
+spans the `zenonia-compat` branch (merged into the fork's `dev`): legacy
+status-bar orientation support for SDK-less 32-bit games (`f41c4fd`), the
+upstream merge with the `CFURLCreatePropertyFromResource` re-port
+(`6ef95d1`), the merge-audit fixes (`1e5a06a`, `a951a14`, `0ab6a65`,
+`3b746a3`), the canvas presentation and its device-feedback corrections
+(`c055b87`, `d6c8222`, `bf8d653`, and the final self-calibrating measured
+fit `b96ed82`).
+
+CI at the final tip is green on all three workflows: the full macOS build
+([Build LiveExec32 run 36330418946](https://github.com/dai-1228/LiveExec32/actions/runs/36330418946)),
+the host unit tests including the legacy status-bar and canvas-fit suites
+([Zenonia compat host tests run 36330416376](https://github.com/dai-1228/LiveExec32/actions/runs/36330416376)),
+and the fork `dev` build
+([run 36330418950](https://github.com/dai-1228/LiveExec32/actions/runs/36330418950)).
+The same tree is published as the fork's `nightly` release (IPA + rootless
+DEB). Device verification covers launch, orientation, presentation, and
+touch interaction; audio was exercised in gameplay but not formally
+audited, and the extended simulator regression matrix
+(`uikit_legacy_rootless_rotation`) remains macOS-manual.
 
 ## App profile
 
@@ -211,6 +217,19 @@ table (134 lines; 118 duplicate symbols at the guest CoreFoundation link)
 `MPMediaPlaybackIsPreparedToPlayDidChangeNotification` was kept upstream's
 ABI-renamed definition, matching the merge's stated intent.
 
+### Canvas presentation (`c055b87` → `b96ed82`, device-verified)
+
+The same keyless runtime-declared class receives the fixed 320×480
+presentation: guest `UIScreen` answers the canonical canvas, the
+OpenGLES adapter adopts a launch-sized drawable to that canvas before its
+renderbuffer storage is allocated, the controller-less window's host
+frame is grown to cover the live viewport (direct-subview autoresizing
+frozen for the fit's lifetime), and a self-calibrating transform on the
+window layer's `sublayerTransform` composes measured corrections until
+the rendered canvas coincides with the measured screen rect. The three
+device-feedback iterations that produced this architecture are documented
+in the addendum below.
+
 ## Verification
 
 ### Verified source-level in this pass
@@ -253,39 +272,72 @@ ABI-renamed definition, matching the merge's stated intent.
 
 ### What the tip CI covers (green)
 
-- [Build LiveExec32, run 36312713886](https://github.com/dai-1228/LiveExec32/actions/runs/36312713886):
+- [Build LiveExec32, run 36330418946](https://github.com/dai-1228/LiveExec32/actions/runs/36330418946):
   full macOS build on `macos-26` — generated shims, armv7s guest
   frameworks (which links the CoreFoundation/MediaPlayer changes), the
   ramdisk, the rootless deb, and the IPA; this compiles all production
   host code including `LegacyRotation.mm` and `UIKit.mm`.
-- [Zenonia compat host tests, run 36312711990](https://github.com/dai-1228/LiveExec32/actions/runs/36312711990):
+- [Zenonia compat host tests, run 36330416376](https://github.com/dai-1228/LiveExec32/actions/runs/36330416376):
   `check-uikit-legacy-statusbar-orientation` (18 checks),
+  `check-uikit-legacy-canvas-fit` (21 checks),
   `check-legacy-nib-loading`, `check-uikit-background-tasks`.
 - The same tree merged into the fork's `dev` branch and rebuilt green
-  ([run 36312713790](https://github.com/dai-1228/LiveExec32/actions/runs/36312713790));
-  the fork's `nightly` release was republished from it.
-- **None of the runs execute the extended rotation matrix** —
+  ([run 36330418950](https://github.com/dai-1228/LiveExec32/actions/runs/36330418950));
+  the fork's `nightly` release is built from it and is the artifact the
+  device test installed.
+- **None of the CI runs execute the extended rotation matrix** —
   `uikit_legacy_rootless_rotation.sh` needs a booted iOS simulator and is
-  macOS-manual only, and neither run has launched Zenonia itself. Guest
-  link-level selector collisions for the new `lc32_*` methods were checked
-  against the generator templates (clean), not by a link.
+  macOS-manual only. Guest link-level selector collisions for the new
+  `lc32_*` methods were checked against the generator templates (clean),
+  not by a link.
 
-### Remaining work — macOS/simulator pass checklist
+### Verified on device (iPhone Air, LiveContainer install)
+
+- Launch through LiveContainer with LiveExec32 set as the default app:
+  the game boots, reaches gameplay, and stays stable through play.
+- Orientation: the single runtime `setStatusBarOrientation:3` request
+  produces the correct landscape presentation — the root-cause analysis
+  above is confirmed closed for the turn itself.
+- Presentation: after the canvas-fit corrections below, the 320×480
+  canvas renders centered, filling the screen height with 3:2 letterbox
+  bars; the self-calibrating fit converges on this device's ~2.4:1
+  Classic-Mode viewport.
+- Touch: taps land at the correct logical points under the scaled,
+  rotated presentation (menus, dialog dismissal, and movement were
+  exercised during play).
+- The launch also resolves two launch-blocker risks transitively: the
+  C++ engine runs (253 SjLj frames through the RootFS
+  `libstdc++.6.dylib`/`libgcc_s.1.dylib`), and the nib-driven
+  controller-less window receives its legacy backing and
+  requested-orientation turn.
+
+### Regression checklist (macOS/simulator; device class verified separately)
+
+The iPhone Air device run above is the functional verification for this
+game; the commands below remain the reproducible regression surface for
+the class, other SDK versions, and other devices:
 
 ```sh
 # Host tests (no simulator needed):
 gmake -C test check-uikit-legacy-statusbar-orientation    # 18 checks
+gmake -C test check-uikit-legacy-canvas-fit               # 21 checks
 gmake -C test check-uikit-background-tasks check-mediaplayer-stop
 gmake -C test check-uikit-legacy-rootless-rotation-build  # compile gate
 
-# Full matrix, 16 cases x 6 SDKs (2, 5, 6.1, 7, 8, 11):
+# Full matrix, 17 cases x 6 SDKs (2, 5, 6.1, 7, 8, 11):
 sh test/uikit_legacy_rootless_rotation.sh --device UDID
 # Focused new-case pass:
 sh test/uikit_legacy_rootless_rotation.sh --device UDID --sdk 2 --sdk 11 \
-    --case controllerless --case statusbar-request
+    --case controllerless --case statusbar-request --case fixed-canvas
 # 2009 keyless-plist variant (the Zenonia contract):
 sh test/uikit_legacy_rootless_rotation.sh --device UDID --keyless
 ```
+
+Device retest baseline (LiveContainer install): import the `nightly`
+release IPA, set LiveExec32 as the default app, import the game bundle,
+and verify launch → title → gameplay with upright orientation, centered
+canvas, and correct touch mapping; screenshots of cold launch plus a
+device rotation settle the remaining simulator-only observations.
 
 Per-run expectations: `rootless-rotation-regression: PASS` in every case
 log, plus `controllerless-requested-turn-delivered: PASS`,
@@ -320,26 +372,25 @@ if the ramdisk lacks them).
 
 ## Remaining risks
 
-1. **Controller-less window turn is unproven on current UIKit.**
-   `_updateToInterfaceOrientation:duration:force:` on a window with no
-   rotation client may silently no-op; the fixture asserts only the
-   production unit's arguments, not compositor cooperation. Mitigation
-   paths (device turn, LC orientation lock) still present the content
-   correctly via the extended backing, but the automatic launch turn needs
-   simulator confirmation.
-2. **No fixed 320×480 canvas in native mode.** Zenonia receives
-   portrait-ordered *scene-sized* bounds, so its 320×480 quad covers a
-   sub-rect of a large Classic-Mode scene — expect letterboxed/undersized
-   content (the top fidelity item; a canvas-classifier extension was
-   deliberately out of scope). `UIScreen.bounds` can also change size
-   mid-startup under Classic Mode.
-3. **SjLj/C++ runtime from the RootFS is unverified.** The 253
-   SjLj-instrumented functions, `__gxx_personality_sj0`, the
-   `__cxa_guard_*` trio, and 32 `*vfp` libgcc helpers require
-   `libstdc++.6.dylib`/`libgcc_s.1.dylib` in the iOS 10.3.3 32-bit
-   ramdisk; nothing in the repo builds them. This is a hard launch
-   blocker if absent. Related ABI risk: `objc_msgSend_stret` on armv6
-   (struct buffer as first argument) across 31 call sites.
+Risks 1–3 and 7 as originally written are **resolved by the device run**
+(noted inline); what remains:
+
+1. ~~**Controller-less window turn is unproven on current UIKit.**~~
+   Device-verified: the requested-orientation turn presents upright
+   content on iOS 26 hardware. The fixture still asserts only the
+   production unit's arguments, so compositor cooperation on *other*
+   iOS versions remains a simulator-matrix item.
+2. ~~**No fixed 320×480 canvas in native mode.**~~ Implemented and
+   device-verified: fixed guest canvas, drawable adoption, window growth
+   with frozen subview autoresizing, and the self-calibrating measured
+   fit (`b96ed82` and predecessors). `UIScreen.bounds` can still change
+   size mid-startup under Classic Mode — the fit refits, and converges
+   once the viewport settles.
+3. ~~**SjLj/C++ runtime from the RootFS is unverified.**~~ Resolved
+   transitively: the game's 253 SjLj-instrumented frames execute on
+   device, so the ramdisk ships working `libstdc++.6.dylib` and
+   `libgcc_s.1.dylib`. The armv6 `objc_msgSend_stret` ABI note stands as
+   review-level.
 4. **Host→guest delegate delivery is the most speculative addition** —
    main-queue, guarded by `LC32CanQueryGuestOrientation` and
    `respondsToSelector:`. Zenonia implements neither selector and
@@ -352,18 +403,27 @@ if the ramdisk lacks them).
 6. **Canvas + runtime-hidden**: pre-8 executables in canvas mode that hide
    the status bar at runtime now qualify for the full-screen viewport —
    intended, but covered only by review, not by a fixture.
-7. **All evidence in this report is source-level**; the two CI runs were
-   incomplete when this was written and may have been dispatched before
-   the final merge-audit fixes. The simulator matrix, Zenonia launch,
-   audio, and gameplay remain entirely unverified.
+7. **Verification scope**: one physical device class (iPhone Air) and one
+   Classic-Mode viewport has been exercised. The self-calibrating fit is
+   per-pass and converges on measured geometry, but other devices/aspect
+   ratios, the extended simulator matrix, accelerometer-driven 180° flips
+   (the game's own GL rotation), and formal audio auditing remain
+   unverified. The fit yields after 32 non-settling passes rather than
+   looping; a viewport that oscillates would leave the last converged
+   transform in place.
 
 ## Handoff
 
-This validation pass authored no commits or pushes; its two source fixes
-(the guest MediaPlayer duplicate constant and the host duplicate dispatch
-case) are in the branch tip via the coordinating session's commits
-(`0ab6a65`, `3b746a3`). Everything above lives on `zenonia-compat` in the
-fork; nothing was merged or pushed elsewhere, and the wave-1/wave-2
+The original validation pass authored no commits or pushes; its two source
+fixes (the guest MediaPlayer duplicate constant and the host duplicate
+dispatch case) entered the branch tip via the coordinating session's
+commits (`0ab6a65`, `3b746a3`). As of the final state, everything lives on
+`zenonia-compat` **and** the fork's `dev` branch
+(`08f8d84` merge), is built by the fork's CI (all three workflows green at
+the final tip), and is published as the fork's `nightly` release — the
+artifact installed on the device test. Nothing was pushed to the upstream
+`LiveContainer/LiveExec32` repository; a pull request from
+`dai-1228:zenonia-compat` is the natural upstreaming step. The wave-1/wave-2
 reports under `/tmp/opencode/` were not modified.
 
 ## Addendum — device feedback iteration: canvas presentation (27 September 2026)
@@ -394,11 +454,15 @@ message "Present the native legacy canvas measured to the live viewport":
 A second device run (iPhone Air) after that correction still pinned the
 canvas bottom-left: two failures of analytic placement mean the rotation's
 mount point and conversion semantics on current iOS cannot be modeled
-blind. The fit is now self-calibrating: each pass measures the screen rect
-and the rendered content rect through the same CoreAnimation model-tree
-math, and composes a correction onto the sublayer transform until the two
-coincide (converges within a quarter point, bounded pass count). Anchor
-semantics, rotation placement, and viewport churn are all absorbed by the
-iteration. Status: committed and CI-verified; awaiting the next device
-retest. Full analysis: `/tmp/opencode/wave5-canvas-centering-fix.md`
-(session-local).
+blind. The fit was then made self-calibrating (`b96ed82`): each pass
+measures the screen rect and the rendered content rect through the same
+CoreAnimation model-tree math, and composes a correction onto the
+sublayer transform until the two coincide (converges within a quarter
+point, bounded pass count). Anchor semantics, rotation placement, and
+viewport churn are all absorbed by the iteration.
+
+**Result: resolved on device.** The iPhone Air retest with the
+self-calibrating fit presents the canvas centered and filling the screen
+height with correct 3:2 aspect; the game is playable end to end with
+correct touch mapping. Full analysis:
+`/tmp/opencode/wave5-canvas-centering-fix.md` (session-local).
