@@ -462,6 +462,14 @@ std::vector<GuestCrashAnnotation> CollectGuestCrashAnnotations(
 void symbolicate_call_stack(
     symbolicated_call *callStack, int callStackLen,
     const std::vector<GuestImageSnapshot> &images);
+/* Compose, symbolicate, and print a cross-thread snapshot of the emulated
+ * machine for the host hang watchdog: a blocked guest main thread freezes
+ * the application without raising any signal the crash machinery observes.
+ * Halts every JIT first so blocked threads' register files are stable,
+ * walks each registered thread's registers and frame chain, prints the
+ * full report to stderr, and returns a compact one-line description
+ * suitable for the process abort reason. */
+std::string LC32GuestHangSnapshot();
 int HostProtectionForGuestPermissions(int permissions);
 void *GuestPageTablePointer(
     u64 guestPageAddress, const t_memory_page page);

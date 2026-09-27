@@ -485,6 +485,26 @@ macOS runtime. The host side cross-configures on Linux through the
 same toolchain selection block, gated so macOS toolchain behavior stays
 byte-identical (`build-libiconv.sh`, `HostFrameworks/LC32/Makefile`).
 
+The next device run of that build then **froze during and right after
+the intro video** instead of crashing: a hang, which produces no report
+by itself. Static re-audit of every new path at the freeze point (the
+game's one-shot ExtAudioFile decoders, the Game Center completion
+chain — async, no retry — the presentation-suspension fit, the
+eager AVFoundation constructor) cleared each candidate of an obvious
+blocking bug, so the completion wave's evidence machinery gained its
+missing piece: a **main-queue hang watchdog**. The guest main thread
+runs on the host main thread, so a stalled guest stalls the host main
+queue; a one-second heartbeat timer on that queue only fires while it
+drains. When the heartbeat goes stale for forty-five seconds (re-verified
+after a grace interval, standing down while the app is backgrounded),
+the watchdog halts the JITs, snapshots every guest thread's registers,
+registry wait state, and frame chain, symbolicates the frames, prints
+the full report to stderr, and terminates with a compact description
+installed as the process abort reason — so a freeze now leaves the
+same evidence a crash does, and the device's crash log (Settings ->
+Privacy & Security -> Analytics Data) carries the stalled PC and wait
+state for exact offline symbolication.
+
 Expected device behavior after this wave: launch → upright
 letterboxed title → intro video (fullscreen, native presentation) →
 menu at 2x with the 4-inch layout branch, Game Center reporting its

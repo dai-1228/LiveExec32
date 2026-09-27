@@ -32,17 +32,22 @@
 
 #include "dynarmic_internal.h"
 
+#include <atomic>
 #include <execinfo.h>
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+
+#include <dispatch/dispatch.h>
 
 #include <mach/mach_init.h>
 
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 
 namespace {
 
@@ -243,6 +248,7 @@ void LC32HostUncaughtExceptionHandler(NSException *exception) {
 void LC32InstallHostCrashNetOnce(void) {
     if(lc32HostCrashNetInstalled) return;
     lc32HostCrashNetInstalled = true;
+    LC32InstallHangWatchdog();
 
     /* Never fight an existing handler chain: keep the previous uncaught
      * handler and forward to it after recording ours, and leave any host
@@ -278,6 +284,121 @@ void LC32InstallHostCrashNetOnce(void) {
                 LC32HostFatalSignalName(fatalSignals[index]),
                 strerror(errno));
         }
+    }
+}
+
+/*
+ * ------------------------------------------------------------------
+ * Host main-queue hang watchdog.
+ *
+ * The guest main thread runs on the host main thread, so a blocked guest
+ * stalls the host main queue: a one-second heartbeat timer scheduled on
+ * the main queue only fires while the queue drains.  When the heartbeat
+ * goes stale the watchdog takes a cross-thread snapshot of the emulated
+ * machine (see LC32GuestHangSnapshot) - which halts the JITs, dumps every
+ * guest thread's registers, wait state, and frame chain, and prints the
+ * symbolicated report to stderr - and then terminates with the compact
+ * description installed as the process abort reason, so a frozen guest
+ * leaves the same kind of evidence a crash does.  Backgrounding the app
+ * legitimately suspends the main queue, so the watchdog stands down
+ * between the background and foreground notifications.
+ */
+
+std::atomic<uint64_t> lc32MainQueueHeartbeatNanos{0};
+std::atomic<bool> lc32MainQueueEverServiced{false};
+std::atomic<bool> lc32AppBackgrounded{false};
+dispatch_source_t lc32MainQueueHeartbeatTimer = nil;
+
+uint64_t LC32MonotonicNanos() {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &now);
+    return static_cast<uint64_t>(now.tv_sec) * 1000000000ull +
+           static_cast<uint64_t>(now.tv_nsec);
+}
+
+void *LC32HangWatchdogMain(void *) {
+    constexpr uint64_t lc32HangThresholdNanos = 45ull * 1000000000ull;
+    struct timespec pollInterval = {5, 0};
+    struct timespec reverifyGrace = {3, 0};
+    for (;;) {
+        nanosleep(&pollInterval, nullptr);
+        if (!lc32MainQueueEverServiced.load(std::memory_order_acquire)) {
+            continue;
+        }
+        if (lc32AppBackgrounded.load(std::memory_order_acquire)) {
+            continue;
+        }
+        const uint64_t heartbeat =
+            lc32MainQueueHeartbeatNanos.load(std::memory_order_acquire);
+        const uint64_t now = LC32MonotonicNanos();
+        if (now <= heartbeat ||
+                now - heartbeat < lc32HangThresholdNanos) {
+            continue;
+        }
+        /* Re-verify after a short grace so a transient scheduling gap
+         * cannot terminate a healthy application. */
+        nanosleep(&reverifyGrace, nullptr);
+        if (lc32AppBackgrounded.load(std::memory_order_acquire)) {
+            continue;
+        }
+        if (lc32MainQueueHeartbeatNanos.load(
+                std::memory_order_acquire) != heartbeat) {
+            continue;
+        }
+        const std::string compact = LC32GuestHangSnapshot();
+        /* The snapshot halts the JITs; nothing guest-side can make
+         * progress anymore, and the fatal-signal handler must keep this
+         * richer abort reason rather than its own generic fault text. */
+        lc32HostCrashReasonInstalled = 1;
+        abort_with_reason(LC32_OS_REASON_LIBSYSTEM,
+            LC32HostCrashReasonCode,
+            compact.empty() ? "LiveExec32 guest main thread stalled"
+                            : compact.c_str(),
+            0);
+    }
+    return nullptr;
+}
+
+void LC32InstallHangWatchdog() {
+    lc32MainQueueHeartbeatTimer = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    if (lc32MainQueueHeartbeatTimer != nil) {
+        dispatch_source_set_timer(lc32MainQueueHeartbeatTimer,
+            dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
+            NSEC_PER_SEC, 0);
+        dispatch_source_set_event_handler(
+            lc32MainQueueHeartbeatTimer, ^{
+                lc32MainQueueHeartbeatNanos.store(
+                    LC32MonotonicNanos(), std::memory_order_release);
+                lc32MainQueueEverServiced.store(
+                    true, std::memory_order_release);
+            });
+        dispatch_resume(lc32MainQueueHeartbeatTimer);
+    }
+
+    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+    [center addObserverForName:
+            UIApplicationDidEnterBackgroundNotification
+        object:nil queue:[NSOperationQueue mainQueue]
+        usingBlock:^(__unused NSNotification *notification) {
+            lc32AppBackgrounded.store(true, std::memory_order_release);
+        }];
+    [center addObserverForName:
+            UIApplicationWillEnterForegroundNotification
+        object:nil queue:[NSOperationQueue mainQueue]
+        usingBlock:^(__unused NSNotification *notification) {
+            lc32AppBackgrounded.store(false, std::memory_order_release);
+            lc32MainQueueHeartbeatNanos.store(
+                LC32MonotonicNanos(), std::memory_order_release);
+        }];
+
+    pthread_t watchdogThread;
+    if (pthread_create(&watchdogThread, nullptr,
+                LC32HangWatchdogMain, nullptr) == 0) {
+        pthread_detach(watchdogThread);
+    } else {
+        fprintf(stderr,
+            "LC32: could not start the main-queue hang watchdog\n");
     }
 }
 
