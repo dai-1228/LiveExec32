@@ -90,6 +90,7 @@ typedef NS_ENUM(NSUInteger, LC32LegacyIPadGeometryMode) {
     BOOL hasTransform;
     BOOL hasWindowFrame;
     BOOL yielded;
+    unsigned fitPasses;
 }
 @end
 
@@ -2011,15 +2012,10 @@ void LC32FitNativeLegacyCanvasWindow(UIWindow *window) {
      * a foreign transform wins and permanently yields this window, exactly
      * like the canvas-mode sublayer compositor's takeover handling. */
     const CATransform3D currentSublayer = windowLayer.sublayerTransform;
-    CATransform3D measureSublayer = currentSublayer;
-    if(state && state->hasTransform && CATransform3DEqualToTransform(
-            currentSublayer, state->appliedSublayerTransform)) {
-        /* Measure the authored geometry with the previous fit removed, so
-         * repeated passes neither compound nor cancel earlier placements. */
-        measureSublayer = state->originalSublayerTransform;
-    } else if(state) {
-        if(!CATransform3DEqualToTransform(
-                currentSublayer, state->appliedSublayerTransform) &&
+    if(state) {
+        if(state->hasTransform &&
+                !CATransform3DEqualToTransform(
+                    currentSublayer, state->appliedSublayerTransform) &&
                 !CATransform3DEqualToTransform(
                     currentSublayer, state->originalSublayerTransform)) {
             state->yielded = YES;
@@ -2028,6 +2024,14 @@ void LC32FitNativeLegacyCanvasWindow(UIWindow *window) {
     } else if(!CATransform3DIsIdentity(currentSublayer)) {
         /* Another owner already composes this window's sublayers. */
         return;
+    }
+    if(!state) {
+        state = [LC32NativeCanvasFitState new];
+        state->originalSublayerTransform = currentSublayer;
+        state->appliedSublayerTransform = CATransform3DIdentity;
+        objc_setAssociatedObject(window, LC32NativeCanvasFitStateKey,
+            state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [state release];
     }
 
     /* The uniformly fitted content must stay inside the window's hit
@@ -2040,18 +2044,54 @@ void LC32FitNativeLegacyCanvasWindow(UIWindow *window) {
         return;
     }
 
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    if(!CATransform3DEqualToTransform(
-            measureSublayer, currentSublayer)) {
-        windowLayer.sublayerTransform = measureSublayer;
+    /* Target and content are both measured through the same CoreAnimation
+     * model-tree math, so the fit is independent of where UIKit mounted the
+     * rotation (an inner transform layer, an ancestor scene layer, or the
+     * window's own backing) and of CoreAnimation's anchor-relative
+     * sublayerTransform application: the correction below composes in the
+     * effective-affine domain, where anchor-relative applications combine
+     * cleanly (f_{inc.cur} = f_inc o f_cur for a shared anchor).
+     *
+     * Screen rect: the topmost ancestor layer's bounds, converted into the
+     * window layer's space — this applies any rotation living above the
+     * window exactly as the renderer sees it.
+     * Content rect: the union of the direct guest subview layers' bounds,
+     * converted into the window layer's space — this applies any rotation
+     * living inside the window, plus the fit transform itself. */
+    CALayer *sceneLayer = windowLayer;
+    while(sceneLayer.superlayer) sceneLayer = sceneLayer.superlayer;
+    CGRect targetRect = CGRectNull;
+    if(sceneLayer != windowLayer) {
+        const CGRect sceneBounds = sceneLayer.bounds;
+        if(isfinite(sceneBounds.origin.x) &&
+                isfinite(sceneBounds.origin.y) &&
+                isfinite(sceneBounds.size.width) &&
+                isfinite(sceneBounds.size.height) &&
+                sceneBounds.size.width > 0 && sceneBounds.size.height > 0) {
+            targetRect = [windowLayer convertRect:sceneBounds
+                                          fromLayer:sceneLayer];
+            if(!isfinite(targetRect.origin.x) ||
+                    !isfinite(targetRect.origin.y) ||
+                    !isfinite(targetRect.size.width) ||
+                    !isfinite(targetRect.size.height) ||
+                    !(targetRect.size.width > 0) ||
+                    !(targetRect.size.height > 0)) {
+                targetRect = CGRectNull;
+            }
+        }
+    }
+    if(CGRectIsNull(targetRect)) targetRect = viewport;
+
+    const CGAffineTransform currentAffine =
+        CATransform3DGetAffineTransform(currentSublayer);
+    if(!isfinite(currentAffine.a) || !isfinite(currentAffine.d) ||
+            !isfinite(currentAffine.tx) || !isfinite(currentAffine.ty)) {
+        return;
     }
 
-    /* Measure the canvas exactly as the native backing presents it:
-     * converting each direct guest subview layer into the window layer's
-     * space applies the active rotation presentation, so the fit composes
-     * with whatever UIKit actually produced instead of assuming an
-     * axis-aligned canvas rect. */
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+
     CGRect contentRect = CGRectNull;
     for(UIView *subview in LC32NativeViewSubviews(window)) {
         if(!subview.guest_selfOrNull) continue;
@@ -2069,66 +2109,68 @@ void LC32FitNativeLegacyCanvasWindow(UIWindow *window) {
             ? presented : CGRectUnion(contentRect, presented);
     }
     if(CGRectIsNull(contentRect)) {
-        if(!CATransform3DEqualToTransform(
-                currentSublayer, windowLayer.sublayerTransform)) {
-            windowLayer.sublayerTransform = currentSublayer;
-        }
         [CATransaction commit];
         return;
     }
 
-    /* Core Animation applies sublayerTransform relative to the layer's
-     * anchor point, not the bounds origin (Core Animation Programming
-     * Guide: "applies the parent layer's sublayerTransform to each
-     * sublayer relative to the parent layer's anchor point"). The intended
-     * origin-based mapping p -> scale*p + t must therefore be delivered as
-     * scale*p + (t - (scale-1)*anchor); without the compensation the fit
-     * lands offset by (1-scale)*anchor, which presents as the canvas pinned
-     * into a corner of the rotated scene. */
-    const CGPoint layerAnchor = {
-        windowLayer.bounds.origin.x +
-            windowLayer.anchorPoint.x * windowLayer.bounds.size.width,
-        windowLayer.bounds.origin.y +
-            windowLayer.anchorPoint.y * windowLayer.bounds.size.height,
-    };
     const CGFloat contentWidth = contentRect.size.width;
     const CGFloat contentHeight = contentRect.size.height;
-    const CGFloat scale = MIN(viewport.size.width / contentWidth,
-                              viewport.size.height / contentHeight);
-    const CGAffineTransform target = (!(scale > 0) || !isfinite(scale))
-        ? CGAffineTransformIdentity
-        : CGAffineTransformMake(scale, 0, 0, scale,
-              CGRectGetMidX(viewport) - scale * CGRectGetMidX(contentRect) -
-                  (1 - scale) * layerAnchor.x,
-              CGRectGetMidY(viewport) - scale * CGRectGetMidY(contentRect) -
-                  (1 - scale) * layerAnchor.y);
-    if(!(scale > 0) || !isfinite(scale) || !isfinite(target.tx) ||
-            !isfinite(target.ty)) {
-        if(!CATransform3DEqualToTransform(
-                currentSublayer, windowLayer.sublayerTransform)) {
-            windowLayer.sublayerTransform = currentSublayer;
-        }
+    const CGFloat scale = MIN(targetRect.size.width / contentWidth,
+                              targetRect.size.height / contentHeight);
+    if(!(scale > 0) || !isfinite(scale)) {
+        [CATransaction commit];
+        return;
+    }
+    const CGFloat midErrorX = CGRectGetMidX(targetRect) -
+        (scale * CGRectGetMidX(contentRect));
+    const CGFloat midErrorY = CGRectGetMidY(targetRect) -
+        (scale * CGRectGetMidY(contentRect));
+    if(!isfinite(midErrorX) || !isfinite(midErrorY)) {
         [CATransaction commit];
         return;
     }
 
-    if(!state) {
-        state = [LC32NativeCanvasFitState new];
-        state->originalSublayerTransform = currentSublayer;
-        state->appliedSublayerTransform = CATransform3DIdentity;
-        objc_setAssociatedObject(window, LC32NativeCanvasFitStateKey,
-            state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [state release];
-    }
+    /* Converged when the correction is within half a point and a tenth of a
+     * percent: leave the current transform untouched and stop rescheduling.
+     * Large corrections reset the pass counter (the viewport moved); tiny
+     * corrections that never settle yield after a bounded run instead of
+     * looping forever. */
+    const BOOL converged = fabs(scale - 1.0) < 0.001 &&
+        fabs(CGRectGetMidX(targetRect) - CGRectGetMidX(contentRect)) < 0.25 &&
+        fabs(CGRectGetMidY(targetRect) - CGRectGetMidY(contentRect)) < 0.25;
+    if(!converged) {
+        if(fabs(scale - 1.0) > 0.1 || state->fitPasses >= 32) {
+            if(state->fitPasses >= 32) {
+                state->yielded = YES;
+                [CATransaction commit];
+                return;
+            }
+            state->fitPasses = 0;
+        }
+        state->fitPasses++;
 
-    const CATransform3D desired =
-        CATransform3DMakeAffineTransform(target);
-    const BOOL changed = !CATransform3DEqualToTransform(currentSublayer, desired);
-    if(changed) {
+        /* Compose the measured correction onto the current transform: the
+         * effective affine maps the content rect onto the target rect, and
+         * CoreAnimation's anchor-relative application of the composed matrix
+         * reproduces exactly that composed effective affine. */
+        const CGAffineTransform correction = CGAffineTransformMake(
+            scale, 0, 0, scale, midErrorX, midErrorY);
+        const CGAffineTransform next =
+            CGAffineTransformConcat(correction, currentAffine);
+        if(!isfinite(next.a) || !isfinite(next.d) ||
+                !isfinite(next.tx) || !isfinite(next.ty)) {
+            [CATransaction commit];
+            return;
+        }
+        const CATransform3D desired =
+            CATransform3DMakeAffineTransform(next);
+        if(!state->hasTransform) {
+            state->originalSublayerTransform = currentSublayer;
+        }
+        state->appliedSublayerTransform = desired;
+        state->hasTransform = YES;
         windowLayer.sublayerTransform = desired;
     }
-    state->appliedSublayerTransform = desired;
-    state->hasTransform = YES;
     if(!state->appliedBackground) {
         /* The letterbox area only ever shows the window background; the
          * compatibility container paints it black, so match that here.  The
@@ -2146,9 +2188,8 @@ void LC32FitNativeLegacyCanvasWindow(UIWindow *window) {
     /* The live viewport can keep settling after any single event (the
      * Classic-Mode startup expansions). Revalidate once more whenever this
      * pass actually moved the canvas; the chain terminates as soon as the
-     * viewport stabilizes, because an unchanged transform schedules
-     * nothing. */
-    if(changed) {
+     * fit converges, because an converged pass schedules nothing. */
+    if(!converged) {
         dispatch_async(dispatch_get_main_queue(), ^{
             LC32FitNativeLegacyCanvasWindow(window);
         });
