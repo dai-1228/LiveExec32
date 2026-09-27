@@ -84,7 +84,7 @@ endif
 
 LiveExec32Shared_FILES = \
 	LiveExec32Shared.cpp guest_bootstrap.cpp debugger_server.cpp \
-	crash_exception.mm guest_dispatch.mm guest_timer_queue.cpp guest_timers.cpp \
+	crash_exception.mm host_crash_net.mm guest_dispatch.mm guest_timer_queue.cpp guest_timers.cpp \
 	arm_dynarmic_cp15.cpp dynarmic.cpp dynarmic_syscalls.cpp \
 	darwin_file_syscalls.cpp guest_mach_messages.cpp guest_mach_exceptions.cpp \
 	dynarmic_memory.cpp dynarmic_callbacks.cpp dynarmic_thread_state.cpp \
@@ -101,16 +101,19 @@ LiveExec32Shared_FILES = \
 	../OpenAL/OpenAL.mm ../OpenGLES/OpenGLES.mm ../UIKit/UIKit.mm \
 	../UIKit/LegacyAutoLayout.mm ../UIKit/LegacyFonts.mm ../UIKit/LegacyAlerts.mm \
 	../UIKit/LegacyRotation.mm ../UIKit/LegacyNibLoading.mm \
-	../UIKit/UIViewController+LC32LegacyModalPresentation.mm
+	../UIKit/UIViewController+LC32LegacyModalPresentation.mm \
+	../UIKit/UIViewController+LC32GuestNibLoading.mm
 LiveExec32Shared_CFLAGS = \
 	-I. -I$(DYNARMIC_ROOT)/src -I../../include -DDYNARMIC_MASTER \
 	-I../../External/mini-gdbstub/include -DLC32_DEBUG_LOGS=$(LC32_DEBUG_LOGS)
 LiveExec32Shared_CCFLAGS = -std=c++17
 crash_exception.mm_CFLAGS = -fobjc-arc
+host_crash_net.mm_CFLAGS = -fobjc-arc
 ../UIKit/LegacyFonts.mm_CFLAGS = -fobjc-arc
 ../UIKit/LegacyAlerts.mm_CFLAGS = -fobjc-arc
 ../UIKit/LegacyRotation.mm_CFLAGS = -fobjc-arc
 ../UIKit/UIViewController+LC32LegacyModalPresentation.mm_CFLAGS = -fobjc-arc
+../UIKit/UIViewController+LC32GuestNibLoading.mm_CFLAGS = -fobjc-arc
 LiveExec32Shared_OBJ_FILES = $(DYNARMIC_STATIC_LIBS)
 LiveExec32Shared_LDFLAGS = -L../../External/mini-gdbstub/build -Wl,-weak-lMobileGestalt
 LiveExec32Shared_LIBRARIES = gdbstub

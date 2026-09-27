@@ -1,4 +1,5 @@
 #import <AVFoundation/AVFoundation.h>
+#import <Foundation/Foundation+LC32.h>
 
 #include <float.h>
 
@@ -7,10 +8,26 @@
  * are ABI data, not necessarily the exported symbol spelling (for example,
  * aperture modes and metadata identifiers deliberately differ).  Keeping
  * these as real guest constant strings avoids loading another native
- * framework during LiveExec32 startup.
+ * framework during LiveExec32 startup; the exceptions that the native
+ * runtime compares by value are bound to the native constants below.
  */
 #define LC32_DEFINE_AVFOUNDATION_STRING(symbol, value) \
     NSString *const LC32_AVFOUNDATION_##symbol __asm__("_" #symbol) = value;
+
+/*
+ * Media characteristics are matched by the native runtime against exact
+ * string values, and those values are not necessarily the exported symbol
+ * spelling, exactly like the aperture modes and metadata identifiers above.
+ * Give these exported pointers stable constant-string proxies and bind them
+ * to the native framework's own constant objects at load time, mirroring
+ * the Core Animation constant bridge; if a native constant is unavailable,
+ * the binding helper falls back to the symbol spelling as a string.
+ */
+#define LC32_DEFINE_AVFOUNDATION_HOST_STRING(symbol) \
+    NSString *const LC32_AVFOUNDATION_##symbol __asm__("_" #symbol) = \
+        LC32_CONST_STR_ID((&(LC32ConstantStringProxy){ \
+            __CFConstantStringClassReference, 0x7c8, NULL, 0 \
+        }));
 
 LC32_DEFINE_AVFOUNDATION_STRING(AVAssetChapterMetadataGroupsDidChangeNotification, @"AVAssetChapterMetadataGroupsDidChangeNotification")
 LC32_DEFINE_AVFOUNDATION_STRING(AVAssetDownloadTaskMediaSelectionKey, @"AVAssetDownloadTaskMediaSelectionKey")
@@ -171,19 +188,19 @@ LC32_DEFINE_AVFOUNDATION_STRING(AVFoundationErrorDomain, @"AVFoundationErrorDoma
 LC32_DEFINE_AVFOUNDATION_STRING(AVLayerVideoGravityResize, @"AVLayerVideoGravityResize")
 LC32_DEFINE_AVFOUNDATION_STRING(AVLayerVideoGravityResizeAspectFill, @"AVLayerVideoGravityResizeAspectFill")
 LC32_DEFINE_AVFOUNDATION_STRING(AVLinearPCMIsNonInterleaved, @"AVLinearPCMIsNonInterleaved")
-LC32_DEFINE_AVFOUNDATION_STRING(AVMediaCharacteristicAudible, @"AVMediaCharacteristicAudible")
+LC32_DEFINE_AVFOUNDATION_HOST_STRING(AVMediaCharacteristicAudible)
 LC32_DEFINE_AVFOUNDATION_STRING(AVMediaCharacteristicContainsOnlyForcedSubtitles, @"public.subtitles.forced-only")
 LC32_DEFINE_AVFOUNDATION_STRING(AVMediaCharacteristicDescribesMusicAndSoundForAccessibility, @"public.accessibility.describes-music-and-sound")
 LC32_DEFINE_AVFOUNDATION_STRING(AVMediaCharacteristicDescribesVideoForAccessibility, @"public.accessibility.describes-video")
 LC32_DEFINE_AVFOUNDATION_STRING(AVMediaCharacteristicDubbedTranslation, @"public.translation.dubbed")
 LC32_DEFINE_AVFOUNDATION_STRING(AVMediaCharacteristicEasyToRead, @"public.easy-to-read")
-LC32_DEFINE_AVFOUNDATION_STRING(AVMediaCharacteristicFrameBased, @"AVMediaCharacteristicFrameBased")
+LC32_DEFINE_AVFOUNDATION_HOST_STRING(AVMediaCharacteristicFrameBased)
 LC32_DEFINE_AVFOUNDATION_STRING(AVMediaCharacteristicIsAuxiliaryContent, @"public.auxiliary-content")
 LC32_DEFINE_AVFOUNDATION_STRING(AVMediaCharacteristicIsMainProgramContent, @"public.main-program-content")
 LC32_DEFINE_AVFOUNDATION_STRING(AVMediaCharacteristicLanguageTranslation, @"public.translation")
 LC32_DEFINE_AVFOUNDATION_STRING(AVMediaCharacteristicTranscribesSpokenDialogForAccessibility, @"public.accessibility.transcribes-spoken-dialog")
 LC32_DEFINE_AVFOUNDATION_STRING(AVMediaCharacteristicUsesWideGamutColorSpace, @"public.uses-wide-gamut-color-space")
-LC32_DEFINE_AVFOUNDATION_STRING(AVMediaCharacteristicVisual, @"AVMediaCharacteristicVisual")
+LC32_DEFINE_AVFOUNDATION_HOST_STRING(AVMediaCharacteristicVisual)
 LC32_DEFINE_AVFOUNDATION_STRING(AVMediaCharacteristicVoiceOverTranslation, @"public.translation.voice-over")
 LC32_DEFINE_AVFOUNDATION_STRING(AVMediaTypeAudio, @"soun")
 LC32_DEFINE_AVFOUNDATION_STRING(AVMediaTypeClosedCaption, @"clcp")
@@ -873,3 +890,27 @@ const float LC32_AVSpeechUtteranceMaximumSpeechRate
     __asm__("_AVSpeechUtteranceMaximumSpeechRate") = 1.0f;
 const float LC32_AVSpeechUtteranceDefaultSpeechRate
     __asm__("_AVSpeechUtteranceDefaultSpeechRate") = 0.5f;
+
+/*
+ * The generated class shims in this framework forward to the native
+ * AVFoundation classes through the bridge, and the native audio-session
+ * property support resolves AVAudioSession by name.  Load the native
+ * framework once here so those lookups succeed for any application that
+ * links this guest framework, then bind the media characteristics to the
+ * native constant objects.  Applications that never link AVFoundation never
+ * run this constructor.  This mirrors the native-framework loading done by
+ * the Core Data and Core Animation constant bridges.
+ */
+__attribute__((constructor))
+static void LC32BindAVFoundationNativeMediaCharacteristics(void) {
+    LC32LoadHostFramework("AVFoundation");
+    LC32BindHostObjectConstant(
+        (id)LC32_AVFOUNDATION_AVMediaCharacteristicAudible,
+        "AVMediaCharacteristicAudible");
+    LC32BindHostObjectConstant(
+        (id)LC32_AVFOUNDATION_AVMediaCharacteristicFrameBased,
+        "AVMediaCharacteristicFrameBased");
+    LC32BindHostObjectConstant(
+        (id)LC32_AVFOUNDATION_AVMediaCharacteristicVisual,
+        "AVMediaCharacteristicVisual");
+}

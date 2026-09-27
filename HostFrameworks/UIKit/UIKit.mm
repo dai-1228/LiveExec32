@@ -32,6 +32,15 @@ typedef NS_ENUM(NSUInteger, LC32LegacyIPadGeometryMode) {
     LC32LegacyIPadGeometryModePreservePhoneLandscapeCanvas,
 };
 
+/* Supplied by the native legacy rotation unit: whether the pre-iOS-8 turn
+ * has already initialized the window's current root controller.  The canvas
+ * fit's window growth must not precede that turn for a controller-backed
+ * window of the declared-universal class, because the turn sizes the root
+ * view explicitly and a window already grown to the live viewport would
+ * hand that sizing a screen extent instead of the authored canvas. */
+extern "C" BOOL LC32NativeLegacyRotationTurnedControllerForWindow(
+    UIWindow *window);
+
 @interface LC32LegacyIPadContainerController : UIViewController {
 @private
     UIViewController *_guestContentController;
@@ -91,6 +100,10 @@ typedef NS_ENUM(NSUInteger, LC32LegacyIPadGeometryMode) {
     BOOL hasTransform;
     BOOL hasWindowFrame;
     BOOL yielded;
+    /* The converged transform is temporarily off the window layer while a
+     * host presentation container is mounted over the canvas; see the
+     * suspension block in LC32FitNativeLegacyCanvasWindow. */
+    BOOL overlaySuspended;
     unsigned fitPasses;
 }
 @end
@@ -2004,7 +2017,16 @@ void LC32RecordNativeLegacyCanvasDrawable(UIView *owner, CALayer *drawable) {
         objc_setAssociatedObject(window, LC32NativeCanvasDrawableLayerKey,
             record, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
+    const BOOL wasRecorded = [record objectForKey:[NSNull null]] != nil;
     [record setObject:drawable forKey:[NSNull null]];
+    if(!wasRecorded) {
+        /* The record is a controller-backed window's only content source:
+         * before it exists the fit's passes run without a measurement and
+         * stop without rescheduling, so the drawable's first adoption must
+         * re-arm the fit itself.  The schedule's gates and the pending
+         * associated object coalesce this with any pass already queued. */
+        LC32ScheduleNativeLegacyCanvasFit(window);
+    }
 }
 
 CGRect LC32NativeLegacyCanvasDrawableContentRect(
@@ -2032,6 +2054,25 @@ CGRect LC32NativeLegacyCanvasDrawableContentRect(
     return presented;
 }
 
+bool LC32NativeLegacyCanvasPresentationOverlayMounted(UIWindow *window) {
+    /* Modern UIKit presents a view controller by mounting its transition
+     * container as a direct subview of the presenting controller's window.
+     * That container is authored on the host side (no guest mirror) and
+     * covers the window's grown bounds, and it is the only such subview a
+     * controller-backed window of this class has besides the root
+     * controller's own view and the guest's mirrored content.  Alert,
+     * keyboard, and text-effect surfaces live in their own windows and
+     * never appear here. */
+    UIViewController *root = LC32NativeWindowRootViewController(window);
+    UIView *rootView = nil;
+    LC32NativeViewIfLoaded(root, &rootView);
+    for(UIView *subview in LC32NativeViewSubviews(window)) {
+        if(subview == rootView || subview.guest_selfOrNull) continue;
+        return true;
+    }
+    return false;
+}
+
 void LC32FitNativeLegacyCanvasWindow(UIWindow *window) {
     /* Present the canonical phone canvas of the runtime-declared class
      * (320x480) or of the declared-universal class (320x480 or 320x568,
@@ -2057,6 +2098,14 @@ void LC32FitNativeLegacyCanvasWindow(UIWindow *window) {
          * pieces still ours, mirroring the rootless placement
          * reconciliation. */
         if(!state) return;
+        if(state->overlaySuspended) {
+            /* A mounted presentation overlay already holds the original
+             * sublayer transform on the layer, so the fit's own transform is
+             * not on screen to restore; only the window growth can still be
+             * ours to undo, which the growth-only path below performs. */
+            state->overlaySuspended = NO;
+            state->hasTransform = NO;
+        }
         if(!state->hasTransform) {
             /* The fill transform never engaged; the window growth may still
              * be ours to undo. */
@@ -2097,6 +2146,65 @@ void LC32FitNativeLegacyCanvasWindow(UIWindow *window) {
             state->originalBackground = NULL;
         }
         return;
+    }
+
+    /* The rotation unit's pre-iOS-8 turn sizes a controller-backed window's
+     * root view explicitly, so the growth below must wait for it: growing
+     * the window to the live viewport first would hand that sizing the
+     * screen extent instead of the authored canvas.  The turn schedules
+     * this fit once it has laid out the client, so this gate only reorders
+     * the early passes; controller-less windows and every window of the
+     * runtime-declared class keep their existing behavior. */
+    if(LC32NativeDeclaredLandscapePhoneCanvasClassActive() &&
+            LC32NativeWindowRootViewController(window) &&
+            !LC32NativeLegacyRotationTurnedControllerForWindow(window)) {
+        return;
+    }
+
+    /* A mounted presentation container covers the window's grown bounds,
+     * while the composed transform below is calibrated for the authored
+     * canvas, so leaving it in place would scale the presented interface
+     * past the screen and crop it (a fullscreen video, a web view, a Game
+     * Center controller).  Suspend the fit while such an overlay is
+     * mounted: the container presents natively against the window's grown
+     * frame, and the converged transform goes straight back on once the
+     * overlay leaves.  The presentation and dismissal both re-arm the fit
+     * through the controller viewDidMoveToWindow swizzle. */
+    if(LC32NativeDeclaredLandscapePhoneCanvasClassActive() &&
+            LC32NativeWindowRootViewController(window)) {
+        if(LC32NativeLegacyCanvasPresentationOverlayMounted(window)) {
+            if(state && state->hasTransform && !state->overlaySuspended) {
+                [CATransaction begin];
+                [CATransaction setDisableActions:YES];
+                windowLayer.sublayerTransform =
+                    state->originalSublayerTransform;
+                [CATransaction commit];
+                state->overlaySuspended = YES;
+            }
+            return;
+        }
+        if(state && state->overlaySuspended) {
+            state->overlaySuspended = NO;
+            if(state->hasTransform) {
+                const CATransform3D currentSublayer =
+                    windowLayer.sublayerTransform;
+                if(!CATransform3DEqualToTransform(currentSublayer,
+                        state->originalSublayerTransform) &&
+                        !CATransform3DEqualToTransform(currentSublayer,
+                            state->appliedSublayerTransform)) {
+                    /* Another owner composed the window's sublayers while
+                     * the fit was suspended; the converged transform is no
+                     * longer ours to restore. */
+                    state->yielded = YES;
+                    return;
+                }
+                [CATransaction begin];
+                [CATransaction setDisableActions:YES];
+                windowLayer.sublayerTransform =
+                    state->appliedSublayerTransform;
+                [CATransaction commit];
+            }
+        }
     }
 
     const CGRect viewport = LC32LegacyViewportInView(window, window);

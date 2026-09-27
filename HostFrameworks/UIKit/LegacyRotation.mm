@@ -412,6 +412,22 @@ extern "C" void LC32FinishNativeLegacyRotationStartup(void) {
     UpdateWindows(PreferredOrientation(), true);
 }
 
+extern "C" BOOL LC32NativeLegacyRotationTurnedControllerForWindow(
+        UIWindow *window) {
+    /* Answers whether the pre-iOS-8 turn has already initialized this
+     * window's current root controller. The UIKit adapter's canvas fit
+     * consults this before growing a controller-backed window of the
+     * declared-universal class: this unit sizes the root view explicitly
+     * during the turn, and a window already grown to the live viewport
+     * would hand that sizing the screen extent instead of the authored
+     * canvas. A root that was never initialized leaves the fit to the
+     * schedule this unit issues once its turn lays the client out. */
+    if(!LC32NativeLegacyRotationEnabled()) return NO;
+    UIViewController *root = NativeRoot(window);
+    if(!root) return NO;
+    return WindowState(window).initializedController == root;
+}
+
 extern "C" void LC32NativeLegacyRotationRefreshRequested(
         UIInterfaceOrientation orientation) {
     if(!LC32NativeLegacyRotationEnabled()) return;
@@ -436,6 +452,12 @@ extern "C" void LC32NativeLegacyRotationRefreshRequested(
     [self lc32_rotationViewDidMoveToWindow:window shouldAppearOrDisappear:appear];
     if(!window || !pthread_main_np() || !RegisteredClass(object_getClass(self))) return;
     [Controllers() addObject:self];
+    // A presented guest controller's view enters its window through the
+    // modern presentation container, and leaves again at dismissal; both
+    // events change what the fixed-canvas fit may compose over. The adapter
+    // gates and coalesces the work, and resolves a mounted overlay inside
+    // the fit itself.
+    LC32ScheduleNativeLegacyCanvasFit(window);
     if(!startupFinished) return;
     // Revalidate deferred attachment work; a replaced or detached controller
     // must not initialize the next owner of its old window.

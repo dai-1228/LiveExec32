@@ -141,7 +141,19 @@ layer backing the adopted drawable (falling back to the direct-subview union
 when a window has no adopted drawable). The drawable stays equal to the
 view's own bounds: a view authored at or below canvas size is left
 untouched, and only a launch-sized view that arrived larger than the canvas
-is re-fitted to it. iPad-idiom execution keeps the normal universal path —
+is re-fitted to it. Growth of a controller-backed window also waits for the
+rotation unit's pre-iOS-8 turn to size its root view, because that turn
+sizes explicitly and a window grown to the live viewport first would hand
+it the screen extent instead of the canvas; the turn re-arms the fit once
+the client is laid out. The record's first arrival re-arms the fit as well,
+since a controller-backed window has no measurable direct guest subview
+before its drawable exists. While a modern presentation container is mounted
+over such a window (a fullscreen intro video, a web view, a Game Center
+controller), the fit is suspended — the composed canvas transform would
+scale the window-sized container past the screen and crop it — and the
+converged transform returns as the overlay leaves, with a foreign
+sublayer-transform takeover during the suspension yielding the fit
+permanently like any other owner conflict. iPad-idiom execution keeps the normal universal path —
 the larger canvas such applications expect there belongs to the rotation
 unit — SDK-8+ executables never enter the class, and phone-only bundles
 keep their existing classes, so the class is strictly additive; the

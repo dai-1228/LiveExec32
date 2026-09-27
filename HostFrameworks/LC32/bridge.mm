@@ -1591,7 +1591,104 @@ static bool LC32DetachDeadNativePeerGuestKey(u32 guestObject) {
     return true;
 }
 
-extern "C" u32 LC32UpdateHostMapping(
+/*
+ * Host exceptions which must keep riding their own unwind even though a
+ * host dispatch point caught them.  Guest crash exceptions carry the
+ * finished guest report and surface through the outer container's catch.
+ * UIKit's debugger-stop notifier instead unwinds the host run loop through
+ * a caught private exception whose class is file-local there, so recognize
+ * its stable name: a nested run-loop drain inside a dispatch point must
+ * not convert that control-flow unwind into a crash report.
+ */
+static bool LC32HostDispatchExceptionRidesUnwind(NSException *exception) {
+    if(LC32IsGuestCrashException(exception)) return true;
+    return [exception.name isEqualToString:@"LC32DebuggerStopException"];
+}
+
+/*
+ * An Objective-C exception raised by host framework code during a bridged
+ * guest call previously escaped the emulated CPU's fault machinery and
+ * terminated the process through the unwinder with no report at all: the
+ * guest crash path only covers signals raised inside the JIT.  Convert such
+ * an exception into the guest crash-report channel, with the exception's
+ * own throw-site stack, so host-side failures during guest calls reach the
+ * operator instead of dying silently.  LC32InvokeHostSelector uses this for
+ * ordinary selector dispatch (SVC 1006); the remaining dispatch entries
+ * which can carry throwing host code share it through
+ * LC32ShieldHostDispatch below.
+ */
+__attribute__((cold, noreturn)) static void
+LC32ThrowHostBridgeExceptionAtSite(
+        const char *site, NSException *exception,
+        u64 host_self, u64 host_cmd) {
+    SEL selector = (SEL)(host_cmd &
+        ~(SEL_RETURN_GUEST_OBJECT | SEL_ALLOW_UNMAPPED_RECEIVER |
+          SEL_RETURN_STRUCT));
+    const char *selectorName =
+        selector ? sel_getName(selector) : "(null selector)";
+    const char *exceptionName = exception.name.UTF8String ?: "?";
+    const char *exceptionReason = exception.reason.UTF8String ?: "";
+    /* The receiver identity is deliberately not dereferenced here: its
+     * invocation guard has already unwound, so the host object may be
+     * gone, and the throw-site stack identifies the failure regardless. */
+    std::string report;
+    report.reserve(2048 + 1024 * 16);
+    report += "LiveExec32 host exception during bridged guest call\n";
+    report += "Dispatch site: ";
+    report += site ? site : "(unknown)";
+    report += "\n";
+    if(host_cmd != 0) {
+        char scratch[32];
+        snprintf(scratch, sizeof(scratch), "%llx",
+            (unsigned long long)host_self);
+        report += "Receiver handle: 0x";
+        report += scratch;
+        report += "\nSelector: ";
+        report += selectorName;
+        report += "\n";
+    }
+    report += "Exception: ";
+    report += exceptionName;
+    report += ": ";
+    report += exceptionReason;
+    report += "\nHost throw-site stack:\n";
+    for(NSString *frame in [exception callStackSymbols]) {
+        report += "  ";
+        report += frame.UTF8String ?: "";
+        report += "\n";
+    }
+    std::string compact;
+    compact.reserve(512);
+    compact += "LiveExec32 host exception during ";
+    compact += site ? site : "a bridged guest call";
+    compact += ": ";
+    compact += exceptionName;
+    LC32ThrowGuestCrashException(
+        report.data(), report.size(), LC32_OS_REASON_LIBSYSTEM,
+        LC32_GUEST_CRASH_REASON_CODE, compact.c_str());
+}
+
+/*
+ * Shield one of the bridge's host dispatch entries.  Everything the entry
+ * raises except an exception which rides its own unwind becomes a guest
+ * crash report naming the dispatch site, so the entry can never fail
+ * silently.  The try block adds no cost to the non-throwing path.
+ */
+template <typename Function>
+auto LC32ShieldHostDispatch(const char *site, Function &&function)
+        -> decltype(function()) {
+    @try {
+        return function();
+    } @catch(NSException *exception) {
+        if(LC32HostDispatchExceptionRidesUnwind(exception)) @throw;
+        LC32ThrowHostBridgeExceptionAtSite(site, exception, 0, 0);
+    }
+}
+
+/* Publishing a mapping may initialize native Objective-C weak storage and
+ * run custom retain/release machinery, so this entry point can raise like
+ * any other host dispatch; shield it (SVC 1023). */
+static u32 LC32UpdateHostMappingInner(
         u32 guestObject, LC32HostMappingOperation operation,
         u64 hostObject) {
     static_assert(sizeof(LC32HostMappingOperation) == sizeof(u32));
@@ -1626,6 +1723,17 @@ extern "C" u32 LC32UpdateHostMapping(
                 guestObject, hostObject, false);
     }
     return 0;
+}
+
+extern "C" u32 LC32UpdateHostMapping(
+        u32 guestObject, LC32HostMappingOperation operation,
+        u64 hostObject) {
+    return LC32ShieldHostDispatch(
+        "host identity-mapping update (SVC 1023)",
+        [&] {
+            return LC32UpdateHostMappingInner(
+                guestObject, operation, hostObject);
+        });
 }
 
 static void LC32MarkHostWeakMappingRetiring(
@@ -1797,8 +1905,11 @@ extern "C" u32 LC32FinishHostWeakRetain(
     return 1;
 }
 
-extern "C" LC32HostWeakRetainResult
-LC32TryRetainHostWeakReference(u32 guestObject) {
+/* objc_loadWeakRetained may initialize classes and dispatch custom
+ * retain/release, so this half of the guest weak-retain handshake can raise
+ * host code (SVC 1019); shield it. */
+static LC32HostWeakRetainResult
+LC32TryRetainHostWeakReferenceInner(u32 guestObject) {
     std::shared_ptr<LC32HostWeakMappingEntry> entry;
     bool mappingWasLive = false;
     bool mappingWasPermanent = false;
@@ -1869,6 +1980,15 @@ LC32TryRetainHostWeakReference(u32 guestObject) {
     LC32DeferOwnedHostRelease(ownedHostObject);
     LC32DeferHostWeakEntryRelease(std::move(entry));
     return LC32HostWeakRetainMappedDead;
+}
+
+extern "C" LC32HostWeakRetainResult
+LC32TryRetainHostWeakReference(u32 guestObject) {
+    return LC32ShieldHostDispatch(
+        "host weak-reference try-retain (SVC 1019)",
+        [&] {
+            return LC32TryRetainHostWeakReferenceInner(guestObject);
+        });
 }
 
 static int LC32UniqueSelectorArgumentIndexNamed(SEL selector,
@@ -2257,7 +2377,10 @@ u32 LC32CopyHostStringBytes(u64 host_object, u32 encoding,
     return byteCount;
 }
 
-u64 LC32HostStringRangeOfString(
+/* Foundation raises NSRangeException when the guest-supplied search range
+ * exceeds the receiver, so this conversion entry can throw host code (SVC
+ * 1014); shield it. */
+static u64 LC32HostStringRangeOfStringInner(
         const LC32FoundationStringRangeRequest *request) {
     const u64 hostString = (u64)request->hostStringLow |
         ((u64)request->hostStringHigh << 32);
@@ -2302,6 +2425,15 @@ u64 LC32HostStringRangeOfString(
         ? (u32)INT32_MAX : (u32)range.location;
     const u32 length = (u32)range.length;
     return (u64)location | ((u64)length << 32);
+}
+
+u64 LC32HostStringRangeOfString(
+        const LC32FoundationStringRangeRequest *request) {
+    return LC32ShieldHostDispatch(
+        "NSString rangeOfString bridge (SVC 1014)",
+        [&] {
+            return LC32HostStringRangeOfStringInner(request);
+        });
 }
 
 static bool LC32HostObjectIsDispatchData(id object) {
@@ -2411,7 +2543,10 @@ u64 LC32Dlsym(u32 guest_name, bool isFunction) {
     return r;
 }
 
-extern "C" u32 LC32LoadNativeFramework(u32 guestFrameworkName) {
+/* dlopen runs native framework initializers, which can raise host
+ * Objective-C exceptions before the guest ever sees a failure; shield this
+ * SVC 1002 entry point. */
+static u32 LC32LoadNativeFrameworkInner(u32 guestFrameworkName) {
     DynarmicHostString frameworkName(guestFrameworkName);
     if(!frameworkName.hostPtr || !frameworkName.hostPtr[0]) {
         fprintf(stderr, "LC32: refusing an empty native framework name\n");
@@ -2494,6 +2629,14 @@ extern "C" u32 LC32LoadNativeFramework(u32 guestFrameworkName) {
     }
 
     return 1;
+}
+
+extern "C" u32 LC32LoadNativeFramework(u32 guestFrameworkName) {
+    return LC32ShieldHostDispatch(
+        "native framework load (SVC 1002 dlopen)",
+        [&] {
+            return LC32LoadNativeFrameworkInner(guestFrameworkName);
+        });
 }
 
 /*
@@ -2597,7 +2740,12 @@ static id LC32AllocateGuestClassMirror(Class cls) {
     return object;
 }
 
-u64 LC32GetHostObject(u32 guest_self, u32 guest_className, bool returnClass) {
+/* Resolving or synthesizing the native peer of a guest object sends real
+ * messages to host classes (alloc, setGuest_self:, isGuestClass), which can
+ * trigger host +initialize methods that raise; shield this entry (SVC 1007).
+ */
+static u64 LC32GetHostObjectInner(
+        u32 guest_self, u32 guest_className, bool returnClass) {
     DynarmicHostString host_className(guest_className);
     Class cls = objc_getClass(host_className.hostPtr);
     if(returnClass) {
@@ -2626,6 +2774,15 @@ u64 LC32GetHostObject(u32 guest_self, u32 guest_className, bool returnClass) {
         LC32PinGuestObjectToHost(obj, guest_self, true);
     }
     return (u64)obj;
+}
+
+u64 LC32GetHostObject(u32 guest_self, u32 guest_className, bool returnClass) {
+    return LC32ShieldHostDispatch(
+        "guest class/peer resolution (SVC 1007)",
+        [&] {
+            return LC32GetHostObjectInner(
+                guest_self, guest_className, returnClass);
+        });
 }
 
 namespace {
@@ -2703,13 +2860,6 @@ static bool LC32SelectorIsInInitializerFamily(SEL selector) {
     return next == '\0' || next < 'a' || next > 'z';
 }
 
-/* An Objective-C exception raised by host framework code during a bridged
- * guest call previously escaped the emulated CPU's fault machinery and
- * terminated the process through the unwinder with no report at all: the
- * guest crash path only covers signals raised inside the JIT.  Convert such
- * an exception into the guest crash-report channel, with the exception's
- * own throw-site stack, so host-side failures during guest calls reach the
- * operator instead of dying silently. */
 static u64 LC32InvokeHostSelectorInner(
         u64 host_self, u64 host_cmd, u64 va_args);
 
@@ -2718,42 +2868,12 @@ __attribute__((cold, noreturn)) static void LC32ThrowHostBridgeException(
     SEL selector = (SEL)(host_cmd &
         ~(SEL_RETURN_GUEST_OBJECT | SEL_ALLOW_UNMAPPED_RECEIVER |
           SEL_RETURN_STRUCT));
-    const char *selectorName =
-        selector ? sel_getName(selector) : "(null selector)";
-    const char *exceptionName = exception.name.UTF8String ?: "?";
-    const char *exceptionReason = exception.reason.UTF8String ?: "";
-    /* The receiver identity is deliberately not dereferenced here: its
-     * invocation guard has already unwound, so the host object may be
-     * gone, and the throw-site stack identifies the failure regardless. */
-    std::string report;
-    report.reserve(2048 + 1024 * 16);
-    report += "LiveExec32 host exception during bridged guest call\n";
-    report += "Receiver handle: 0x";
-    char scratch[32];
-    snprintf(scratch, sizeof(scratch), "%llx",
-        (unsigned long long)host_self);
-    report += scratch;
-    report += "\nSelector: ";
-    report += selectorName;
-    report += "\nException: ";
-    report += exceptionName;
-    report += ": ";
-    report += exceptionReason;
-    report += "\nHost throw-site stack:\n";
-    for(NSString *frame in [exception callStackSymbols]) {
-        report += "  ";
-        report += frame.UTF8String ?: "";
-        report += "\n";
-    }
-    std::string compact;
-    compact.reserve(512);
-    compact += "LiveExec32 host exception during bridged call of ";
-    compact += selectorName;
-    compact += ": ";
-    compact += exceptionName;
-    LC32ThrowGuestCrashException(
-        report.data(), report.size(), LC32_OS_REASON_LIBSYSTEM,
-        LC32_GUEST_CRASH_REASON_CODE, compact.c_str());
+    char site[192];
+    snprintf(site, sizeof(site),
+        "bridged objc_msgSend dispatch of %s",
+        selector ? sel_getName(selector) : "(null selector)");
+    LC32ThrowHostBridgeExceptionAtSite(
+        site, exception, host_self, host_cmd);
 }
 
 // guest to host call of objc_msgSend*
@@ -2763,7 +2883,7 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
     } @catch(NSException *exception) {
         /* Guest crash exceptions and debugger stops are already reported
          * through their own machinery and must keep riding the unwind. */
-        if(LC32IsGuestCrashException(exception)) @throw;
+        if(LC32HostDispatchExceptionRidesUnwind(exception)) @throw;
         LC32ThrowHostBridgeException(exception, host_self, host_cmd);
     }
 }
@@ -5257,7 +5377,10 @@ u64 LC32InvokeGuestSelector(id self, SEL _cmd, u64 arg2, u64 arg3,
     return host_result;
 }
 
-static void LC32InvokeGuestNotificationSelector(
+/* Host notification centers deliver through the process-lifetime alias block
+ * in LC32NotificationCallbackSelector, so a raise in the host half of this
+ * helper propagates into whatever native code is posting; shield it. */
+static void LC32InvokeGuestNotificationSelectorInner(
         id observer, SEL selector, NSNotification *notification) {
     LC32TraceGuestMethodCallback(observer, selector);
     if(Dynarmic_guest_thread_is_registered()) {
@@ -5284,6 +5407,17 @@ static void LC32InvokeGuestNotificationSelector(
         fprintf(stderr, "LC32: cannot relay notification callback %s\n",
             sel_getName(selector));
     }
+}
+
+static void LC32InvokeGuestNotificationSelector(
+        id observer, SEL selector, NSNotification *notification) {
+    LC32ShieldHostDispatch(
+        "host notification observer delivery",
+        [&] {
+            LC32InvokeGuestNotificationSelectorInner(
+                observer, selector, notification);
+            return 0;
+        });
 }
 
 static SEL LC32NotificationCallbackSelector(id observer, SEL selector) {
@@ -6452,7 +6586,10 @@ static void LC32ScheduleGuestAutoreleaseNow(
 #endif
 }
 
-extern "C" u32 LC32ScheduleGuestAutorelease(
+/* Guest autoreleases schedule a real Objective-C token through this SVC 1002
+ * entry point on every crossing, including coordinated custom
+ * retain/release; shield it like the selector dispatch. */
+static u32 LC32ScheduleGuestAutoreleaseInner(
         u32 hostLow, u32 hostHigh, u32 guestStackPointer) {
     const u64 hostAddress = hostLow | ((u64)hostHigh << 32);
 #ifdef LC32_TRACE_AUTORELEASE
@@ -6491,6 +6628,16 @@ extern "C" u32 LC32ScheduleGuestAutorelease(
         guestObject);
 #endif
     return 0;
+}
+
+extern "C" u32 LC32ScheduleGuestAutorelease(
+        u32 hostLow, u32 hostHigh, u32 guestStackPointer) {
+    return LC32ShieldHostDispatch(
+        "guest autorelease scheduling (SVC 1002)",
+        [&] {
+            return LC32ScheduleGuestAutoreleaseInner(
+                hostLow, hostHigh, guestStackPointer);
+        });
 }
 
 static void LC32PinGuestObjectToHost(id hostObject, u32 guestObject,
@@ -6995,8 +7142,16 @@ BOOL host_hook_getClass(const char *name, Class *outClass) {
     }
 
     LC32_DEBUG_PRINTF("host_hook_getClass: %s\n", name);
-    *outClass = guest_objc_getClass_retHostClass(name);
-    return *outClass != nil;
+    /* Synthesizing the native mirror of a guest class performs substantial
+     * host Objective-C work on whatever thread asked the host runtime for
+     * the class, including framework +initialize methods the first send
+     * triggers; shield the resolution like any other host dispatch. */
+    return LC32ShieldHostDispatch(
+        "host class-ref resolution (objc_getClass hook)",
+        [&] {
+            *outClass = guest_objc_getClass_retHostClass(name);
+            return *outClass != nil;
+        });
 }
 
 static Class LC32NativeNSProxyClass;

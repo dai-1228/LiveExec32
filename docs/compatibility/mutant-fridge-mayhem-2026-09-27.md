@@ -17,7 +17,7 @@ pending, and every statement below about runtime behavior —
 launch, geometry, presentation, audio, video, Crittercism, GCD pacing — is
 a prediction from analysis, not an observation.
 
-CI on the branch tip (`2ea03cf`): the host unit tests are green
+CI on the branch (through `2ef53a0`): the host unit tests are green
 ([Zenonia compat host tests, run 36346450250](https://github.com/dai-1228/LiveExec32/actions/runs/36346450250),
 38 s), covering the new classifier truth table, the tall-art canvas
 selection, the strict-additivity guarantee, and the extended
@@ -397,3 +397,101 @@ to make the controller-backed fit path CI-checkable; (3) canvas-mode
 wiring for the universal population only if a clamped runtime becomes a
 real target; (4) the usual `check-symbols`/framework audits on the macOS
 side, which are already part of the nightly build.
+
+## Device feedback iteration 2 — the post-intro crash and the completion wave
+
+The first device build (the CMTime bridge at `7c4e4c6`) fixed the
+intro-video gate: the video now presents and plays. The next device run
+then crashed shortly after the intro ended, with **no** crash log —
+the emulator's crash machinery only reports guest CPU faults, so the
+silence itself identified the failure class: a host-side exception
+raised during a bridged call, escaping through the unwinder with no
+handler anywhere. A five-participant analysis wave located and closed
+the concrete causes:
+
+1. **The post-intro crash root cause: legacy Game Center authentication.**
+   Two seconds after the menu appears (every launch), the game's menu
+   scene dispatches `initGameCenter`, which reaches
+   `-[GKLocalPlayer authenticateWithCompletionHandler:]`. The guest
+   shim forwarded that selector to the host by name — but modern
+   GameKit no longer implements the iOS-5-era method, and the resulting
+   unrecognized-selector exception was exactly the silent
+   host-exception death. The legacy block wrapper now completes the
+   authentication block **guest-locally** with
+   `GKErrorDomain`/`GKErrorNotAuthenticated`, matching the documented
+   unavailable-authentication contract of the local-player adapter, so
+   the game takes its designed "Leaderboards Unavailable" path
+   (`GameKit+LC32LegacyBlocks.m`; the other legacy block selectors
+   were each verified as still-implemented on the host and keep
+   forwarding).
+2. **Legacy modal presentation vocabulary restored on the host** at the
+   video-completion path: `presentModalViewController:animated:` and
+   `dismissModalViewControllerAnimated:` now exist as host
+   `UIViewController` category methods with the documented iOS 5
+   semantics (forward to the modern API; dismiss is a no-op without a
+   live presentation), so the guest stubs' host lookups resolve to
+   tolerant implementations instead of whatever the current host
+   carries (`UIViewController+LC32LegacyModalPresentation.mm`).
+3. **Guest view controllers without `loadView`** could raise "Could not
+   load NIB" from the host's lazy loader, which searched the container's
+   bundles for a class-name nib. A host `loadView` guard, gated on the
+   bridge's guest-class mark, now resolves guest-backed controllers'
+   nibs against the identity-mounted guest bundle and falls back to an
+   empty programmatic view — the privacy/TOS web pages degrade to a
+   dead page instead of crashing the presentation
+   (`UIViewController+LC32GuestNibLoading.mm`).
+4. **AVFoundation never ran natively before this wave**: the guest
+   framework never loaded its host counterpart, and its
+   media-characteristic constants carried symbol spellings rather than
+   the host's own constant objects — the video's
+   `tracksWithMediaCharacteristic:` + unchecked `objectAtIndex:0`
+   pair depends on both. The framework constructor now loads host
+   AVFoundation and binds the constants to the native objects
+   (`AVFoundation.m`), which also un-breaks AVAudioPlayer music.
+   AudioToolbox now zeroes the reserved `AudioStreamBasicDescription`
+   field at the `ExtAudioFileSetProperty` client-format and
+   `AudioFileCreateWithURL` boundaries, where the game's stack-built
+   descriptors carry garbage that modern hosts reject
+   (`AudioToolbox.mm`).
+5. **The fixed-canvas fit learned about modal presentations**: while a
+   host presentation container is mounted over the controller-backed
+   window (the fullscreen intro video, a web view, a store sheet), the
+   fit suspends — the canvas-calibrated transform would scale the
+   window-sized container past the screen and crop it — and restores
+   the converged transform when the overlay leaves, yielding to any
+   foreign sublayer-transform takeover. Growth of a controller-backed
+   window also waits for the rotation unit's turn (which sizes the
+   root view explicitly), and the drawable record's first arrival
+   re-arms the fit (`UIKit.mm`, `LegacyRotation.mm`).
+6. **Silent host deaths are eliminated as a class**: the bridge's
+   guest-to-host dispatch shield now covers the selector dispatch plus
+   seven more host entry points (identity mapping, weak try-retain,
+   string ranges, framework loading, host object resolution, the
+   class-hook synthesis, notification aliases), converting any host
+   exception during a bridged call into the reported crash channel
+   with the throw-site stack; a final-net uncaught-exception handler
+   covers raises outside the bridge (dispatch blocks) and writes the
+   report to stderr plus the process abort reason; async-signal-safe
+   SIGSEGV/SIGBUS/SIGABRT handlers record native backtraces for
+   host-code faults (`bridge.mm`, new `host_crash_net` unit). Any
+   future failure produces evidence.
+
+The same wave also produced a working **non-macOS build**: the guest
+side now compiles and links fully on Linux with Theos's bundled
+toolchain (classic ARM32 `ld` via `LC32_GUEST_LINKER`, explicit
+`-target` triples, `flock` locking), and CI publishes the generated
+shim sources as an artifact because the generator itself requires the
+macOS runtime. The host side cross-configures on Linux through the
+same toolchain selection block, gated so macOS toolchain behavior stays
+byte-identical (`build-libiconv.sh`, `HostFrameworks/LC32/Makefile`).
+
+Expected device behavior after this wave: launch → upright
+letterboxed title → intro video (fullscreen, native presentation) →
+menu at 2x with the 4-inch layout branch, Game Center reporting its
+designed "unavailable" alert instead of crashing, music and effects
+playing, touches landing on the centered canvas. If anything still
+fails, the process now either shows the guest crash report (guest
+faults), the host-bridge report (bridged-call exceptions), or writes
+the report to stderr and the OS abort reason (everything else) —
+export whichever appears and the next iteration starts from evidence.
+

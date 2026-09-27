@@ -2229,10 +2229,13 @@ size_t VertexAttribElementCount(GLenum pname) {
          * its plist policy knowable from process start, so only a view
          * that arrived larger than its own canvas is re-fitted; either
          * way the adapter records the drawable layer for the measured
-         * fit. The adapter re-fits the drawable view to the canonical
-         * canvas first, so the allocated storage matches the engine's
-         * fixed projection. Cheap for every other process: the class
-         * checks inside leave after two static loads. */
+         * fit, and the record's first arrival re-arms that fit (before
+         * it exists, a controller-backed window has no measurable content
+         * and its fit passes stop without rescheduling). The adapter
+         * re-fits the drawable view to the canonical canvas first, so
+         * the allocated storage matches the engine's fixed projection.
+         * Cheap for every other process: the class checks inside leave
+         * after two static loads. */
         LC32UIKitAdoptNativeLegacyCanvasDrawable(drawableLayer);
         NSDictionary *properties = drawableLayer.drawableProperties;
         NSMutableDictionary *normalized =
