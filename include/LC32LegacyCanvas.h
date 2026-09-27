@@ -329,6 +329,34 @@ static inline BOOL LC32UsesRuntimeLandscapePhoneCanvas(
            requestedInterfaceOrientation == 4;
 }
 
+/* A pre-iOS-8 universal bundle that declares a landscape-only phone policy
+ * is a fixed legacy phone-screen application while it executes in the phone
+ * idiom: the iPhoneOS 4.x/5.x/6.x contract such applications were built
+ * for, with the canvas 568 points tall when the bundle ships 4-inch launch
+ * art and 480 points otherwise.  Both device families are required so the
+ * class is strictly additive: phone-only bundles keep the existing
+ * landscape phone-canvas classes above, and pad-only or
+ * exclusively-iPad-art bundles keep the iPad canvas classes.  The
+ * stable-side requirement of those classes is deliberately absent: this
+ * era of universal application commonly declares both landscape sides and
+ * lets the first launch settle the side, so only the landscape-only
+ * policy is required.  Executing in the phone idiom is a runtime property,
+ * not a bundle property, so the caller supplies it exactly like the
+ * runtime-declared classifier takes its caller-supplied inputs;
+ * iPad-idiom execution answers NO and keeps the normal universal path
+ * with the larger canvas it legitimately expects.  sdkVersion is the
+ * executable's own SDK, never a spoofed or effective value. */
+static inline BOOL LC32BundleUsesDeclaredLandscapePhoneCanvasInPhoneIdiom(
+        NSBundle *bundle, uint32_t sdkVersion, BOOL executingInPhoneIdiom) {
+    if(sdkVersion >= 0x00080000) return NO;
+    if(!executingInPhoneIdiom) return NO;
+    const LC32SupportedDeviceFamilies families =
+        LC32BundleSupportedDeviceFamilies(bundle);
+    if(!families.supportsPhone || !families.supportsPad) return NO;
+    return LC32BundleUsesLandscapeOnlyPhonePolicy(bundle) &&
+        LC32BundleContainsPhoneLaunchArt(bundle, [bundle infoDictionary]);
+}
+
 /* Compose the presentation transform of a canonical phone canvas inside a
  * viewport rect that is already expressed in the canvas' own coordinate
  * space (the window-content space that hosts the canvas at its origin).

@@ -244,6 +244,57 @@ static BOOL LC32RequiresNativeLegacyPhoneCanvas(void) {
         LC32InvokeHostCRet32(LC32HostNativeFixedPhoneCanvas) != 0;
 }
 
+static pthread_once_t LC32NativeDeclaredPhoneCanvasOnce = PTHREAD_ONCE_INIT;
+static uint64_t LC32HostNativeDeclaredPhoneCanvas;
+static pthread_once_t LC32NativeDeclaredPhoneCanvasArtOnce = PTHREAD_ONCE_INIT;
+static CGFloat LC32NativeDeclaredPhoneCanvasHeight;
+static BOOL LC32NativeDeclaredPhoneCanvasStatusBarHidden;
+
+static void LC32ResolveNativeDeclaredPhoneCanvas(void) {
+    /* The declared-universal canvas class is decided on the host from the
+     * bundle's plist policy plus the live device idiom; an older host
+     * without the classifier keeps the modern geometry. Only the host
+     * entry point resolves here: the guest controller category consults
+     * this at +load, and that path must not grow new kinds of early work. */
+    LC32HostNativeDeclaredPhoneCanvas = LC32Dlsym(
+        "LC32UIKitUsesNativeDeclaredLandscapePhoneCanvas", YES);
+}
+
+static void LC32ResolveNativeDeclaredPhoneCanvasArt(void) {
+    /* The class's canvas height and status-bar preference follow its own
+     * launch art and plist, read once beside the host entry point exactly
+     * like the canvas-mode snapshot. Resolved lazily with the first UIScreen
+     * canvas read rather than at +load. */
+    NSBundle *bundle = NSBundle.mainBundle;
+    LC32NativeDeclaredPhoneCanvasHeight =
+        LC32BundleContainsTallPhoneLaunchArt(bundle, bundle.infoDictionary)
+            ? 568.0f : 480.0f;
+    LC32NativeDeclaredPhoneCanvasStatusBarHidden = [[NSBundle.mainBundle
+        objectForInfoDictionaryKey:@"UIStatusBarHidden"] boolValue];
+}
+
+static CGFloat LC32NativeDeclaredCanvasHeight(void) {
+    pthread_once(&LC32NativeDeclaredPhoneCanvasArtOnce,
+        LC32ResolveNativeDeclaredPhoneCanvasArt);
+    return LC32NativeDeclaredPhoneCanvasHeight;
+}
+
+static BOOL LC32NativeDeclaredCanvasStatusBarHidden(void) {
+    pthread_once(&LC32NativeDeclaredPhoneCanvasArtOnce,
+        LC32ResolveNativeDeclaredPhoneCanvasArt);
+    return LC32NativeDeclaredPhoneCanvasStatusBarHidden;
+}
+
+static BOOL LC32RequiresNativeDeclaredLandscapePhoneCanvas(void) {
+    pthread_once(&LC32NativeDeclaredPhoneCanvasOnce,
+        LC32ResolveNativeDeclaredPhoneCanvas);
+    /* The bundle terms and the device idiom are both fixed for the process
+     * lifetime, but keep the live query shape of the runtime-class answer
+     * above: the host owns the single classification decision. */
+    return LC32HostNativeDeclaredPhoneCanvas &&
+        LC32InvokeHostCRet32(LC32HostNativeDeclaredPhoneCanvas) != 0;
+}
+
 static BOOL LC32RequiresLegacyIPadCanvas(void) {
     pthread_once(&LC32LegacyCanvasOnce, LC32ResolveLegacyCanvas);
     return LC32LegacyIPadCanvasRequired;
@@ -289,10 +340,14 @@ static void LC32ResolveLegacyScreenCoordinates(void) {
      * hosts keep serving their own adapted geometry to their SDK-1..7
      * executables; a binary without an SDK version marker inherits the same
      * portrait-ordered contract whenever the effective process SDK is
-     * pre-iOS-8, because such binaries were never built for anything else. */
+     * pre-iOS-8, because such binaries were never built for anything else.
+     * A pre-iOS-8 universal executable declaring a landscape-only phone
+     * policy inherits the same contract while it executes in the phone
+     * idiom (the host answers for that class live). */
     LC32UsesLegacyScreenCoordinates = LC32GuestSDKUsesLegacyGeometryContract(
         sdkVersion, LC32GuestUIKitLegacyCompatibilityEnabled(),
-        LC32GuestNativeLegacyRotationEnabled());
+        LC32GuestNativeLegacyRotationEnabled(),
+        LC32RequiresNativeDeclaredLandscapePhoneCanvas());
 }
 
 static BOOL LC32GuestUsesLegacyScreenCoordinates(void) {
@@ -782,6 +837,14 @@ compatibleWithTraitCollection:nil];
          * the live viewport, so the engine's internal geometry contract
          * stays exactly what it was authored against. */
         bounds = CGRectMake(0, 0, 320, 480);
+    } else if(LC32RequiresNativeDeclaredLandscapePhoneCanvas()) {
+        /* The declared-universal class: the same fixed phone screen for a
+         * pre-iOS-8 universal application declaring a landscape-only phone
+         * policy, 568 points tall when its bundle ships 4-inch launch art
+         * (the fixed screen iOS extended for tall devices). The host
+         * presents this canvas through the same rotated, measured fit, so
+         * an engine-controller window keeps its authored contract. */
+        bounds = CGRectMake(0, 0, 320, LC32NativeDeclaredCanvasHeight());
     }
     return bounds;
 }
@@ -804,6 +867,13 @@ compatibleWithTraitCollection:nil];
         frame = LC32LegacyNativePhoneCanvasStatusBarHidden
             ? CGRectMake(0, 0, 320, 480)
             : CGRectMake(0, 20, 320, 460);
+    } else if(LC32RequiresNativeDeclaredLandscapePhoneCanvas()) {
+        /* Status-bar-consistent variant of the declared-universal canvas,
+         * paired with the same fixed bounds above. */
+        const CGFloat canvasHeight = LC32NativeDeclaredCanvasHeight();
+        frame = LC32NativeDeclaredCanvasStatusBarHidden()
+            ? CGRectMake(0, 0, 320, canvasHeight)
+            : CGRectMake(0, 20, 320, canvasHeight - 20);
     }
     return frame;
 }
@@ -820,7 +890,8 @@ compatibleWithTraitCollection:nil];
     CGFloat scale = (CGFloat)LC32HostFloatingResult(LC32InvokeHostSelector(
         self.host_self, selector, (uint64_t)0));
     if(scale > 2.0f && (LC32RequiresFixedLandscapePhoneCanvas() ||
-                        LC32RequiresNativeLegacyPhoneCanvas())) {
+                        LC32RequiresNativeLegacyPhoneCanvas() ||
+                        LC32RequiresNativeDeclaredLandscapePhoneCanvas())) {
         scale = 2.0f;
     }
     return scale;

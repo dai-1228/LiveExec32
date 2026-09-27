@@ -125,6 +125,31 @@ key-declaring bundles, and iPad-idiom apps never enter the class. The
 keyless-plist
 status-bar contract has its own opt-in simulator regression:
 `sh test/uikit_legacy_rootless_rotation.sh --device UDID --keyless`.
+A pre-iOS-8 universal executable that declares a landscape-only phone
+policy through its Info.plist is the same fixed phone-screen application
+while it executes in the phone idiom: the iPhoneOS 4.x/5.x/6.x contract such
+applications were built for, with the canvas 568 points tall when the
+bundle ships 4-inch launch art and 480 points otherwise. It receives the
+portrait-ordered geometry contract above, the status-bar-consistent
+`applicationFrame`, the same scale clamp, and the same drawable adoption and
+measured iterative fit — including through a window with its own root view
+controller, the engine-controller shape of that era: controller-backed
+windows qualify for the fit, the window growth freezes the root
+controller's view beside the direct guest subviews so the canvas keeps its
+authored geometry, and the fit measures the rendered content through the
+layer backing the adopted drawable (falling back to the direct-subview union
+when a window has no adopted drawable). The drawable stays equal to the
+view's own bounds: a view authored at or below canvas size is left
+untouched, and only a launch-sized view that arrived larger than the canvas
+is re-fitted to it. iPad-idiom execution keeps the normal universal path —
+the larger canvas such applications expect there belongs to the rotation
+unit — SDK-8+ executables never enter the class, and phone-only bundles
+keep their existing classes, so the class is strictly additive; the
+classifier is the shared `LC32BundleUsesDeclaredLandscapePhoneCanvasInPhoneIdiom`
+inline. The canvas-mode adapters (effective SDK iOS 8 or later) do not
+classify this population yet: such executions keep the rotation pipeline
+with portrait-ordered, scene-sized geometry, and extending the canvas-mode
+container to them is left for a device-verified follow-up.
 Pre-iOS-11 processes also repair nonfinite preferred-font results from
 CoreText's legacy text-style tables (including Vietnamese line metrics).
 Valid fonts are unchanged. Broken results use their resolved native face

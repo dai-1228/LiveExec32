@@ -2225,10 +2225,14 @@ size_t VertexAttribElementCount(GLenum pname) {
          * runtime-declared landscape phone-canvas class can reach this
          * allocation with scene-sized launch bounds, because its first
          * UIScreen read precedes the status-bar request that defines the
-         * class. The adapter re-fits the drawable view to the canonical
-         * canvas first, so the allocated storage matches the engine's fixed
-         * projection. Cheap for every other process: the class check inside
-         * leaves after two static loads. */
+         * class. The declared-universal class reaches the same hook with
+         * its plist policy knowable from process start, so only a view
+         * that arrived larger than its own canvas is re-fitted; either
+         * way the adapter records the drawable layer for the measured
+         * fit. The adapter re-fits the drawable view to the canonical
+         * canvas first, so the allocated storage matches the engine's
+         * fixed projection. Cheap for every other process: the class
+         * checks inside leave after two static loads. */
         LC32UIKitAdoptNativeLegacyCanvasDrawable(drawableLayer);
         NSDictionary *properties = drawableLayer.drawableProperties;
         NSMutableDictionary *normalized =

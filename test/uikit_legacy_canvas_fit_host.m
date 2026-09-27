@@ -2,7 +2,11 @@
 // canvas presentation math from the real include/LC32LegacyCanvas.h (the
 // canvas model's single source of truth). Everything here is deterministic
 // pure math, so no UIKit is needed; the host adapter and the guest UIScreen
-// overrides both consume these inlines.
+// overrides both consume these inlines. The bundle-level classifiers read
+// real Info.plists through small on-disk fixtures under the temporary
+// directory. Window eligibility and the measured fit's drawable-layer
+// selection live in the host UIKit adapter (real UIKit windows and layers),
+// so they are device/CI coverage, not this pure fixture.
 #import <Foundation/Foundation.h>
 
 #include "LC32LegacyCanvas.h"
@@ -28,6 +32,36 @@ static BOOL closeTransform(
     return closeScalar(value.a, a) && closeScalar(value.b, b) &&
         closeScalar(value.c, c) && closeScalar(value.d, d) &&
         closeScalar(value.tx, tx) && closeScalar(value.ty, ty);
+}
+
+/* Minimal on-disk bundle fixtures: the header's bundle-level helpers read
+ * real Info.plists and probe real resource paths, so their truth tables
+ * need actual bundles. Each lives under a unique temporary directory and
+ * is removed after its checks. */
+static NSBundle *LC32TestBundleWithInfo(
+        NSDictionary *info, NSArray<NSString *> *launchImages) {
+    NSString *directory = [NSTemporaryDirectory()
+        stringByAppendingPathComponent:[@"lc32-canvas-fit-"
+            stringByAppendingString:
+                NSProcessInfo.processInfo.globallyUniqueString]];
+    [[NSFileManager defaultManager] createDirectoryAtPath:directory
+                            withIntermediateDirectories:YES
+                                             attributes:nil
+                                                  error:nil];
+    [info writeToFile:[directory
+        stringByAppendingPathComponent:@"Info.plist"] atomically:YES];
+    for(NSString *name in launchImages) {
+        [@"" writeToFile:[directory stringByAppendingPathComponent:name]
+              atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+    return [NSBundle bundleWithPath:directory];
+}
+
+static void LC32TestDiscardBundle(NSBundle *bundle) {
+    if(bundle) {
+        [[NSFileManager defaultManager] removeItemAtPath:bundle.bundlePath
+                                                  error:nil];
+    }
 }
 
 int main(void) {
@@ -69,6 +103,129 @@ int main(void) {
         check(!LC32UsesRuntimeLandscapePhoneCanvas(
                   0x000B0000, YES, NO, NO, 3),
               "sdk11-executable-does-not-qualify");
+
+        /* The declared-universal class: a pre-iOS-8 bundle supporting both
+         * device families that declares a landscape-only phone policy,
+         * executing in the phone idiom. Truth table over real bundles,
+         * including the strictly-additive guarantee against the existing
+         * classes. */
+        NSDictionary *universalLandscape = @{
+            @"UIDeviceFamily": @[@1, @2],
+            @"UISupportedInterfaceOrientations": @[
+                @"UIInterfaceOrientationLandscapeLeft",
+                @"UIInterfaceOrientationLandscapeRight",
+            ],
+        };
+        NSBundle *bundle = LC32TestBundleWithInfo(universalLandscape,
+            @[@"Default.png", @"Default@2x.png"]);
+        check(LC32BundleUsesDeclaredLandscapePhoneCanvasInPhoneIdiom(
+                  bundle, 0x00070000, YES),
+              "universal-landscape-pre8-phone-idiom-qualifies");
+        check(LC32BundleUsesDeclaredLandscapePhoneCanvasInPhoneIdiom(
+                  bundle, 0, YES),
+              "sdk0-marker-universal-landscape-still-qualifies");
+        check(!LC32BundleUsesDeclaredLandscapePhoneCanvasInPhoneIdiom(
+                  bundle, 0x00070000, NO),
+              "pad-idiom-execution-does-not-qualify");
+        check(!LC32BundleUsesDeclaredLandscapePhoneCanvasInPhoneIdiom(
+                  bundle, 0x00080000, YES),
+              "sdk8-executable-does-not-qualify-in-declared-class");
+        check(LC32BundleLegacyIPadCanvasKind(bundle, 0x00070000) ==
+                  LC32LegacyIPadCanvasNone,
+              "universal-bundle-stays-out-of-ipad-canvas-classes");
+        /* Canvas size selection: no tall launch art means the fixed canvas
+         * stays 480 points tall. */
+        check(!LC32BundleContainsTallPhoneLaunchArt(
+                  bundle, bundle.infoDictionary),
+              "no-tall-art-selects-480-point-canvas");
+        LC32TestDiscardBundle(bundle);
+
+        bundle = LC32TestBundleWithInfo(universalLandscape,
+            @[@"Default.png", @"Default@2x.png",
+              @"Default-568h@2x.png"]);
+        check(LC32BundleUsesDeclaredLandscapePhoneCanvasInPhoneIdiom(
+                  bundle, 0x00070000, YES),
+              "tall-art-universal-landscape-still-qualifies");
+        /* Canvas size selection: 4-inch launch art extends the fixed canvas
+         * to 568 points, exactly the historical 4-inch device screen. */
+        check(LC32BundleContainsTallPhoneLaunchArt(
+                  bundle, bundle.infoDictionary),
+              "tall-art-selects-568-point-canvas");
+        LC32TestDiscardBundle(bundle);
+
+        bundle = LC32TestBundleWithInfo(@{
+            @"UIDeviceFamily": @[@1, @2],
+            @"UISupportedInterfaceOrientations":
+                @[@"UIInterfaceOrientationPortrait"],
+        }, @[@"Default.png"]);
+        check(!LC32BundleUsesDeclaredLandscapePhoneCanvasInPhoneIdiom(
+                  bundle, 0x00070000, YES),
+              "portrait-declaring-bundle-does-not-qualify");
+        LC32TestDiscardBundle(bundle);
+
+        bundle = LC32TestBundleWithInfo(universalLandscape, @[]);
+        check(!LC32BundleUsesDeclaredLandscapePhoneCanvasInPhoneIdiom(
+                  bundle, 0x00070000, YES),
+              "missing-phone-launch-art-does-not-qualify");
+        LC32TestDiscardBundle(bundle);
+
+        bundle = LC32TestBundleWithInfo(@{
+            @"UIDeviceFamily": @[@1, @2],
+        }, @[@"Default.png"]);
+        check(!LC32BundleUsesDeclaredLandscapePhoneCanvasInPhoneIdiom(
+                  bundle, 0x00070000, YES),
+              "keyless-universal-bundle-does-not-qualify");
+        LC32TestDiscardBundle(bundle);
+
+        bundle = LC32TestBundleWithInfo(@{
+            @"UIDeviceFamily": @[@1, @2],
+            @"UIInterfaceOrientation":
+                @"UIInterfaceOrientationLandscapeRight",
+        }, @[@"Default.png"]);
+        check(LC32BundleUsesDeclaredLandscapePhoneCanvasInPhoneIdiom(
+                  bundle, 0x00070000, YES),
+              "initial-orientation-key-declares-landscape-policy");
+        LC32TestDiscardBundle(bundle);
+
+        /* Strictly additive: phone-only bundles never enter the new class,
+         * and the populations of the existing classes are unchanged. */
+        bundle = LC32TestBundleWithInfo(@{
+            @"UIDeviceFamily": @[@1],
+            @"UISupportedInterfaceOrientations":
+                @[@"UIInterfaceOrientationLandscapeRight"],
+        }, @[@"Default.png"]);
+        check(!LC32BundleUsesDeclaredLandscapePhoneCanvasInPhoneIdiom(
+                  bundle, 0x00070000, YES),
+              "phone-only-bundle-stays-out-of-declared-class");
+        check(LC32BundleUsesFixedLandscapePhoneCanvas(bundle, 0x00070000),
+              "phone-only-bundle-keeps-plist-canvas-class");
+        LC32TestDiscardBundle(bundle);
+
+        bundle = LC32TestBundleWithInfo(@{
+            @"UIDeviceFamily": @[@1],
+            @"UISupportedInterfaceOrientations": @[
+                @"UIInterfaceOrientationLandscapeLeft",
+                @"UIInterfaceOrientationLandscapeRight",
+            ],
+        }, @[@"Default.png"]);
+        check(!LC32BundleUsesDeclaredLandscapePhoneCanvasInPhoneIdiom(
+                  bundle, 0x00070000, YES),
+              "both-sides-phone-only-stays-out-of-declared-class");
+        check(!LC32BundleUsesFixedLandscapePhoneCanvas(bundle, 0x00070000),
+              "both-sides-phone-only-stays-unclassified");
+        LC32TestDiscardBundle(bundle);
+
+        bundle = LC32TestBundleWithInfo(@{
+            @"UIDeviceFamily": @[@2],
+            @"UISupportedInterfaceOrientations~ipad": @[
+                @"UIInterfaceOrientationLandscapeLeft",
+                @"UIInterfaceOrientationLandscapeRight",
+            ],
+        }, @[@"Default-Portrait~ipad.png"]);
+        check(!LC32BundleUsesDeclaredLandscapePhoneCanvasInPhoneIdiom(
+                  bundle, 0x00070000, YES),
+              "pad-only-bundle-does-not-qualify");
+        LC32TestDiscardBundle(bundle);
 
         /* Fit math: a canonical portrait 320x480 canvas fitted into the
          * live viewport expressed in the canvas' own coordinate space. For
