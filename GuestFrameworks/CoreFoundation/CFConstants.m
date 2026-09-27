@@ -264,17 +264,6 @@ const CFStringRef kCFStreamPropertyAppendToFile = CFSTR("kCFStreamPropertyAppend
 const CFStringRef kCFStreamPropertyFileCurrentOffset = CFSTR("kCFStreamPropertyFileCurrentOffset");
 const CFStringRef kCFStreamPropertySocketRemoteHostName = CFSTR("kCFStreamPropertySocketRemoteHostName");
 const CFStringRef kCFStreamPropertySocketRemotePortNumber = CFSTR("kCFStreamPropertySocketRemotePortNumber");
-const CFStringRef kCFStreamPropertySOCKSProxy = CFSTR("kCFStreamPropertySOCKSProxy");
-const CFStringRef kCFStreamPropertySOCKSProxyHost = CFSTR("kCFStreamPropertySOCKSProxyHost");
-const CFStringRef kCFStreamPropertySOCKSProxyPort = CFSTR("kCFStreamPropertySOCKSProxyPort");
-const CFStringRef kCFStreamPropertySOCKSVersion = CFSTR("kCFStreamPropertySOCKSVersion");
-const CFStringRef kCFStreamSocketSOCKSVersion4 = CFSTR("kCFStreamSocketSOCKSVersion4");
-const CFStringRef kCFStreamSocketSOCKSVersion5 = CFSTR("kCFStreamSocketSOCKSVersion5");
-const CFStringRef kCFStreamPropertySOCKSUser = CFSTR("kCFStreamPropertySOCKSUser");
-const CFStringRef kCFStreamPropertySOCKSPassword = CFSTR("kCFStreamPropertySOCKSPassword");
-const CFStringRef kCFStreamPropertySocketSecurityLevel = CFSTR("kCFStreamPropertySocketSecurityLevel");
-const CFStringRef kCFStreamSocketSecurityLevelNone = CFSTR("kCFStreamSocketSecurityLevelNone");
-const CFStringRef kCFStreamSocketSecurityLevelSSLv2 = CFSTR("kCFStreamSocketSecurityLevelSSLv2");
 
 /* Private keys consumed by the iOS 10 Security/IOKit dependency closure. */
 const CFStringRef _kCFBundlePackageTypeKey = CFSTR("CFBundlePackageType");
