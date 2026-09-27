@@ -365,3 +365,32 @@ case) are in the branch tip via the coordinating session's commits
 (`0ab6a65`, `3b746a3`). Everything above lives on `zenonia-compat` in the
 fork; nothing was merged or pushed elsewhere, and the wave-1/wave-2
 reports under `/tmp/opencode/` were not modified.
+
+## Addendum — device feedback iteration: canvas presentation (27 September 2026)
+
+The first device run launched and played correctly upright with working
+touch axes, but the canvas rendered in the screen corner instead of
+filling it. A presentation fix (fixed-canvas sizing, drawable adoption,
+uniform-scale fit) was added, then a follow-up device run still showed a
+corner-anchored canvas. The follow-up correction is committed with the
+message "Present the native legacy canvas measured to the live viewport":
+
+- The game's window is nib-authored at exactly 320×480 and never resized
+  by guest code; the window therefore did not cover the presentation, and
+  the fit's canvas-inside-window-bounds gate rejected every pass (the
+  transform was never applied). The host frame now grows the window to
+  the live viewport first — host-only mutation; the class never reads the
+  window back — with direct-subview autoresizing frozen during the fit
+  and restored afterward.
+- The original fit assumed an axis-aligned 320×480 canvas rect in the
+  window layer's space, but the native backing rotation lives inside that
+  subtree, so the sublayer transform composes outside the rotation. The
+  fit now measures the canvas rect by converting each direct guest
+  subview layer into the window layer's space (CoreAnimation applies the
+  active rotation) and centers/uniformly scales the measured rect onto
+  the viewport, per pass, self-correcting on every rotation or viewport
+  event.
+
+Status: correction committed and CI-verified; awaiting the next device
+retest. Full analysis: `/tmp/opencode/wave5-canvas-centering-fix.md`
+(session-local).
