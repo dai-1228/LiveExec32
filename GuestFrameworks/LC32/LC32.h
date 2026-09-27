@@ -5,6 +5,7 @@
 #include <LC32BlockBridgeABI.h>
 #include <LC32FoundationBridgeABI.h>
 #include <LC32ObjCBridgeABI.h>
+#include <LC32ObjCTrace.h>
 
 #define CRSetCrashLogMessage(msg) __assert_rtn(NULL, __FILE__, __LINE__, msg)
 #define HALT __builtin_trap()
@@ -27,6 +28,17 @@
 - (void)setHost_self:(uint64_t)ptr;
 @end
 
+/* ARM32 layout consumed by the native lazy constant-string bridge. */
+typedef struct LC32ConstantStringProxy {
+    void *isa;
+    uint32_t flags;
+    const char *bytes;
+    uint32_t length;
+} LC32ConstantStringProxy;
+
+_Static_assert(sizeof(LC32ConstantStringProxy) == 16,
+    "LC32 constant-string proxies require the ARM32 ABI");
+
 /*
  * Base class for guest-only associated storage. LC32 installs the original
  * NSObject ownership methods directly on this class before globally
@@ -41,10 +53,24 @@
 
 uint64_t LC32Dlsym(const char *name, BOOL isFunction);
 
+/*
+ * Guest framework shims are mapped by the emulated dyld, so loading one does
+ * not automatically load its arm64 counterpart into the native process.
+ * Make that dependency explicit before resolving native classes or exported
+ * object constants. The native image is cached and intentionally remains
+ * loaded for the process lifetime.
+ */
+BOOL LC32LoadHostFramework(const char *frameworkName);
+
+/* Bind a guest proxy constant only when its native data export was found. */
+BOOL LC32BindHostObjectConstant(id guestConstant, const char *symbolName);
+
 // Generated Objective-C call tracing is intentionally opt-in; high-frequency
 // selectors such as view/render loops otherwise overwhelm stderr and can
-// materially perturb guest scheduling. Enable it with LC32_OBJC_TRACE=1.
-BOOL LC32ObjCTraceEnabled(void);
+// materially perturb guest scheduling. Build guest frameworks with
+// LC32_OBJC_TRACE=1 to enable it. Calls expand to a compile-time constant;
+// retain the exported function for previously built guest frameworks.
+BOOL (LC32ObjCTraceEnabled)(void);
 
 uint32_t LC32InvokeHostCRet32(uint64_t hostPtr, ...);
 

@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include "LC32DebugLog.h"
 #include <unistd.h>
 #include <stdlib.h>
 #include <fcntl.h>
@@ -41,6 +42,10 @@ extern "C" void LC32ConfigureLegacyAppTransportSecurity(
     uint32_t guestSDKVersion);
 
 static uint32_t guestExecutableSDKVersion;
+
+extern "C" uint32_t LC32GetGuestExecutableSDKVersion(void) {
+    return guestExecutableSDKVersion;
+}
 
 static void InstallGuestTracepointsFromEnvironment() {
     const char *value = getenv("LC32_GUEST_TRACEPOINTS");
@@ -486,7 +491,7 @@ u32 Dynarmic_map_file(bool isDyld, u32 target, const char *path) {
      */
     if(header->filetype == MH_EXECUTE && !(header->flags & MH_PIE)) {
         target = 0;
-        printf("LC32: mapping non-PIE executable at preferred addresses\n");
+        LC32_DEBUG_PRINTF("LC32: mapping non-PIE executable at preferred addresses\n");
     }
     
     uintptr_t cur = (uintptr_t)header + sizeof(mach_header);
@@ -530,7 +535,7 @@ u32 Dynarmic_map_file(bool isDyld, u32 target, const char *path) {
             }
             if(segment.vmsize > segment.filesize) {
                 // round up the page
-                printf("vmsize 0x%x != filesize 0x%x\n",
+                LC32_DEBUG_PRINTF("vmsize 0x%x != filesize 0x%x\n",
                     segment.vmsize, fileMappingSize);
                 //abort();
             }
@@ -558,7 +563,7 @@ u32 Dynarmic_map_file(bool isDyld, u32 target, const char *path) {
                 headerSegmentGuestAddress = guestSegmentAddress;
                 headerSegmentFileSize = segment.filesize;
             }
-            printf("Mapping 0x%lx-0x%lx to 0x%x\n",
+            LC32_DEBUG_PRINTF("Mapping 0x%lx-0x%lx to 0x%x\n",
                 map + segment.fileoff,
                 map + segment.fileoff + segment.filesize,
                 guestSegmentAddress);
@@ -840,7 +845,7 @@ u32 Dynarmic_map_file(bool isDyld, u32 target, const char *path) {
                 encryption.cryptid, strerror(decryptionError));
             LC32MapFileFailure(path, message);
         }
-        printf("LC32: decrypted main executable range "
+        LC32_DEBUG_PRINTF("LC32: decrypted main executable range "
             "0x%08x-0x%08llx (cryptid %u)\n",
             guestEncryptedAddress,
             static_cast<unsigned long long>(
@@ -954,11 +959,10 @@ int LC32RunGuest(int argc, char* argv[], char* envp[]) {
         return 1;
     }
 
-    const char *configuredGuestHomeValue = getenv("LC32_GUEST_HOME");
     const std::string configuredGuestHome =
-        configuredGuestHomeValue != nullptr &&
-            configuredGuestHomeValue[0] == '/' ?
-                configuredGuestHomeValue : "";
+        LC32GuestBootstrap::SelectConfiguredHomeDirectory(
+            getenv("LC32_GUEST_HOME"), getenv("LC_HOME_PATH"),
+            getenv("HOME"), getenv("SIMULATOR_UDID") != nullptr);
 
     /*
      * Snapshot explicit guest variables before any setenv call can replace
@@ -1024,19 +1028,31 @@ int LC32RunGuest(int argc, char* argv[], char* envp[]) {
         sharedHandle.fs->addMountpoint(guestHome, guestHome);
     }
     setenv("LC32_GUEST_HOME", guestHome.c_str(), 1);
-    setenv("LC32_GUEST_EXECUTABLE", execPath, 1);
 
-    // map the main executable first
+    /* Publish the executable only after its load commands have populated the
+     * SDK version. UIKit uses presence of this environment value as the
+     * readiness guard for caching legacy canvas policy, where SDK zero is a
+     * meaningful value for early binaries rather than "not initialized". */
+    guestExecutableSDKVersion = 0;
     u32 execAddr = Dynarmic_map_file(false, 0x11000000, execPath);
+    // Bundle discovery also needs the legacy HOME alias in LiveContainer,
+    // independently of the host SDK or UIKit's native compatibility mode.
+    const int legacyLayoutError = LC32GuestBootstrap::EnsureLegacyBundleLayout(
+        configuredGuestHome, execPath, guestExecutableSDKVersion);
+    if(legacyLayoutError != 0) {
+        fprintf(stderr, "LC32: could not expose the legacy app bundle in HOME: %s\n",
+            strerror(legacyLayoutError));
+    }
+    setenv("LC32_GUEST_EXECUTABLE", execPath, 1);
     LC32ConfigureLegacyAppTransportSecurity(
         guestExecutableSDKVersion);
     
     // map dyld
     const char *dyldPath = getenv("DYLD_PATH");
-    printf("Loading dyld at DYLD_PATH %s\n", dyldPath);
+    LC32_DEBUG_PRINTF("Loading dyld at DYLD_PATH %s\n", dyldPath);
     Dynarmic_map_file(true, 0x10000000, dyldPath);
     InstallGuestTracepointsFromEnvironment();
-    printf("entry point: 0x%x\n", threadHandle.jit->Regs()[15]);
+    LC32_DEBUG_PRINTF("entry point: 0x%x\n", threadHandle.jit->Regs()[15]);
     
     // commpage 0xffff4000+0x1000
     u32 commpage = Dynarmic_mmap(0xffff4000, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
@@ -1086,7 +1102,6 @@ int LC32RunGuest(int argc, char* argv[], char* envp[]) {
     std::vector<std::string> guestEnvironment =
         LC32GuestBootstrap::FinalizeEnvironment(
             std::move(guestEnvironmentSelection), guestHome,
-            getenv("LC32_OBJC_TRACE") ?: "0",
             getenv("NATIVE_GUEST_THREADS") ?: "0",
             &overriddenGuestEnvironmentNames);
     for(const std::string &name : overriddenGuestEnvironmentNames) {
@@ -1145,7 +1160,7 @@ int LC32RunGuest(int argc, char* argv[], char* envp[]) {
     }
     const u32 dyldStackPtr = initialStack.stackPointer;
     
-    printf("LC32: stack ptr now 0x%x\n", dyldStackPtr);
+    LC32_DEBUG_PRINTF("LC32: stack ptr now 0x%x\n", dyldStackPtr);
     
     // Go!
     Dynarmic_reg_1write(13, dyldStackPtr);

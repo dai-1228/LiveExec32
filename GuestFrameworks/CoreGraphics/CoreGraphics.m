@@ -9,6 +9,10 @@
 #include <math.h>
 #include <string.h>
 
+@interface NSObject (LC32CoreGraphicsOwnership)
+- (void)LC32_releaseGuestOwnershipOnly;
+@end
+
 static pthread_once_t LC32CoreGraphicsDispatcherOnce = PTHREAD_ONCE_INIT;
 static uint64_t LC32CoreGraphicsDispatcherAddress;
 
@@ -62,8 +66,24 @@ CGColorRef CGColorCreate(CGColorSpaceRef space, const CGFloat *components) {
     return (CGColorRef)LC32_CG_CALL(LC32CoreGraphicsOpColorCreate,
         LC32_CG_HOST(space), LC32_CG_U32((uintptr_t)components));
 }
+bool CGColorEqualToColor(CGColorRef color1, CGColorRef color2) {
+    if(color1 == color2) return true;
+    if(!color1 || !color2) return false;
+    return LC32_CG_CALL(LC32CoreGraphicsOpColorEqualToColor,
+        LC32_CG_HOST(color1), LC32_CG_HOST(color2)) != 0;
+}
+
 void CGColorRelease(CGColorRef color) {
     if(color) CFRelease(color);
+}
+
+CGColorRef CGColorRetain(CGColorRef color) {
+    return color ? (CGColorRef)CFRetain(color) : NULL;
+}
+
+CGColorRef CGColorCreateCopy(CGColorRef color) {
+    // CGColor is immutable; a copy carries independent +1 ownership.
+    return CGColorRetain(color);
 }
 
 CGFloat CGColorGetAlpha(CGColorRef color) {
@@ -113,6 +133,12 @@ CGColorSpaceModel CGColorSpaceGetModel(CGColorSpaceRef space) {
     return space ? (CGColorSpaceModel)(int32_t)LC32_CG_CALL(
         LC32CoreGraphicsOpColorSpaceGetModel,
         LC32_CG_HOST(space)) : kCGColorSpaceModelUnknown;
+}
+
+size_t CGColorSpaceGetNumberOfComponents(CGColorSpaceRef space) {
+    return space ? (size_t)LC32_CG_CALL(
+        LC32CoreGraphicsOpColorSpaceGetNumberOfComponents,
+        LC32_CG_HOST(space)) : 0;
 }
 void CGColorSpaceRelease(CGColorSpaceRef color) {
     if(!color) return;
@@ -168,6 +194,16 @@ CGDataProviderRef CGDataProviderCreateWithCFData(CFDataRef data) {
         LC32_CG_HOST(data)) : NULL;
 }
 
+CGDataProviderRef CGDataProviderCreateWithData(void *info,
+        const void *data, size_t size,
+        CGDataProviderReleaseDataCallback releaseData) {
+    if(size && !data) return NULL;
+    return (CGDataProviderRef)LC32_CG_CALL(
+        LC32CoreGraphicsOpDataProviderCreateWithData,
+        LC32_CG_U32((uintptr_t)info), LC32_CG_U32((uintptr_t)data),
+        LC32_CG_U32(size), LC32_CG_U32((uintptr_t)releaseData));
+}
+
 CGImageRef CGImageCreate(size_t width, size_t height,
         size_t bitsPerComponent, size_t bitsPerPixel, size_t bytesPerRow,
         CGColorSpaceRef space, CGBitmapInfo bitmapInfo,
@@ -188,8 +224,71 @@ CGImageRef CGImageCreate(size_t width, size_t height,
 
 void CGDataProviderRelease(CGDataProviderRef provider) {
     if(!provider) return;
-    CFRelease(provider);
+    /* Native providers do not always support Objective-C weak promotion.
+     * Consume the caller-owned reference through the typed CF API, while
+     * maintaining the corresponding guest ownership count exactly once. */
+    const uint64_t hostProvider = LC32_CG_HOST(provider);
+    [(id)provider LC32_releaseGuestOwnershipOnly];
+    LC32_CG_CALL(LC32CoreGraphicsOpDataProviderRelease, hostProvider);
 }
+
+CGDataProviderRef CGDataProviderRetain(CGDataProviderRef provider) {
+    return provider ? (CGDataProviderRef)LC32_CG_CALL(
+        LC32CoreGraphicsOpDataProviderRetain,
+        LC32_CG_HOST(provider)) : NULL;
+}
+
+CFDataRef CGDataProviderCopyData(CGDataProviderRef provider) {
+    return provider ? (CFDataRef)LC32_CG_CALL(
+        LC32CoreGraphicsOpDataProviderCopyData,
+        LC32_CG_HOST(provider)) : NULL;
+}
+
+#pragma mark CGFont
+
+CGFontRef CGFontCreateWithDataProvider(CGDataProviderRef provider) {
+    return provider ? (CGFontRef)LC32_CG_CALL(
+        LC32CoreGraphicsOpFontCreateWithDataProvider,
+        LC32_CG_HOST(provider)) : NULL;
+}
+
+CGFontRef CGFontRetain(CGFontRef font) {
+    return font ? (CGFontRef)CFRetain(font) : NULL;
+}
+
+void CGFontRelease(CGFontRef font) {
+    if(font) CFRelease(font);
+}
+
+CFDataRef CGFontCopyTableForTag(CGFontRef font, uint32_t tag) {
+    return font ? (CFDataRef)LC32_CG_CALL(
+        LC32CoreGraphicsOpFontCopyTableForTag,
+        LC32_CG_HOST(font), LC32_CG_U32(tag)) : NULL;
+}
+
+#define LC32_CG_FONT_METRIC(name) \
+    int CGFont##name(CGFontRef font) { \
+        return font ? (int32_t)LC32_CG_CALL( \
+            LC32CoreGraphicsOpFont##name, LC32_CG_HOST(font)) : 0; \
+    }
+
+LC32_CG_FONT_METRIC(GetUnitsPerEm)
+LC32_CG_FONT_METRIC(GetAscent)
+LC32_CG_FONT_METRIC(GetDescent)
+LC32_CG_FONT_METRIC(GetCapHeight)
+LC32_CG_FONT_METRIC(GetXHeight)
+
+#undef LC32_CG_FONT_METRIC
+
+bool CGFontGetGlyphAdvances(CGFontRef font, const CGGlyph *glyphs,
+                            size_t count, int *advances) {
+    if(!font || (count && (!glyphs || !advances))) return false;
+    return LC32_CG_CALL(LC32CoreGraphicsOpFontGetGlyphAdvances,
+        LC32_CG_HOST(font), LC32_CG_U32((uintptr_t)glyphs),
+        LC32_CG_U32(count), LC32_CG_U32((uintptr_t)advances)) != 0;
+}
+
+#pragma mark CGImage
 
 CGImageRef CGImageCreateWithJPEGDataProvider(
         CGDataProviderRef source, const CGFloat *decode,
@@ -212,6 +311,10 @@ CGImageRef CGImageCreateWithPNGDataProvider(
         LC32CoreGraphicsOpImageCreateWithPNGDataProvider,
         LC32_CG_HOST(source), LC32_CG_U32((uintptr_t)decode),
         LC32_CG_U32(shouldInterpolate), LC32_CG_U32(intent));
+}
+
+CGImageRef CGImageRetain(CGImageRef image) {
+    return image ? (CGImageRef)CFRetain(image) : NULL;
 }
 
 void CGImageRelease(CGImageRef image) {
@@ -264,6 +367,16 @@ void CGContextDrawImage(CGContextRef context, CGRect rect,
                         CGImageRef image) {
     if(!context || !image) return;
     LC32_CG_CALL(LC32CoreGraphicsOpContextDrawImage,
+        LC32_CG_HOST(context),
+        LC32_CG_F32(rect.origin.x), LC32_CG_F32(rect.origin.y),
+        LC32_CG_F32(rect.size.width), LC32_CG_F32(rect.size.height),
+        LC32_CG_HOST(image));
+}
+
+void CGContextDrawTiledImage(CGContextRef context, CGRect rect,
+                             CGImageRef image) {
+    if(!context || !image) return;
+    LC32_CG_CALL(LC32CoreGraphicsOpContextDrawTiledImage,
         LC32_CG_HOST(context),
         LC32_CG_F32(rect.origin.x), LC32_CG_F32(rect.origin.y),
         LC32_CG_F32(rect.size.width), LC32_CG_F32(rect.size.height),
@@ -323,6 +436,11 @@ void CGContextRotateCTM(CGContextRef context, CGFloat angle) {
         LC32_CG_HOST(context), LC32_CG_F32(angle));
 }
 
+void CGContextSetAlpha(CGContextRef context, CGFloat alpha) {
+    if(context) LC32_CG_CALL(LC32CoreGraphicsOpContextSetAlpha,
+        LC32_CG_HOST(context), LC32_CG_F32(alpha));
+}
+
 void CGContextSaveGState(CGContextRef context) {
     if(context) LC32_CG_CALL(LC32CoreGraphicsOpContextSaveGState,
         LC32_CG_HOST(context));
@@ -336,6 +454,43 @@ void CGContextRestoreGState(CGContextRef context) {
 void CGContextBeginPath(CGContextRef context) {
     if(context) LC32_CG_CALL(LC32CoreGraphicsOpContextBeginPath,
         LC32_CG_HOST(context));
+}
+
+void CGContextBeginTransparencyLayer(CGContextRef context,
+                                     CFDictionaryRef auxiliaryInfo) {
+    if(context) LC32_CG_CALL(
+        LC32CoreGraphicsOpContextBeginTransparencyLayer,
+        LC32_CG_HOST(context), LC32_CG_HOST(auxiliaryInfo));
+}
+
+void CGContextEndTransparencyLayer(CGContextRef context) {
+    if(context) LC32_CG_CALL(
+        LC32CoreGraphicsOpContextEndTransparencyLayer,
+        LC32_CG_HOST(context));
+}
+
+void CGContextSetFont(CGContextRef context, CGFontRef font) {
+    if(context && font) LC32_CG_CALL(LC32CoreGraphicsOpContextSetFont,
+        LC32_CG_HOST(context), LC32_CG_HOST(font));
+}
+
+void CGContextSetFontSize(CGContextRef context, CGFloat size) {
+    if(context) LC32_CG_CALL(LC32CoreGraphicsOpContextSetFontSize,
+        LC32_CG_HOST(context), LC32_CG_F32(size));
+}
+
+void CGContextSetTextDrawingMode(CGContextRef context,
+                                 CGTextDrawingMode mode) {
+    if(context) LC32_CG_CALL(LC32CoreGraphicsOpContextSetTextDrawingMode,
+        LC32_CG_HOST(context), LC32_CG_U32(mode));
+}
+
+void CGContextShowGlyphsAtPoint(CGContextRef context, CGFloat x,
+        CGFloat y, const CGGlyph *glyphs, size_t count) {
+    if(context && glyphs && count) LC32_CG_CALL(
+        LC32CoreGraphicsOpContextShowGlyphsAtPoint,
+        LC32_CG_HOST(context), LC32_CG_F32(x), LC32_CG_F32(y),
+        LC32_CG_U32((uintptr_t)glyphs), LC32_CG_U32(count));
 }
 
 void CGContextClosePath(CGContextRef context) {
@@ -586,9 +741,35 @@ void CGContextSetShouldAntialias(CGContextRef context, bool shouldAntialias) {
         LC32_CG_HOST(context), LC32_CG_U32(shouldAntialias));
 }
 
+void CGContextSetAllowsAntialiasing(CGContextRef context, bool allowsAntialiasing) {
+    if(context) LC32_CG_CALL(
+        LC32CoreGraphicsOpContextSetAllowsAntialiasing,
+        LC32_CG_HOST(context), LC32_CG_U32(allowsAntialiasing));
+}
+
+void CGContextSetAllowsFontSubpixelPositioning(CGContextRef context, bool allows) {
+    if(context) LC32_CG_CALL(
+        LC32CoreGraphicsOpContextSetAllowsFontSubpixelPositioning,
+        LC32_CG_HOST(context), LC32_CG_U32(allows));
+}
+
+void CGContextSetShouldSubpixelQuantizeFonts(CGContextRef context, bool should) {
+    if(context) LC32_CG_CALL(
+        LC32CoreGraphicsOpContextSetShouldSubpixelQuantizeFonts,
+        LC32_CG_HOST(context), LC32_CG_U32(should));
+}
+
 void CGContextSetTextPosition(CGContextRef context, CGFloat x, CGFloat y) {
     if(context) LC32_CG_CALL(LC32CoreGraphicsOpContextSetTextPosition,
         LC32_CG_HOST(context), LC32_CG_F32(x), LC32_CG_F32(y));
+}
+
+CGPoint CGContextGetTextPosition(CGContextRef context) {
+    if(!context) return CGPointZero;
+    CGPoint result = CGPointZero;
+    return LC32_CG_CALL(LC32CoreGraphicsOpContextGetTextPosition,
+        LC32_CG_HOST(context), LC32_CG_U32((uintptr_t)&result))
+        ? result : CGPointZero;
 }
 
 void CGContextSetTextMatrix(CGContextRef context,
@@ -764,6 +945,36 @@ void CGPathAddRect(CGMutablePathRef path,
         LC32_CG_F32(rect.size.width), LC32_CG_F32(rect.size.height));
 }
 
+void CGPathAddEllipseInRect(CGMutablePathRef path,
+        const CGAffineTransform *transform, CGRect rect) {
+    if(!path) return;
+    LC32_CG_CALL(LC32CoreGraphicsOpPathAddEllipseInRect,
+        LC32_CG_HOST(path), LC32_CG_U32(transform != NULL),
+        transform ? LC32_CG_F32(transform->a) : 0,
+        transform ? LC32_CG_F32(transform->b) : 0,
+        transform ? LC32_CG_F32(transform->c) : 0,
+        transform ? LC32_CG_F32(transform->d) : 0,
+        transform ? LC32_CG_F32(transform->tx) : 0,
+        transform ? LC32_CG_F32(transform->ty) : 0,
+        LC32_CG_F32(rect.origin.x), LC32_CG_F32(rect.origin.y),
+        LC32_CG_F32(rect.size.width), LC32_CG_F32(rect.size.height));
+}
+
+void CGPathAddQuadCurveToPoint(CGMutablePathRef path,
+        const CGAffineTransform *transform, CGFloat cpx, CGFloat cpy,
+        CGFloat x, CGFloat y) {
+    if(!path) return;
+    LC32_CG_CALL(LC32CoreGraphicsOpPathAddQuadCurveToPoint,
+        LC32_CG_HOST(path), LC32_CG_U32(transform != NULL),
+        transform ? LC32_CG_F32(transform->a) : 0,
+        transform ? LC32_CG_F32(transform->b) : 0,
+        transform ? LC32_CG_F32(transform->c) : 0,
+        transform ? LC32_CG_F32(transform->d) : 0,
+        transform ? LC32_CG_F32(transform->tx) : 0,
+        transform ? LC32_CG_F32(transform->ty) : 0,
+        LC32_CG_F32(cpx), LC32_CG_F32(cpy), LC32_CG_F32(x), LC32_CG_F32(y));
+}
+
 CGPathRef CGPathCreateCopy(CGPathRef path) {
     return path ? (CGPathRef)LC32_CG_CALL(
         LC32CoreGraphicsOpPathCreateCopy, LC32_CG_HOST(path)) : NULL;
@@ -775,6 +986,10 @@ CGRect CGPathGetBoundingBox(CGPathRef path) {
     return LC32_CG_CALL(LC32CoreGraphicsOpPathGetBoundingBox,
         LC32_CG_HOST(path), LC32_CG_U32((uintptr_t)&result))
         ? result : CGRectNull;
+}
+
+CGPathRef CGPathRetain(CGPathRef path) {
+    return path ? (CGPathRef)CFRetain(path) : NULL;
 }
 
 void CGPathRelease(CGPathRef cg_nullable path) {
@@ -802,7 +1017,23 @@ const CGSize CGSizeZero = {0,0};
  * These are value-only operations.  Computing them in ARM32 keeps CGFloat as
  * float and avoids both a host transition and the incompatible ARM64 struct
  * return ABI.
+ *
+ * The 10.3 SDK maps a few public spellings to private static-inline helpers.
+ * Undefine those mappings here so the guest framework still exports the
+ * public ABI symbols found in CoreGraphics.tbd.
  */
+#undef CGAffineTransformMake
+#undef CGPointApplyAffineTransform
+#undef CGPointEqualToPoint
+#undef CGSizeApplyAffineTransform
+#undef CGSizeEqualToSize
+
+CGAffineTransform CGAffineTransformMake(
+        CGFloat a, CGFloat b, CGFloat c, CGFloat d,
+        CGFloat tx, CGFloat ty) {
+    return (CGAffineTransform){a, b, c, d, tx, ty};
+}
+
 CGAffineTransform CGAffineTransformMakeTranslation(CGFloat tx, CGFloat ty) {
     return (CGAffineTransform){1, 0, 0, 1, tx, ty};
 }
@@ -826,6 +1057,30 @@ bool CGAffineTransformIsIdentity(CGAffineTransform transform) {
     return transform.a == 1 && transform.b == 0 &&
         transform.c == 0 && transform.d == 1 &&
         transform.tx == 0 && transform.ty == 0;
+}
+
+bool CGAffineTransformEqualToTransform(
+        CGAffineTransform first, CGAffineTransform second) {
+    return first.a == second.a && first.b == second.b &&
+        first.c == second.c && first.d == second.d &&
+        first.tx == second.tx && first.ty == second.ty;
+}
+
+CGAffineTransform CGAffineTransformInvert(CGAffineTransform transform) {
+    const CGFloat determinant =
+        transform.a * transform.d - transform.c * transform.b;
+    if(determinant == 0) return transform;
+    const CGFloat inverse = 1.0f / determinant;
+    return (CGAffineTransform){
+        transform.d * inverse,
+        -transform.b * inverse,
+        -transform.c * inverse,
+        transform.a * inverse,
+        (transform.c * transform.ty -
+            transform.d * transform.tx) * inverse,
+        (transform.b * transform.tx -
+            transform.a * transform.ty) * inverse,
+    };
 }
 
 CGAffineTransform CGAffineTransformConcat(CGAffineTransform first,
@@ -882,6 +1137,28 @@ CGAffineTransform CGAffineTransformRotate(
         CGAffineTransformMakeRotation(angle), transform);
 }
 
+CGPoint CGPointApplyAffineTransform(
+        CGPoint point, CGAffineTransform transform) {
+    return CGPointMake(
+        point.x * transform.a + point.y * transform.c + transform.tx,
+        point.x * transform.b + point.y * transform.d + transform.ty);
+}
+
+bool CGPointEqualToPoint(CGPoint first, CGPoint second) {
+    return first.x == second.x && first.y == second.y;
+}
+
+CGSize CGSizeApplyAffineTransform(
+        CGSize size, CGAffineTransform transform) {
+    return CGSizeMake(
+        size.width * transform.a + size.height * transform.c,
+        size.width * transform.b + size.height * transform.d);
+}
+
+bool CGSizeEqualToSize(CGSize first, CGSize second) {
+    return first.width == second.width && first.height == second.height;
+}
+
 // We don't call host functions if possible to avoid performance cost.
 static CGRect LC32CGRectStandardized(CGRect rect) {
     if(rect.size.width < 0) {
@@ -893,6 +1170,10 @@ static CGRect LC32CGRectStandardized(CGRect rect) {
         rect.size.height = -rect.size.height;
     }
     return rect;
+}
+
+CGRect CGRectStandardize(CGRect rect) {
+    return LC32CGRectStandardized(rect);
 }
 
 CGFloat CGRectGetMinX(CGRect rect) {

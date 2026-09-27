@@ -270,6 +270,8 @@ bool Dynarmic_submit_guest_block_callback(
     const LC32GuestBlockCallbackDescriptor *descriptor);
 bool Dynarmic_submit_guest_function_callback(
     const LC32GuestBlockCallbackDescriptor *descriptor);
+bool Dynarmic_submit_guest_selector_callback(
+    const LC32GuestBlockCallbackDescriptor *descriptor);
 bool Dynarmic_submit_guest_block_release(u32 guest_block);
 u32 LC32GuestCallbackExecutorSupported(u32 unused1, u32 unused2,
                                        u32 unused3);
@@ -280,7 +282,9 @@ bool Dynarmic_nativeInitialize();
 void Dynarmic_nativeDestroy();
 int Dynarmic_munmap(u64 address, u64 size);
 u32 Dynarmic_direct_mmap(u32 address, u64 size, int protection, int flags, void *src, u64 off);
-u32 Dynarmic_mmap(u32 address, u64 size, int protection, int flags, int fildes, u64 off, u64 mask = DYN_PAGE_MASK);
+u32 Dynarmic_mmap(u32 address, u64 size, int protection, int flags,
+                 int fildes, u64 off, u64 mask = DYN_PAGE_MASK,
+                 bool purgable = false);
 int Dynarmic_mprotect(u64 address, u64 size, int perms);
 /* Returns a Darwin errno value, or zero on success. */
 int Dynarmic_mremap_encrypted(u32 start, u32 length, u32 cryptid,

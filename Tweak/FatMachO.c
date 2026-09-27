@@ -34,6 +34,13 @@
 #define LC32_REPLACEMENT_STAGING_NAME "replacement"
 #define LC32_IOS_11_VERSION (11u << 16)
 
+#ifndef LC32_PRESERVE_GUEST_SDK
+#define LC32_PRESERVE_GUEST_SDK 1
+#endif
+#if LC32_PRESERVE_GUEST_SDK != 0 && LC32_PRESERVE_GUEST_SDK != 1
+#error LC32_PRESERVE_GUEST_SDK must be 0 or 1
+#endif
+
 #define LC32_CS_MAGIC_CODE_DIRECTORY 0xfade0c02u
 #define LC32_CS_MAGIC_EMBEDDED_SIGNATURE 0xfade0cc0u
 #define LC32_CS_MAGIC_EMBEDDED_ENTITLEMENTS 0xfade7171u
@@ -2016,6 +2023,22 @@ static char *LC32CreatePathByAppendingComponent(
     return path;
 }
 
+static uint32_t LC32EffectiveShimSDK(const LC32MachOSlice *guestSlice) {
+    uint32_t sdk = 0;
+    if(guestSlice->hasVersionMinIPhoneOS) {
+        sdk = guestSlice->versionMinIPhoneOSSDK;
+    } else if(guestSlice->hasBuildVersion &&
+            guestSlice->buildVersionPlatform == PLATFORM_IOS) {
+        sdk = guestSlice->buildVersionSDK;
+    }
+#if LC32_PRESERVE_GUEST_SDK
+    /* Zero (including no version command) is a genuine old-binary value. */
+    return sdk;
+#else
+    return sdk < LC32_IOS_11_VERSION ? LC32_IOS_11_VERSION : sdk;
+#endif
+}
+
 static bool LC32PatchShimBuildVersion(
         uint8_t *shimBytes, size_t shimSize,
         const LC32MachOSlice *shimSlice, uint32_t requestedSDK,
@@ -2045,8 +2068,8 @@ static bool LC32PatchShimBuildVersion(
     }
 
     command.minos = LC32_IOS_11_VERSION;
-    command.sdk = requestedSDK < LC32_IOS_11_VERSION ?
-        LC32_IOS_11_VERSION : requestedSDK;
+    /* requestedSDK was selected using the build's explicit SDK policy. */
+    command.sdk = requestedSDK;
     memcpy(shimBytes + shimSlice->buildVersionCommandOffset,
         &command, sizeof(command));
     return true;
@@ -2709,7 +2732,7 @@ LC32MachOInjectionResult LC32InjectArm64ExecutableSlice(
     bool hasARM32Executable = false;
     bool hasEncryptedARM32Executable = false;
     bool targetSDKIsSet = false;
-    uint32_t targetSDK = LC32_IOS_11_VERSION;
+    uint32_t targetSDK = 0;
     for(uint32_t index = 0; index < targetSliceCount; index++) {
         const LC32MachOSlice *slice = &targetImage.slices[index];
         if(slice->cpuType == CPU_TYPE_ARM64) {
@@ -2725,10 +2748,7 @@ LC32MachOInjectionResult LC32InjectArm64ExecutableSlice(
                 "byte-swapped ARM executable slices are not supported");
             goto cleanup;
         }
-        const uint32_t sliceSDK =
-            slice->hasVersionMinIPhoneOS &&
-                slice->versionMinIPhoneOSSDK >= LC32_IOS_11_VERSION ?
-                    slice->versionMinIPhoneOSSDK : LC32_IOS_11_VERSION;
+        const uint32_t sliceSDK = LC32EffectiveShimSDK(slice);
         if(targetSDKIsSet && targetSDK != sliceSDK) {
             LC32SetError(errorBuffer, errorBufferCapacity,
                 "ARM32 slices use conflicting iOS SDK versions");

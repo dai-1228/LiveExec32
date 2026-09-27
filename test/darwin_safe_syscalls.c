@@ -15,12 +15,61 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/xattr.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Exported by the iOS 10 libSystem but omitted from its public headers. */
 extern int fdatasync(int fd);
 
+/* Darwin record-lock SPI is absent from some public SDKs. */
+#ifndef F_SETLKWTIMEOUT
+#define F_SETLKWTIMEOUT 10
+#endif
+#ifndef F_GETLKPID
+#define F_GETLKPID 66
+#endif
+#ifndef F_OFD_SETLK
+#define F_OFD_SETLK 90
+#endif
+#ifndef F_OFD_SETLKW
+#define F_OFD_SETLKW 91
+#endif
+#ifndef F_OFD_GETLK
+#define F_OFD_GETLK 92
+#endif
+#ifndef F_OFD_SETLKWTIMEOUT
+#define F_OFD_SETLKWTIMEOUT 93
+#endif
+#ifndef F_OFD_GETLKPID
+#define F_OFD_GETLKPID 94
+#endif
+#ifndef F_SETCONFINED
+#define F_SETCONFINED 95
+#endif
+#ifndef F_GETCONFINED
+#define F_GETCONFINED 96
+#endif
+
 static int failures;
+
+struct LC32SandboxContainerPathArguments {
+    uint64_t pid;
+    uint64_t buffer;
+    uint64_t capacity;
+};
+
+_Static_assert(sizeof(struct LC32SandboxContainerPathArguments) == 24,
+    "unexpected ARM32 sandbox container path argument layout");
+
+struct LC32FlockTimeout {
+    struct flock lock;
+    struct timespec timeout;
+};
+
+_Static_assert(sizeof(struct flock) == 24,
+    "unexpected armv7 flock layout");
+_Static_assert(sizeof(struct LC32FlockTimeout) == 32,
+    "unexpected armv7 flocktimeout layout");
 
 #define CHECK(condition, label) do {                                    \
     if (condition) {                                                     \
@@ -30,6 +79,44 @@ static int failures;
         failures++;                                                     \
     }                                                                   \
 } while (0)
+
+static void test_sandbox_container_path(void) {
+    char path[PATH_MAX];
+    memset(path, 0xa5, sizeof(path));
+    struct LC32SandboxContainerPathArguments arguments = {
+        .pid = (uint64_t)getpid(),
+        .buffer = (uintptr_t)path,
+        .capacity = sizeof(path),
+    };
+    const int result = syscall(
+        SYS___mac_syscall, "Sandbox", 4, &arguments);
+    CHECK(result == 0 && path[0] == '/' &&
+              memchr(path, '\0', sizeof(path)) != NULL,
+          "sandbox-container-path-current-pid-copyout");
+    const char *home = getenv("HOME");
+    CHECK(result == 0 && home != NULL &&
+              memchr(path, '\0', sizeof(path)) != NULL &&
+              strcmp(path, home) == 0,
+          "sandbox-container-path-matches-guest-home");
+
+    memset(path, 0xa5, sizeof(path));
+    arguments.capacity = 1;
+    errno = 0;
+    CHECK(syscall(SYS___mac_syscall, "Sandbox", 4, &arguments) == -1 &&
+              errno == ENAMETOOLONG && (unsigned char)path[0] == 0xa5,
+          "sandbox-container-path-small-buffer-unchanged");
+
+    arguments.buffer = 0;
+    arguments.capacity = sizeof(path);
+    errno = 0;
+    CHECK(syscall(SYS___mac_syscall, "Sandbox", 4, &arguments) == -1 &&
+              errno == EFAULT,
+          "sandbox-container-path-null-output");
+    errno = 0;
+    CHECK(syscall(SYS___mac_syscall, "Sandbox", 4, NULL) == -1 &&
+              errno == EFAULT,
+          "sandbox-container-path-null-arguments");
+}
 
 static int poll_null_descriptors(void) {
     int (*volatile function)(struct pollfd *, nfds_t, int) = poll;
@@ -71,6 +158,94 @@ static int list_contains(const char *list, size_t length,
         offset += itemLength + 1;
     }
     return 0;
+}
+
+static struct flock byte_range_lock(short type, off_t start) {
+    struct flock lock = {};
+    lock.l_start = start;
+    lock.l_len = 1;
+    lock.l_type = type;
+    lock.l_whence = SEEK_SET;
+    return lock;
+}
+
+static void test_fcntl_record_locks(
+        const char *filePath, int descriptor) {
+    int otherDescriptor = open(filePath, O_RDWR);
+    CHECK(otherDescriptor >= 0, "fcntl-lock-open-second-description");
+    if(otherDescriptor < 0) return;
+
+    struct flock lock = byte_range_lock(F_WRLCK, 0);
+    CHECK(fcntl(descriptor, F_SETLK, &lock) == 0,
+          "fcntl-setlk-copyin");
+
+    struct flock query = byte_range_lock(F_WRLCK, 0);
+    CHECK(fcntl(otherDescriptor, F_GETLK, &query) == 0 &&
+              query.l_type == F_UNLCK,
+          "fcntl-getlk-copyout");
+    query = byte_range_lock(F_WRLCK, 0);
+    query.l_pid = getpid();
+    CHECK(fcntl(otherDescriptor, F_GETLKPID, &query) == 0 &&
+              query.l_type == F_UNLCK,
+          "fcntl-getlkpid-copyout");
+
+    lock = byte_range_lock(F_UNLCK, 0);
+    CHECK(fcntl(descriptor, F_SETLK, &lock) == 0,
+          "fcntl-setlk-unlock");
+
+    lock = byte_range_lock(F_WRLCK, 1);
+    CHECK(fcntl(descriptor, F_SETLKW, &lock) == 0,
+          "fcntl-setlkw-copyin");
+    lock.l_type = F_UNLCK;
+    CHECK(fcntl(descriptor, F_SETLK, &lock) == 0,
+          "fcntl-setlkw-unlock");
+
+    struct LC32FlockTimeout timedLock = {
+        .lock = byte_range_lock(F_WRLCK, 2),
+        .timeout = {.tv_sec = 1, .tv_nsec = 0},
+    };
+    CHECK(fcntl(descriptor, F_SETLKWTIMEOUT, &timedLock) == 0,
+          "fcntl-setlkwtimeout-timespec32");
+    lock = byte_range_lock(F_UNLCK, 2);
+    CHECK(fcntl(descriptor, F_SETLK, &lock) == 0,
+          "fcntl-setlkwtimeout-unlock");
+
+    lock = byte_range_lock(F_WRLCK, 3);
+    CHECK(fcntl(descriptor, F_OFD_SETLK, &lock) == 0,
+          "fcntl-ofd-setlk-copyin");
+    query = byte_range_lock(F_WRLCK, 3);
+    CHECK(fcntl(otherDescriptor, F_OFD_GETLK, &query) == 0 &&
+              query.l_type == F_WRLCK,
+          "fcntl-ofd-getlk-copyout");
+    query = byte_range_lock(F_WRLCK, 3);
+    query.l_pid = getpid();
+    errno = 0;
+    CHECK(fcntl(otherDescriptor, F_OFD_GETLKPID, &query) == 0 &&
+              query.l_type == F_UNLCK,
+          "fcntl-ofd-getlkpid-pid-filter-copyout");
+    lock.l_type = F_UNLCK;
+    CHECK(fcntl(descriptor, F_OFD_SETLK, &lock) == 0,
+          "fcntl-ofd-setlk-unlock");
+
+    lock = byte_range_lock(F_WRLCK, 4);
+    CHECK(fcntl(descriptor, F_OFD_SETLKW, &lock) == 0,
+          "fcntl-ofd-setlkw-copyin");
+    lock.l_type = F_UNLCK;
+    CHECK(fcntl(descriptor, F_OFD_SETLK, &lock) == 0,
+          "fcntl-ofd-setlkw-unlock");
+
+    timedLock.lock = byte_range_lock(F_WRLCK, 5);
+    CHECK(fcntl(descriptor, F_OFD_SETLKWTIMEOUT, &timedLock) == 0,
+          "fcntl-ofd-setlkwtimeout-timespec32");
+    lock = byte_range_lock(F_UNLCK, 5);
+    CHECK(fcntl(descriptor, F_OFD_SETLK, &lock) == 0,
+          "fcntl-ofd-setlkwtimeout-unlock");
+
+    errno = 0;
+    CHECK(fcntl(descriptor, F_GETLK, NULL) == -1 && errno == EFAULT,
+          "fcntl-getlk-null-structure");
+    CHECK(close(otherDescriptor) == 0,
+          "fcntl-lock-close-second-description");
 }
 
 static void test_scalar_syscalls(void) {
@@ -310,6 +485,20 @@ static void test_file_syscalls(const char *temporaryRootOverride) {
     CHECK(flock(fd, LOCK_EX | LOCK_NB) == 0, "flock-exclusive");
     CHECK(flock(fd, LOCK_UN) == 0, "flock-unlock");
 
+    test_fcntl_record_locks(filePath, fd);
+
+    errno = 0;
+    const int confinedResult = fcntl(fd, F_SETCONFINED, 1);
+    CHECK(confinedResult == 0 ||
+              (confinedResult == -1 &&
+               (errno == EAGAIN || errno == EBADF || errno == EINVAL ||
+                errno == ENOTSUP || errno == EPERM)),
+          "fcntl-setconfined-forwarded");
+    if (confinedResult == 0) {
+        CHECK(fcntl(fd, F_GETCONFINED, 0) >= 0,
+              "fcntl-getconfined-forwarded");
+    }
+
     const off_t largeOffset = ((off_t)UINT32_C(5) << 32) + 0x123;
     static const char marker = 'Z';
     CHECK(pwrite(fd, &marker, 1, largeOffset) == 1,
@@ -464,6 +653,7 @@ static void test_file_syscalls(const char *temporaryRootOverride) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    test_sandbox_container_path();
     test_scalar_syscalls();
     test_pipe_poll_readv();
     test_file_syscalls(argc > 1 ? argv[1] : NULL);

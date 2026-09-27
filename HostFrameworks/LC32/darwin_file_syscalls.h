@@ -47,3 +47,8 @@ ssize_t guest_readv(int syscall_number, int fildes,
 ssize_t guest_pwrite(int syscall_number, int fildes,
                      u32 guest_buffer, size_t byte_count,
                      off_t offset);
+
+int guest_aio_read(u32 guest_control_block);
+int guest_aio_error(u32 guest_control_block);
+int guest_aio_return(u32 guest_control_block);
+void ClearGuestAioOperations();

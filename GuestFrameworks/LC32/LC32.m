@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -39,19 +40,13 @@ uint64_t LC32CachedHostSelector(
     return expected;
 }
 
-static pthread_once_t LC32ObjCTraceOnce = PTHREAD_ONCE_INIT;
-static BOOL LC32ObjCTraceIsEnabled;
 static pthread_once_t LC32OperationTraceOnce = PTHREAD_ONCE_INIT;
 static BOOL LC32OperationTraceIsEnabled;
 static uint64_t LC32OperationTraceSequence;
 static pthread_once_t LC32AutoreleaseSchedulerOnce = PTHREAD_ONCE_INIT;
 static uint64_t LC32AutoreleaseScheduler;
-
-static void LC32InitializeObjCTrace(void) {
-    const char *value = getenv("LC32_OBJC_TRACE");
-    LC32ObjCTraceIsEnabled =
-        value && value[0] && strcmp(value, "0") != 0;
-}
+static pthread_once_t LC32HostFrameworkLoaderOnce = PTHREAD_ONCE_INIT;
+static uint64_t LC32HostFrameworkLoader;
 
 static void LC32InitializeOperationTrace(void) {
     const char *value = getenv("LC32_OPERATION_TRACE");
@@ -64,11 +59,59 @@ static void LC32InitializeAutoreleaseScheduler(void) {
         LC32Dlsym("LC32ScheduleGuestAutorelease", YES);
 }
 
-BOOL LC32ObjCTraceEnabled(void) {
-    // pthread_once avoids the problematic inline ARMv7 CAS sequence clang
-    // emits for a local atomic while remaining safe with native guest threads.
-    pthread_once(&LC32ObjCTraceOnce, LC32InitializeObjCTrace);
-    return LC32ObjCTraceIsEnabled;
+static void LC32ResolveHostFrameworkLoader(void) {
+    LC32HostFrameworkLoader = LC32Dlsym(
+        "LC32LoadNativeFramework", YES);
+}
+
+BOOL LC32LoadHostFramework(const char *frameworkName) {
+    if(!frameworkName || !frameworkName[0]) {
+        fprintf(stderr, "LC32: invalid empty native framework name\n");
+        return NO;
+    }
+
+    pthread_once(&LC32HostFrameworkLoaderOnce,
+        LC32ResolveHostFrameworkLoader);
+    if(!LC32HostFrameworkLoader) {
+        fprintf(stderr,
+            "LC32: native framework loader is unavailable for %s\n",
+            frameworkName);
+        return NO;
+    }
+    return LC32InvokeHostCRet32(
+        LC32HostFrameworkLoader, frameworkName) != 0;
+}
+
+BOOL LC32BindHostObjectConstant(id guestConstant, const char *symbolName) {
+    if(!guestConstant || !symbolName || !symbolName[0]) return NO;
+    const uint64_t hostConstant = LC32Dlsym(symbolName, NO);
+    if(!hostConstant) {
+        const size_t symbolLength = strlen(symbolName);
+        if(symbolLength > UINT32_MAX) {
+            fprintf(stderr,
+                "LC32: native object constant name is too long: %s\n",
+                symbolName);
+            return NO;
+        }
+
+        LC32ConstantStringProxy *proxy =
+            (LC32ConstantStringProxy *)(void *)guestConstant;
+        proxy->flags = 0x7c8;
+        proxy->bytes = symbolName;
+        proxy->length = (uint32_t)symbolLength;
+        fprintf(stderr,
+            "LC32: native object constant is unavailable; using its "
+            "symbol name as a string fallback: %s\n",
+            symbolName);
+        return NO;
+    }
+    [guestConstant bindHostSelf:hostConstant];
+    return YES;
+}
+
+// Parentheses bypass the function-like macro for this legacy ABI entry point.
+BOOL (LC32ObjCTraceEnabled)(void) {
+    return LC32ObjCTraceEnabled();
 }
 
 void *LC32CreateHostObjectArray(const id *objects, uint32_t count,
@@ -366,6 +409,56 @@ static uint64_t LC32ExistingHostSelf(id object) {
     return mapping == LC32_HOST_MAPPING_DEAD ? 0 : mapping;
 }
 
+/* Final release can reenter the bridge from subclass -dealloc, or while
+ * root -dealloc destroys associated objects and C++ ivars. Track those
+ * synchronous scopes without probing
+ * _objc_rootIsDeallocating: its ARM32 implementation assumes the caller
+ * already holds libobjc's SideTable lock, which our ownership gate is not.
+ * Frames live on the caller's stack and contain only the numeric address,
+ * never an ownership reference to the object being destroyed. */
+typedef struct LC32GuestDeallocFrame {
+    uint32_t guestObject;
+    struct LC32GuestDeallocFrame *previous;
+} LC32GuestDeallocFrame;
+
+static pthread_once_t LC32GuestDeallocOnce = PTHREAD_ONCE_INIT;
+static pthread_key_t LC32GuestDeallocKey;
+
+static void LC32InitializeGuestDeallocKey(void) {
+    if(pthread_key_create(&LC32GuestDeallocKey, NULL) != 0) abort();
+}
+
+static LC32GuestDeallocFrame *LC32GuestDeallocStack(void) {
+    if(pthread_once(&LC32GuestDeallocOnce,
+            LC32InitializeGuestDeallocKey) != 0) abort();
+    return pthread_getspecific(LC32GuestDeallocKey);
+}
+
+static void LC32SetGuestDeallocStack(LC32GuestDeallocFrame *frame) {
+    if(pthread_setspecific(LC32GuestDeallocKey, frame) != 0) abort();
+}
+
+static BOOL LC32GuestDeallocIsActive(uint32_t guestObject) {
+    for(LC32GuestDeallocFrame *frame = LC32GuestDeallocStack();
+            frame; frame = frame->previous) {
+        if(frame->guestObject == guestObject) return YES;
+    }
+    return NO;
+}
+
+static void LC32SendGuestDealloc(id object) {
+    LC32GuestDeallocFrame frame = {
+        (uint32_t)(uintptr_t)object,
+        LC32GuestDeallocStack(),
+    };
+    LC32SetGuestDeallocStack(&frame);
+    @try {
+        [object dealloc];
+    } @finally {
+        LC32SetGuestDeallocStack(frame.previous);
+    }
+}
+
 @implementation LC32GuestBuffer
 - (void)dealloc {
     free(_bytes);
@@ -395,8 +488,26 @@ uint32_t LC32ReleaseGuestLifetimePin(id object) {
      * tombstone. The private primitive atomically reports whether this exact
      * decrement reached zero without invoking -dealloc itself. */
     const BOOL releasedToZero = _objc_rootReleaseWasZero(object);
-    if(releasedToZero) [object dealloc];
+    if(releasedToZero) LC32SendGuestDealloc(object);
     return releasedToZero;
+}
+
+uint32_t LC32ReleaseGuestNativeProxyOwnership(id object) {
+    /* The host holds native/pin leases and the mapping's private release gate.
+     * Every ordinary/logical decrement for this native proxy uses that same
+     * gate, and its lifetime pin cannot disappear while those leases
+     * are held. Strong/weak retains can only increase the count concurrently.
+     * Do not message the object or run arbitrary guest cleanup here: the host
+     * invokes this primitive without draining deferred releases. */
+    /* The native/pin leases above already prevent this object from entering
+     * deallocation. Do not use _objc_rootIsDeallocating as an extra check:
+     * that private primitive reads the shared refcount map without locking. */
+    if(!object) return 0;
+    const uintptr_t count = _objc_rootRetainCount(object);
+    if(!count) return 0;
+    if(count == 1 || count == UINTPTR_MAX) return 1;
+    if(_objc_rootReleaseWasZero(object)) abort();
+    return 1;
 }
 
 static BOOL LC32OperationTraceEnabled(void) {
@@ -551,6 +662,15 @@ void *LC32GetAssociatedGuestBuffer(id object, uint32_t requiredCapacity) {
                     ptr = LC32RawExistingHostSelf(self);
                     if(ptr == LC32_HOST_MAPPING_DEAD) return 0;
                     if(!ptr) {
+                        /* A final release may enter an unmapped subclass's
+                         * -dealloc, and root -dealloc detaches dead peers before
+                         * destroying C++ ivars and associations. Neither scope
+                         * may recreate a native peer for a zero-count object.
+                         * Existing owned teardown mappings above remain
+                         * callable on their owner thread.
+                         */
+                        if(LC32GuestDeallocIsActive(
+                                (uint32_t)(uintptr_t)self)) return 0;
                         /*
                          * Retains performed while an object is guest-only
                          * deliberately stay local. LC32GetHostObject returns
@@ -628,6 +748,12 @@ void *LC32GetAssociatedGuestBuffer(id object, uint32_t requiredCapacity) {
         return;
     }
 
+    const uint32_t nativeProxyResult = LC32UpdateHostMapping(
+        (uint32_t)(uintptr_t)self,
+        LC32HostMappingReleaseNativeProxyLogicalOwnership, hostSelf);
+    if(nativeProxyResult == LC32NativeProxyReleaseHandled) return;
+    if(nativeProxyResult != LC32NativeProxyReleaseNotApplicable) abort();
+
     // Unlike the lifetime-pin release, this is an ordinary guest ownership
     // decrement, but the native autorelease token owns the paired host +1.
     const uint32_t guestSelf = (uint32_t)(uintptr_t)self;
@@ -636,7 +762,7 @@ void *LC32GetAssociatedGuestBuffer(id object, uint32_t requiredCapacity) {
         const uint32_t token = LC32UpdateHostMapping(
             guestSelf, LC32HostMappingBeginGuestTeardown, hostSelf);
         if(!token) abort();
-        [self dealloc];
+        LC32SendGuestDealloc(self);
         if(!LC32UpdateHostMapping(
                 guestSelf, LC32HostMappingFinishGuestTeardown,
                 token)) abort();
@@ -663,7 +789,7 @@ void *LC32GetAssociatedGuestBuffer(id object, uint32_t requiredCapacity) {
                 const uint32_t token = LC32UpdateHostMapping(
                     guestSelf,
                     LC32HostMappingBeginGuestTeardown, 0);
-                [self dealloc];
+                LC32SendGuestDealloc(self);
                 if(token && !LC32UpdateHostMapping(
                         guestSelf,
                         LC32HostMappingFinishGuestTeardown,
@@ -677,6 +803,10 @@ void *LC32GetAssociatedGuestBuffer(id object, uint32_t requiredCapacity) {
     LC32_OPERATION_TRACE("release", self, hostSelf);
 
     const uint32_t guestSelf = (uint32_t)(uintptr_t)self;
+    const uint32_t nativeProxyResult = LC32UpdateHostMapping(
+        guestSelf, LC32HostMappingReleaseNativeProxy, hostSelf);
+    if(nativeProxyResult == LC32NativeProxyReleaseHandled) return;
+    if(nativeProxyResult != LC32NativeProxyReleaseNotApplicable) abort();
     /* The zero-reporting root primitive makes the final-release decision
      * atomic with racing strong/weak retains.  Keep the Retiring mapping
      * available through arbitrary guest -dealloc code, then erase only its
@@ -686,7 +816,7 @@ void *LC32GetAssociatedGuestBuffer(id object, uint32_t requiredCapacity) {
         const uint32_t token = LC32UpdateHostMapping(
             guestSelf, LC32HostMappingBeginGuestTeardown, hostSelf);
         if(!token) abort();
-        [self dealloc];
+        LC32SendGuestDealloc(self);
         if(!LC32UpdateHostMapping(
                 guestSelf,
                 LC32HostMappingFinishGuestTeardownAndReleaseHost,
@@ -777,15 +907,27 @@ void *LC32GetAssociatedGuestBuffer(id object, uint32_t requiredCapacity) {
     return (NSUInteger)host_ret;
 }
 
-#if 0
-// Can't hook this, host crashes with: Application circumvented Objective-C runtime dealloc initiation for <NSObject-like> object.
-- (void)dealloc {
-    static uint64_t _host_cmd;
-    if(!_host_cmd) _host_cmd = LC32GetHostSelector(_cmd);
-    uint64_t host_ret = LC32InvokeHostSelector(self.host_self, _host_cmd);
-    object_dispose(self);
+- (void)LC32_dealloc {
+    /* The original root implementation still destroys guest C++ ivars and
+     * associations before disposing the ARM32 allocation. Detach a dead
+     * native peer's guest key before that allocation becomes reusable; the
+     * host_self creation guard rejects reentry from this remaining cleanup.
+     * This never sends -dealloc to the native peer. */
+    LC32GuestDeallocFrame frame = {
+        (uint32_t)(uintptr_t)self,
+        LC32GuestDeallocStack(),
+    };
+    LC32SetGuestDeallocStack(&frame);
+    @try {
+        if(!LC32UpdateHostMapping(frame.guestObject,
+                LC32HostMappingGuestRootDealloc, 0)) abort();
+        [self LC32_dealloc];
+    } @finally {
+        /* The original root implementation has freed self. Restore only
+         * the saved stack link; do not inspect or message that address. */
+        LC32SetGuestDeallocStack(frame.previous);
+    }
 }
-#endif
 @end
 
 static void addMethodToClass(Class cls, Method method) {
@@ -912,6 +1054,65 @@ static BOOL LC32InvokeGuestBlockCallback(
     return YES;
 }
 
+static BOOL LC32InvokeGuestSelectorCallback(
+        LC32GuestBlockCallbackDescriptor *descriptor) {
+    if(!descriptor || !descriptor->guestBlock || !descriptor->guestInvoke ||
+       descriptor->argumentCount >
+           LC32_GUEST_BLOCK_CALLBACK_MAX_ARGUMENTS ||
+       descriptor->resultKind != LC32GuestBlockValueVoid) {
+        return NO;
+    }
+
+    uint32_t words[LC32_GUEST_BLOCK_CALLBACK_MAX_WORDS] = {
+        descriptor->guestBlock,
+        descriptor->guestInvoke,
+    };
+    uint32_t wordCount = 2;
+    for(uint32_t index = 0; index < descriptor->argumentCount; index++) {
+        LC32GuestBlockCallbackArgument *argument =
+            &descriptor->arguments[index];
+        if(argument->reserved != 0) return NO;
+
+        switch((LC32GuestBlockValueKind)argument->kind) {
+            case LC32GuestBlockValueObject:
+                if(!LC32AppendGuestBlockWord(words, &wordCount,
+                        (uint32_t)(uintptr_t)LC32HostToGuestObject(
+                            argument->value))) return NO;
+                break;
+            case LC32GuestBlockValueSignedChar:
+            case LC32GuestBlockValueSigned32:
+            case LC32GuestBlockValueUnsigned32:
+                if(!LC32AppendGuestBlockWord(
+                        words, &wordCount, (uint32_t)argument->value)) {
+                    return NO;
+                }
+                break;
+            case LC32GuestBlockValueSigned64:
+            case LC32GuestBlockValueUnsigned64:
+                if(!LC32AppendGuestBlockWord(words, &wordCount,
+                        (uint32_t)argument->value) ||
+                   !LC32AppendGuestBlockWord(words, &wordCount,
+                        (uint32_t)(argument->value >> 32))) return NO;
+                break;
+            case LC32GuestBlockValueRange:
+                if(!LC32AppendGuestBlockWord(words, &wordCount,
+                        (uint32_t)argument->value) ||
+                   !LC32AppendGuestBlockWord(words, &wordCount,
+                        (uint32_t)argument->value2)) return NO;
+                break;
+            case LC32GuestBlockValueVoid:
+            case LC32GuestBlockValueCharPointer:
+            default:
+                return NO;
+        }
+    }
+
+    (void)LC32InvokeGuestBlockWords(
+        (uint32_t)(uintptr_t)objc_msgSend, words, wordCount);
+    descriptor->result = 0;
+    return YES;
+}
+
 static BOOL LC32InvokeGuestFunctionCallback(
         LC32GuestBlockCallbackDescriptor *descriptor) {
     if(!descriptor || descriptor->guestBlock || !descriptor->guestInvoke ||
@@ -996,6 +1197,15 @@ static void *LC32GuestCallbackExecutorMain(
                             "for 0x%x\n", descriptor.guestInvoke);
                     }
                     break;
+                case LC32GuestBlockCallbackKindSelector:
+                    if(!LC32InvokeGuestSelectorCallback(&descriptor)) {
+                        fprintf(stderr,
+                            "LC32: invalid guest selector callback "
+                            "descriptor for receiver 0x%x selector 0x%x\n",
+                            descriptor.guestBlock,
+                            descriptor.guestInvoke);
+                    }
+                    break;
                 default:
                     abort();
             }
@@ -1052,6 +1262,7 @@ __attribute__((constructor)) void LC32FrameworkInit() {
     swizzle(clsNSObject, @selector(retainCount), @selector(LC32_retainCount));
     swizzle(clsNSObject, sel_registerName("retainWeakReference"),
             @selector(LC32_retainWeakReference));
+    swizzle(clsNSObject, @selector(dealloc), @selector(LC32_dealloc));
 
     // Send dlsym and LC32InvokeGuestC pointers to the host
     LC32InvokeHostCRet32(LC32Dlsym("LC32SetInvokeGuestFuncPtr", YES), &dlsym, &LC32InvokeGuestC);

@@ -537,6 +537,22 @@ bool Dynarmic_submit_guest_function_callback(
     return SubmitGuestCallback(*descriptor);
 }
 
+bool Dynarmic_submit_guest_selector_callback(
+        const LC32GuestBlockCallbackDescriptor *descriptor) {
+    if(descriptor == nullptr ||
+            descriptor->kind !=
+                LC32GuestBlockCallbackKindSelector ||
+            descriptor->guestBlock == 0 ||
+            descriptor->guestInvoke == 0 ||
+            descriptor->resultKind != LC32GuestBlockValueVoid ||
+            descriptor->argumentCount >
+                LC32_GUEST_BLOCK_CALLBACK_MAX_ARGUMENTS ||
+            Dynarmic_guest_thread_is_registered()) {
+        return false;
+    }
+    return SubmitGuestCallback(*descriptor);
+}
+
 bool Dynarmic_submit_guest_block_release(u32 guestBlock) {
     if(!guestBlock || Dynarmic_guest_thread_is_registered()) {
         return false;

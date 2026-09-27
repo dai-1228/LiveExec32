@@ -33,11 +33,23 @@ audit_image "$FRAMEWORK_DIR/CoreGraphics.framework/CoreGraphics" \
     CGContextSetLineJoin \
     CGContextSetShadow \
     CGContextSetTextMatrix \
+    CGContextGetTextPosition \
+    CGContextSetAllowsAntialiasing \
+    CGContextSetAllowsFontSubpixelPositioning \
+    CGContextSetShouldSubpixelQuantizeFonts \
     CGDataProviderCreateWithCFData \
+    CGDataProviderCopyData \
     CGImageCreateCopy \
+    CGImageRetain \
+    CGColorRetain \
+    CGColorCreateCopy \
+    CGColorSpaceGetNumberOfComponents \
     CGImageCreate \
     CGImageGetDataProvider \
-    CGPathGetBoundingBox
+    CGPathGetBoundingBox \
+    CGPathAddEllipseInRect \
+    CGPathAddQuadCurveToPoint \
+    CGContextSetAlpha
 
 audit_image "$FRAMEWORK_DIR/QuartzCore.framework/QuartzCore" \
     CATransform3DMakeAffineTransform

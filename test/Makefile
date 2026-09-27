@@ -1,23 +1,187 @@
-LC32_HOST_TEST_GOALS := check-guest-bootstrap check-memory-hash
+LC32_HOST_TEST_GOALS := check-guest-bootstrap check-memory-hash \
+  check-coremedia-time-values-host check-debug-logging check-objc-trace check-build-info \
+  check-guest-thumb-linker check-uikit-legacy-rootless-rotation-build \
+  check-scalar-callback-signature check-guest-timer-queue check-legacy-nib-loading \
+  check-mach-exception-ports check-uikit-background-tasks check-mediaplayer-stop \
+  check-foundation-ports-host
 LC32_HOST_ONLY_BUILD := $(if $(strip $(MAKECMDGOALS)),\
   $(if $(strip $(filter-out $(LC32_HOST_TEST_GOALS),$(MAKECMDGOALS))),,1),)
 
 HOST_CXX ?= xcrun --sdk macosx clang++
+HOST_CC ?= xcrun --sdk macosx clang
 HOST_CXXFLAGS ?= -std=c++17 -Wall -Wextra -Werror -pedantic
+HOST_CFLAGS ?= -Wall -Wextra -Werror -pedantic
 HOST_TEST_OUTPUT_DIR ?= $(CURDIR)/.theos/host-tests
+FOUNDATION_PORTS_HOST_TEST := $(HOST_TEST_OUTPUT_DIR)/foundation-ports-host
 GUEST_BOOTSTRAP_HOST_TEST := $(HOST_TEST_OUTPUT_DIR)/guest-bootstrap-host
 MEMORY_HASH_HOST_TEST := $(HOST_TEST_OUTPUT_DIR)/memory-hash-host
+LEGACY_NIB_LOADING_HOST_TEST := $(HOST_TEST_OUTPUT_DIR)/legacy-nib-loading-host
+MACH_EXCEPTION_PORTS_HOST_TEST := $(HOST_TEST_OUTPUT_DIR)/mach-exception-ports-host
+UIKIT_BACKGROUND_TASKS_HOST_TEST := $(HOST_TEST_OUTPUT_DIR)/uikit-background-tasks-host
+MEDIAPLAYER_STOP_HOST_TEST := $(HOST_TEST_OUTPUT_DIR)/mediaplayer-stop-host
+GUEST_TIMER_QUEUE_HOST_TEST := $(HOST_TEST_OUTPUT_DIR)/guest-timer-queue-host
+GUEST_TIMER_QUEUE_HOST_OBJECT := $(HOST_TEST_OUTPUT_DIR)/guest-timer-queue-backend.o
+COREMEDIA_TIME_VALUES_HOST_TEST := \
+  $(HOST_TEST_OUTPUT_DIR)/coremedia-time-values-host
+DEBUG_LOGGING_HOST_TESTS := $(addprefix $(HOST_TEST_OUTPUT_DIR)/debug-logging-,\
+  default disabled enabled)
+OBJC_TRACE_HOST_TESTS := $(addprefix $(HOST_TEST_OUTPUT_DIR)/objc-trace-,\
+  default disabled enabled)
+BUILD_INFO_LOGGING_HOST_TESTS := $(addprefix $(HOST_TEST_OUTPUT_DIR)/build-info-logging-,\
+  present missing)
 
-.PHONY: check-guest-bootstrap check-memory-hash
+.PHONY: check-guest-bootstrap check-memory-hash \
+  check-coremedia-time-values-host check-debug-logging check-objc-trace check-build-info \
+  check-guest-thumb-linker check-uikit-legacy-rootless-rotation-build \
+  check-scalar-callback-signature check-guest-timer-queue check-legacy-nib-loading \
+  check-mach-exception-ports check-uikit-background-tasks check-mediaplayer-stop \
+  check-foundation-ports-host
+check-mediaplayer-stop: $(MEDIAPLAYER_STOP_HOST_TEST)
+	"$(MEDIAPLAYER_STOP_HOST_TEST)"
+
+$(MEDIAPLAYER_STOP_HOST_TEST): mediaplayer_stop_host.m \
+  mediaplayer-stubs/MediaPlayer/MediaPlayer.h mediaplayer-stubs/LC32/LC32.h \
+  ../GuestFrameworks/MediaPlayer/MPMoviePlayerController+LC32Legacy.m
+	@mkdir -p "$(HOST_TEST_OUTPUT_DIR)"
+	$(HOST_CC) -Wall -Wextra -Werror -fblocks -Imediaplayer-stubs -framework Foundation \
+		mediaplayer_stop_host.m \
+		../GuestFrameworks/MediaPlayer/MPMoviePlayerController+LC32Legacy.m -o "$@"
+
+check-uikit-background-tasks: $(UIKIT_BACKGROUND_TASKS_HOST_TEST)
+	"$(UIKIT_BACKGROUND_TASKS_HOST_TEST)"
+
+$(UIKIT_BACKGROUND_TASKS_HOST_TEST): uikit_background_tasks_host.m \
+  background-task-stubs/UIKit/UIKit.h background-task-stubs/LC32/LC32.h \
+  ../GuestFrameworks/UIKit/UIApplication+LC32BlockCompatibility.m
+	@mkdir -p "$(HOST_TEST_OUTPUT_DIR)"
+	$(HOST_CC) -Wall -Wextra -Werror \
+		-fobjc-arc -fblocks -Ibackground-task-stubs -framework Foundation \
+		uikit_background_tasks_host.m \
+		../GuestFrameworks/UIKit/UIApplication+LC32BlockCompatibility.m -o "$@"
+
+check-foundation-ports-host: $(FOUNDATION_PORTS_HOST_TEST)
+	"$(FOUNDATION_PORTS_HOST_TEST)"
+
+$(FOUNDATION_PORTS_HOST_TEST): foundation_ports_host.m \
+  ../HostFrameworks/Foundation/MachPort.mm ../HostFrameworks/Foundation/MachPort.h
+	@mkdir -p "$(HOST_TEST_OUTPUT_DIR)"
+	$(HOST_CC) -fblocks -Wall -Wextra -Wno-unused-parameter -framework Foundation \
+		foundation_ports_host.m ../HostFrameworks/Foundation/MachPort.mm -o "$@"
+
+check-mach-exception-ports: $(MACH_EXCEPTION_PORTS_HOST_TEST)
+	"$(MACH_EXCEPTION_PORTS_HOST_TEST)"
+
+$(MACH_EXCEPTION_PORTS_HOST_TEST): mach_exception_ports_host.cpp \
+  ../HostFrameworks/LC32/guest_mach_exceptions.cpp \
+  ../HostFrameworks/LC32/guest_mach_messages.h
+	@mkdir -p "$(HOST_TEST_OUTPUT_DIR)"
+	$(HOST_CXX) $(HOST_CXXFLAGS) -I../HostFrameworks/LC32 \
+		mach_exception_ports_host.cpp ../HostFrameworks/LC32/guest_mach_exceptions.cpp -o "$@"
+
+check-legacy-nib-loading: $(LEGACY_NIB_LOADING_HOST_TEST)
+	"$(LEGACY_NIB_LOADING_HOST_TEST)"
+
+$(LEGACY_NIB_LOADING_HOST_TEST): legacy_nib_loading_host.mm \
+  ../HostFrameworks/UIKit/LegacyNibLoading.mm \
+  ../HostFrameworks/UIKit/LegacyNibLoading.h
+	@mkdir -p "$(HOST_TEST_OUTPUT_DIR)"
+	$(HOST_CXX) $(HOST_CXXFLAGS) -fobjc-arc -fmodules \
+		-fmodules-cache-path="$(abspath ../.theos/module-cache)" \
+		legacy_nib_loading_host.mm ../HostFrameworks/UIKit/LegacyNibLoading.mm \
+		-framework Foundation -o "$@"
+
+check-guest-thumb-linker:
+	./guest_thumb_linker.sh
+
+check-uikit-legacy-rootless-rotation-build:
+	sh ./uikit_legacy_rootless_rotation.sh --build-only
+
+check-scalar-callback-signature:
+	HOST_CXX="$(HOST_CXX)" python3 scalar_callback_signature.py
+
+check-guest-timer-queue: $(GUEST_TIMER_QUEUE_HOST_TEST)
+	"$(GUEST_TIMER_QUEUE_HOST_TEST)"
+
+$(GUEST_TIMER_QUEUE_HOST_TEST): guest_timer_queue.cpp $(GUEST_TIMER_QUEUE_HOST_OBJECT) \
+  ../HostFrameworks/LC32/guest_timer_queue.h ../HostFrameworks/LC32/mach_private.h
+	$(HOST_CXX) $(HOST_CXXFLAGS) -pthread -I"$(abspath ../HostFrameworks/LC32)" \
+		-Wno-c99-extensions -Wno-embedded-directive \
+		guest_timer_queue.cpp "$(GUEST_TIMER_QUEUE_HOST_OBJECT)" -o "$@"
+
+# Test-only syscall wrapper pauses an expiry after native kevent64 returns;
+# no production hook or alternate timer implementation is involved.
+$(GUEST_TIMER_QUEUE_HOST_OBJECT): ../HostFrameworks/LC32/guest_timer_queue.cpp \
+  ../HostFrameworks/LC32/guest_timer_queue.h \
+  ../HostFrameworks/LC32/mach_private.h
+	@mkdir -p "$(HOST_TEST_OUTPUT_DIR)"
+	$(HOST_CXX) $(HOST_CXXFLAGS) -pthread -I"$(abspath ../HostFrameworks/LC32)" \
+		-Wno-c99-extensions -Wno-embedded-directive \
+		-Dkevent64=LC32TestKevent64 -c ../HostFrameworks/LC32/guest_timer_queue.cpp -o "$@"
+
 check-guest-bootstrap: $(GUEST_BOOTSTRAP_HOST_TEST)
 	"$(GUEST_BOOTSTRAP_HOST_TEST)"
 
 check-memory-hash: $(MEMORY_HASH_HOST_TEST)
 	"$(MEMORY_HASH_HOST_TEST)"
 
+check-coremedia-time-values-host: $(COREMEDIA_TIME_VALUES_HOST_TEST)
+	"$(COREMEDIA_TIME_VALUES_HOST_TEST)"
+
+check-debug-logging: $(DEBUG_LOGGING_HOST_TESTS)
+	"$(HOST_TEST_OUTPUT_DIR)/debug-logging-default"
+	"$(HOST_TEST_OUTPUT_DIR)/debug-logging-disabled"
+	"$(HOST_TEST_OUTPUT_DIR)/debug-logging-enabled"
+
+check-objc-trace: $(OBJC_TRACE_HOST_TESTS)
+	"$(HOST_TEST_OUTPUT_DIR)/objc-trace-default"
+	"$(HOST_TEST_OUTPUT_DIR)/objc-trace-disabled"
+	"$(HOST_TEST_OUTPUT_DIR)/objc-trace-enabled"
+
+check-build-info: $(BUILD_INFO_LOGGING_HOST_TESTS)
+	python3 build_info.py
+	"$(HOST_TEST_OUTPUT_DIR)/build-info-logging-present"
+	"$(HOST_TEST_OUTPUT_DIR)/build-info-logging-missing"
+
+$(HOST_TEST_OUTPUT_DIR)/build-info-logging-present: BUILD_INFO_LOGGING_TEST_FLAGS := \
+  -DLC32_TEST_MG_PRESENT=1
+$(HOST_TEST_OUTPUT_DIR)/build-info-logging-missing: BUILD_INFO_LOGGING_TEST_FLAGS := \
+  -DLC32_TEST_MG_PRESENT=0 -Wl,-U,_LC32TestMGCopyAnswer
+
+$(BUILD_INFO_LOGGING_HOST_TESTS): build_info_logging.m ../HostFrameworks/LC32/log.m Makefile
+	@mkdir -p "$(HOST_TEST_OUTPUT_DIR)"
+	$(HOST_CC) -fmodules -fno-objc-arc -fblocks -Wall -Wextra -Werror \
+		-fmodules-cache-path="$(abspath ../.theos/module-cache)" \
+		-Wno-deprecated-declarations $(BUILD_INFO_LOGGING_TEST_FLAGS) \
+		build_info_logging.m -framework Foundation -o "$@"
+
+$(HOST_TEST_OUTPUT_DIR)/debug-logging-default: DEBUG_LOGGING_TEST_FLAGS := \
+  -ULC32_DEBUG_LOGS -DLC32_TEST_EXPECT_ENABLED=0
+$(HOST_TEST_OUTPUT_DIR)/debug-logging-disabled: DEBUG_LOGGING_TEST_FLAGS := \
+  -ULC32_DEBUG_LOGS -DLC32_DEBUG_LOGS=0 -DLC32_TEST_EXPECT_ENABLED=0
+$(HOST_TEST_OUTPUT_DIR)/debug-logging-enabled: DEBUG_LOGGING_TEST_FLAGS := \
+  -ULC32_DEBUG_LOGS -DLC32_DEBUG_LOGS=1 -DLC32_TEST_EXPECT_ENABLED=1
+
+$(DEBUG_LOGGING_HOST_TESTS): debug_logging.c ../include/LC32DebugLog.h
+	@mkdir -p "$(HOST_TEST_OUTPUT_DIR)"
+	$(HOST_CC) $(HOST_CFLAGS) $(DEBUG_LOGGING_TEST_FLAGS) \
+		-I"$(abspath ../include)" debug_logging.c -o "$@"
+
+$(HOST_TEST_OUTPUT_DIR)/objc-trace-default: OBJC_TRACE_TEST_FLAGS := \
+  -ULC32_OBJC_TRACE -DLC32_TEST_EXPECT_ENABLED=0
+$(HOST_TEST_OUTPUT_DIR)/objc-trace-disabled: OBJC_TRACE_TEST_FLAGS := \
+  -ULC32_OBJC_TRACE -DLC32_OBJC_TRACE=0 -DLC32_TEST_EXPECT_ENABLED=0
+$(HOST_TEST_OUTPUT_DIR)/objc-trace-enabled: OBJC_TRACE_TEST_FLAGS := \
+  -ULC32_OBJC_TRACE -DLC32_OBJC_TRACE=1 -DLC32_TEST_EXPECT_ENABLED=1
+
+$(OBJC_TRACE_HOST_TESTS): objc_trace.c ../include/LC32ObjCTrace.h
+	@mkdir -p "$(HOST_TEST_OUTPUT_DIR)"
+	$(HOST_CC) $(HOST_CFLAGS) -O0 $(OBJC_TRACE_TEST_FLAGS) \
+		-I"$(abspath ../include)" objc_trace.c -o "$@"
+
 $(GUEST_BOOTSTRAP_HOST_TEST): guest_bootstrap_host.cpp \
   ../HostFrameworks/LC32/guest_bootstrap.cpp \
-  ../HostFrameworks/LC32/guest_bootstrap.h
+  ../HostFrameworks/LC32/guest_bootstrap.h \
+  ../include/LC32LegacyBundleLayout.h
 	@mkdir -p "$(HOST_TEST_OUTPUT_DIR)"
 	$(HOST_CXX) $(HOST_CXXFLAGS) \
 		-I"$(abspath ../HostFrameworks/LC32)" \
@@ -32,9 +196,14 @@ $(MEMORY_HASH_HOST_TEST): guest_memory_hash_host.cpp \
 		-I"$(abspath ../HostFrameworks/LC32)" \
 		guest_memory_hash_host.cpp -o "$@"
 
-# Keep this host-native regression test usable on a clean checkout without
-# requiring Theos or bootstrapping the iOS 10.3 guest SDK. Mixed/default goals
-# continue through the normal guest-test declarations below.
+$(COREMEDIA_TIME_VALUES_HOST_TEST): coremedia_time_values.c
+	@mkdir -p "$(HOST_TEST_OUTPUT_DIR)"
+	$(HOST_CC) $(HOST_CFLAGS) coremedia_time_values.c \
+		-framework CoreMedia -framework CoreFoundation -o "$@"
+
+# Host-only checks do not require Theos. The Thumb-linker audit needs a
+# prepared guest SDK; the native tests do not. Mixed/default goals continue
+# through the normal guest-test declarations below.
 ifeq ($(strip $(LC32_HOST_ONLY_BUILD)),)
 
 ARCHS := armv7s
@@ -57,7 +226,7 @@ ROOTFS ?= $(abspath ../Resources/RootFS)
 include ../module-cache.mk
 
 ADDITIONAL_CFLAGS := -Wno-deprecated-module-dot-map
-ADDITIONAL_LDFLAGS := -fno-autolink
+ADDITIONAL_LDFLAGS := -fno-autolink $(LC32_GUEST_LINKER_FLAGS)
 
 include $(THEOS)/makefiles/common.mk
 
@@ -83,8 +252,10 @@ endef
 # its old build_main_only.sh linked an ambient SDK into test/a.out, so it is
 # intentionally retired instead of becoming part of this reproducible suite.
 $(eval $(call lc32_test,lc32-aes-ioctl-abi,aes_ioctl_abi.c,))
+$(eval $(call lc32_test,lc32-aio-read,aio_read.c,))
 $(eval $(call lc32_test,lc32-bind-abi,bind_abi.c,))
 $(eval $(call lc32_test,lc32-connect-nocancel,connect_nocancel.c connect_nocancel.S,))
+$(eval $(call lc32_test,lc32-kernel-control-ioctl,kernel_control_ioctl.c,))
 $(eval $(call lc32_test,lc32-cwd-syscalls,cwd_syscalls.c,))
 $(eval $(call lc32_test,lc32-darwin-eperm,darwin_eperm.c,))
 $(eval $(call lc32_test,lc32-darwin-safe-syscalls,darwin_safe_syscalls.c,))
@@ -93,37 +264,64 @@ $(eval $(call lc32_test,lc32-debugger-stop-main,debugger_stop.c,))
 $(eval $(call lc32_test,lc32-fcntl-filesigs-return,fcntl_filesigs_return.c,))
 $(eval $(call lc32_test,lc32-getsockname-abi,getsockname_abi.c,))
 $(eval $(call lc32_test,lc32-getsockopt-abi,getsockopt_abi.c,))
+$(eval $(call lc32_test,lc32-guest-thumb-linker,guest_thumb_linker.c,))
 $(eval $(call lc32_test,lc32-host-info,host_info.c,))
+$(eval $(call lc32_test,lc32-iconv-smoke,iconv_smoke.c,))
 $(eval $(call lc32_test,lc32-kqueue-kevent,kqueue_kevent.c,))
 $(eval $(call lc32_test,lc32-lseek-abi,lseek_abi.c,))
 $(eval $(call lc32_test,lc32-mremap-encrypted,mremap_encrypted.c,))
 $(eval $(call lc32_test,lc32-native-pthread-smoke,native_pthread_smoke.c,))
+$(eval $(call lc32_test,lc32-psynch-cvwait-handoff,psynch_cvwait_handoff.c,))
 $(eval $(call lc32_test,lc32-recvfrom-abi,recvfrom_abi.c,))
 $(eval $(call lc32_test,lc32-setsockopt-abi,setsockopt_abi.c,))
 $(eval $(call lc32_test,lc32-socket-accept-abi,socket_accept_abi.c,))
+$(eval $(call lc32_test,lc32-statfs-abi,statfs_abi.c,))
 $(eval $(call lc32_test,lc32-sysctl-size-query,sysctl_size_query.c,))
+$(eval $(call lc32_test,lc32-thread-suspend,thread_suspend.c,))
 $(eval $(call lc32_test,lc32-vm-allocate-collision,vm_allocate_collision.c,))
 $(eval $(call lc32_test,lc32-vm-copy,vm_copy.c,))
+$(eval $(call lc32_test,lc32-vm-read-overwrite,vm_copy.c,))
+lc32-vm-read-overwrite_CFLAGS := -DLC32_TEST_VM_READ_OVERWRITE
+$(eval $(call lc32_test,lc32-vm-memory-entry,vm_memory_entry.c,))
+$(eval $(call lc32_test,lc32-vm-purgable,vm_purgable.c,))
+
+# Accelerate.
+$(eval $(call lc32_guest_test,lc32-accelerate-vdsp,accelerate_vdsp.c,Accelerate))
 
 # AudioToolbox.
+$(eval $(call lc32_guest_test,lc32-audio-converter,audio_converter.c,AudioToolbox CoreFoundation LC32))
 $(eval $(call lc32_guest_test,lc32-audio-file-create-packets,audio_file_create_packets.c,AudioToolbox CoreFoundation LC32))
 $(eval $(call lc32_guest_test,lc32-audio-file-smoke,audio_file_smoke.c,AudioToolbox CoreFoundation LC32))
+$(eval $(call lc32_guest_test,lc32-ext-audio-file-wrap,ext_audio_file_wrap.c,AudioToolbox CoreFoundation LC32))
 $(eval $(call lc32_guest_test,lc32-audio-queue-input,audio_queue_input.c,AudioToolbox CoreFoundation LC32))
 $(eval $(call lc32_guest_test,lc32-audio-queue-output,audio_queue_output.c,AudioToolbox CoreFoundation LC32))
 $(eval $(call lc32_guest_test,lc32-audio-session,audio_session.c,AudioToolbox CoreFoundation LC32))
 $(eval $(call lc32_guest_test,lc32-audio-unit-output,audio_unit_output.c,AudioToolbox CoreFoundation LC32))
+$(eval $(call lc32_guest_test,lc32-audio-unit-spatial-mixer,audio_unit_spatial_mixer.c,AudioToolbox CoreFoundation LC32))
 
 # Foundation, CoreFoundation, and bridge behavior.
 $(eval $(call lc32_guest_test,lc32-addressbook-compat,addressbook_compat.m,AddressBook Foundation CoreFoundation))
+$(eval $(call lc32_guest_test,lc32-nsuuid-bytes,nsuuid_bytes.m,Foundation))
 $(eval $(call lc32_guest_test,lc32-arc-proxy-lifetime,arc_proxy_lifetime.m arc_proxy_lifetime_support.m,Foundation UIKit LC32))
 $(eval $(call lc32_guest_test,lc32-block-bridge,block_bridge.m,Foundation LC32))
+$(eval $(call lc32_guest_test,lc32-dispatch-main-queue,dispatch_main_queue.m,Foundation CoreFoundation AVFoundation))
+$(eval $(call lc32_guest_test,lc32-dispatch-timers,dispatch_timers.m,Foundation CoreFoundation))
+$(eval $(call lc32_guest_test,lc32-cfarray-callbacks,cfarray_callbacks.m,Foundation CoreFoundation LC32))
 $(eval $(call lc32_guest_test,lc32-cfdictionary-callbacks,cfdictionary_callbacks.m,Foundation CoreFoundation LC32))
 $(eval $(call lc32_guest_test,lc32-cfset-callbacks,cfset_callbacks.m,Foundation CoreFoundation LC32))
+$(eval $(call lc32_guest_test,lc32-cfnetwork-http,cfnetwork_http.m,CFNetwork CoreFoundation Foundation LC32))
+$(eval $(call lc32_guest_test,lc32-cfnetwork-host-resolution,cfnetwork_host_resolution.m,CFNetwork CoreFoundation Foundation))
 $(eval $(call lc32_guest_test,lc32-collection-object-buffers,collection_object_buffers.m,Foundation))
+$(eval $(call lc32_guest_test,lc32-class-cluster-reuse,class_cluster_reuse.m,Foundation CoreFoundation LC32))
+$(eval $(call lc32_guest_test,lc32-guest-input-stream,guest_input_stream.m,Foundation LC32))
+$(eval $(call lc32_guest_test,lc32-stream-io,stream_io.m,Foundation CoreFoundation LC32))
+lc32-stream-io_CFLAGS := -DLC32_TEST_STREAM_BOUNDS
+$(eval $(call lc32_guest_test,lc32-root-dealloc-reentry,root_dealloc_reentry.m,Foundation LC32))
 $(eval $(call lc32_guest_test,lc32-collection-variadic,collection_variadic.m,Foundation))
 $(eval $(call lc32_guest_test,lc32-corefoundation-attributed-string,corefoundation_attributed_string.m,Foundation CoreFoundation))
 $(eval $(call lc32_guest_test,lc32-corefoundation-bundle-url,corefoundation_bundle_url.m,Foundation CoreFoundation))
 $(eval $(call lc32_guest_test,lc32-corefoundation-common-wrappers,corefoundation_common_wrappers.m,Foundation CoreFoundation))
+$(eval $(call lc32_guest_test,lc32-corefoundation-low-risk,corefoundation_low_risk.m,Foundation CoreFoundation))
 $(eval $(call lc32_guest_test,lc32-corefoundation-read-stream,corefoundation_read_stream.m,Foundation CoreFoundation))
 $(eval $(call lc32_guest_test,lc32-corefoundation-run-loop,corefoundation_run_loop.m,Foundation CoreFoundation))
 $(eval $(call lc32_guest_test,lc32-corefoundation-run-loop-source,corefoundation_run_loop_source.m,Foundation CoreFoundation))
@@ -137,24 +335,53 @@ $(eval $(call lc32_guest_test,lc32-corefoundation-url-propertylist,corefoundatio
 $(eval $(call lc32_guest_test,lc32-corefoundation-url-common,corefoundation_url_common.m,Foundation CoreFoundation))
 $(eval $(call lc32_guest_test,lc32-corefoundation-uuid,corefoundation_uuid.c,Foundation CoreFoundation))
 $(eval $(call lc32_guest_test,lc32-corefoundation-write-stream,corefoundation_write_stream.m,Foundation CoreFoundation))
+$(eval $(call lc32_guest_test,lc32-coremedia-time-values,coremedia_time_values.c,CoreMedia CoreFoundation Foundation))
+$(eval $(call lc32_guest_test,lc32-corevideo-buffers,corevideo_buffers.m,CoreVideo CoreFoundation Foundation OpenGLES))
+$(eval $(call lc32_guest_test,lc32-coredata-merge-policy,coredata_merge_policy.m,CoreData Foundation CoreFoundation LC32))
 $(eval $(call lc32_guest_test,lc32-cxx-lifecycle,cxx_lifecycle.mm,Foundation UIKit LC32))
 $(eval $(call lc32_guest_test,lc32-data-bytes,data_bytes.m,Foundation))
 $(eval $(call lc32_guest_test,lc32-fast-enumeration,fast_enumeration.m,Foundation))
+$(eval $(call lc32_guest_test,lc32-filesystem-capacity,filesystem_capacity.m,Foundation))
+$(eval $(call lc32_guest_test,lc32-gamecontroller-snapshot,gamecontroller_snapshot.m,GameController Foundation CoreFoundation))
+$(eval $(call lc32_guest_test,lc32-gamekit-achievement-properties,gamekit_achievement_properties.m,GameKit Foundation LC32))
 $(eval $(call lc32_test,lc32-foundation-null-utf8,foundation_null_utf8.m,Foundation))
+$(eval $(call lc32_guest_test,lc32-foundation-constants,foundation_constants.m,Foundation CoreFoundation))
+$(eval $(call lc32_guest_test,lc32-foundation-zone,foundation_zone.m,Foundation))
 $(eval $(call lc32_guest_test,lc32-guest-proxy-lifetime,guest_proxy_lifetime.m,Foundation LC32))
 $(eval $(call lc32_guest_test,lc32-kvo-bridge,kvo_bridge.m,Foundation))
+$(eval $(call lc32_guest_test,lc32-kvc-ivar-ownership,kvc_ivar_ownership.m kvc_ivar_ownership_arc.m,Foundation UIKit CoreGraphics LC32))
+kvc_ivar_ownership.m_CFLAGS := -fno-objc-arc
+kvc_ivar_ownership_arc.m_CFLAGS := -fobjc-arc
+$(eval $(call lc32_guest_test,lc32-imageio-roundtrip,imageio_roundtrip.m,ImageIO CoreGraphics CoreFoundation Foundation))
+$(eval $(call lc32_guest_test,lc32-locale-constants,locale_constants.m,Foundation CoreFoundation))
+$(eval $(call lc32_guest_test,lc32-mobilecoreservices-uti,mobilecoreservices_uti.m,MobileCoreServices CoreFoundation))
+$(eval $(call lc32_guest_test,lc32-mediaplayer-legacy,mediaplayer_legacy.m,MediaPlayer CFNetwork Foundation CoreFoundation LC32))
 $(eval $(call lc32_guest_test,lc32-nsrange-bridge,nsrange_bridge.m,Foundation LC32))
-$(eval $(call lc32_guest_test,lc32-nsvalue-bytes,nsvalue_bytes.m,Foundation))
+$(eval $(call lc32_guest_test,lc32-nsvalue-bytes,nsvalue_bytes.m,Foundation QuartzCore LC32))
+$(eval $(call lc32_guest_test,lc32-notification-selector,notification_selector.m,Foundation LC32))
+$(eval $(call lc32_guest_test,lc32-foundation-not-found,foundation_not_found.m,Foundation))
+$(eval $(call lc32_guest_test,lc32-nsproxy-bridge,nsproxy_bridge.m,Foundation LC32))
+$(eval $(call lc32_guest_test,lc32-host-self-sidetable-race,host_self_sidetable_race.m,Foundation LC32))
 $(eval $(call lc32_guest_test,lc32-nullable-guest-cstring,nullable_guest_cstring.c,LC32))
+$(eval $(call lc32_guest_test,lc32-native-proxy-release,native_proxy_release.m,Foundation LC32))
+$(eval $(call lc32_guest_test,lc32-object-out-parameters,object_out_parameters.m,Foundation))
 $(eval $(call lc32_guest_test,lc32-owned-create-copy,owned_create_copy.m,CoreFoundation))
 $(eval $(call lc32_guest_test,lc32-ownership-publication-race,ownership_publication_race.m ownership_publication_race_weak.m,Foundation LC32))
 $(eval $(call lc32_guest_test,lc32-pointer-out-params,pointer_out_params.m,Foundation LC32))
+$(eval $(call lc32_guest_test,lc32-predicate-variadic,predicate_variadic.m,Foundation))
+$(eval $(call lc32_guest_test,lc32-property-list-serialization,property_list_serialization.m,Foundation CoreFoundation))
 $(eval $(call lc32_guest_test,lc32-string-bytes,string_bytes.m,Foundation))
 $(eval $(call lc32_guest_test,lc32-string-format,string_format.m,Foundation))
+$(eval $(call lc32_guest_test,lc32-vm-protect,vm_protect.c,))
+$(eval $(call lc32_guest_test,lc32-foundation-ports,foundation_ports.m,Foundation))
+$(eval $(call lc32_guest_test,lc32-audio-graph,audio_graph.c,AudioToolbox Foundation LC32))
 $(eval $(call lc32_guest_test,lc32-string-get-bytes,string_get_bytes.m,Foundation LC32))
 $(eval $(call lc32_guest_test,lc32-string-range,string_range.m,Foundation))
 $(eval $(call lc32_guest_test,lc32-thread-modes,thread_modes.m,Foundation))
+$(eval $(call lc32_test,lc32-thread-policy,thread_policy.c,))
+$(eval $(call lc32_test,lc32-mach-simple-rpc,mach_simple_rpc.c,))
 $(eval $(call lc32_guest_test,lc32-thread-perform,thread_perform.m,Foundation))
+$(eval $(call lc32_guest_test,lc32-thread-suspend-hostcall,thread_suspend_hostcall.m,Foundation))
 
 # Graphics and text.
 $(eval $(call lc32_guest_test,lc32-coregraphics-bitmap,coregraphics_bitmap.c,CoreGraphics CoreFoundation LC32))
@@ -174,8 +401,16 @@ $(eval $(call lc32_guest_test,lc32-scalar-pointer-bridge,scalar_pointer_bridge.m
 $(eval $(call lc32_guest_test,lc32-text-input-traits,text_input_traits.m,Foundation UIKit LC32))
 $(eval $(call lc32_guest_test,lc32-uikit-appearance,uikit_appearance.m,Foundation UIKit LC32))
 $(eval $(call lc32_guest_test,lc32-uikit-accessibility,uikit_accessibility.m,Foundation UIKit LC32))
+$(eval $(call lc32_guest_test,lc32-uikit-nib-awakening,uikit_nib_awakening.m,Foundation UIKit CoreGraphics LC32))
 $(eval $(call lc32_guest_test,lc32-uikit-image-context,uikit_image_context.m,Foundation UIKit CoreGraphics LC32))
 $(eval $(call lc32_guest_test,lc32-uikit-legacy-device,uikit_legacy_device.m,Foundation UIKit LC32))
+$(eval $(call lc32_guest_test,lc32-uikit-legacy-overlay,uikit_legacy_overlay.m,Foundation UIKit QuartzCore CoreGraphics LC32))
+$(eval $(call lc32_guest_test,lc32-uikit-legacy-root-geometry,uikit_legacy_root_geometry.m,Foundation UIKit QuartzCore CoreGraphics LC32))
+$(eval $(call lc32_guest_test,lc32-uikit-legacy-phone-canvas,uikit_legacy_phone_canvas.m,Foundation UIKit QuartzCore CoreGraphics LC32))
+$(eval $(call lc32_guest_test,lc32-uikit-legacy-rotation-duration,uikit_legacy_rotation_duration.m,Foundation UIKit LC32))
+$(eval $(call lc32_guest_test,lc32-uikit-legacy-nested-renderer,uikit_legacy_nested_renderer.m,Foundation UIKit QuartzCore CoreGraphics LC32))
+$(eval $(call lc32_guest_test,lc32-uikit-legacy-direct-renderer,uikit_legacy_direct_renderer.m,Foundation UIKit QuartzCore CoreGraphics LC32))
+$(eval $(call lc32_guest_test,lc32-uikit-orientation-startup,uikit_orientation_startup.m,Foundation UIKit LC32))
 $(eval $(call lc32_guest_test,lc32-uikit-legacy-string-sizing,uikit_legacy_string_sizing.m,Foundation UIKit CoreGraphics LC32))
 $(eval $(call lc32_guest_test,lc32-uikit-legacy-window-root,uikit_legacy_window_root.m,Foundation UIKit CoreGraphics LC32))
 $(eval $(call lc32_guest_test,lc32-uikit-view-load-reentrancy,uikit_view_load_reentrancy.m,Foundation UIKit CoreGraphics LC32))
@@ -193,7 +428,10 @@ lc32-ownership-publication-race_CFLAGS := -fobjc-arc
 ownership_publication_race.m_CFLAGS := -fno-objc-arc
 
 lc32-block-bridge_CFLAGS := -fblocks
+lc32-dispatch-main-queue_CFLAGS := -fblocks -fno-objc-arc -Wall -Wextra -Werror -Wno-deprecated-declarations
+lc32-dispatch-timers_CFLAGS := -fblocks -fno-objc-arc -Wall -Wextra -Werror
 lc32-thread-modes_CFLAGS := -fblocks
+lc32-thread-suspend-hostcall_CFLAGS := -fno-objc-arc
 lc32-thread-perform_CFLAGS := -fblocks
 
 lc32-corefoundation-attributed-string_CFLAGS := -fno-objc-arc
@@ -213,13 +451,65 @@ lc32-corefoundation-url-common_CFLAGS := -fno-objc-arc
 lc32-corefoundation-write-stream_CFLAGS := -fno-objc-arc
 lc32-coretext-bridge_CFLAGS := -fno-objc-arc
 lc32-foundation-null-utf8_CFLAGS := -fno-objc-arc
+lc32-ext-audio-file-wrap_CFLAGS := -Wall -Wextra -Werror
+lc32-cfnetwork-host-resolution_CFLAGS := -fno-objc-arc -Wall -Wextra -Werror -Wno-deprecated-declarations
+lc32-foundation-constants_CFLAGS := -fno-objc-arc -Wall -Wextra -Werror
+lc32-locale-constants_CFLAGS := -fno-objc-arc -Wall -Wextra -Werror
+lc32-imageio-roundtrip_CFLAGS := -fno-objc-arc -Wall -Wextra -Werror
+lc32-gamekit-achievement-properties_USE_MODULES := 1
+lc32-gamekit-achievement-properties_CFLAGS := -fno-objc-arc \
+	-I$(abspath ../GuestFrameworks) -I$(abspath ../include)
+lc32-object-out-parameters_CFLAGS := -fno-objc-arc
+lc32-property-list-serialization_CFLAGS := -fno-objc-arc -Wno-deprecated-declarations
 lc32-uikit-legacy-window-root_CFLAGS := -fno-objc-arc -Wall -Wextra -Werror
+# Override Theos' clang target, which otherwise takes precedence over a
+# standalone -miphoneos-version-min flag and advertises SDK 10.3.
+lc32-uikit-legacy-overlay_CFLAGS := -fno-objc-arc -target armv7s-apple-ios7.0
+lc32-uikit-legacy-overlay_LDFLAGS += -target armv7s-apple-ios7.0
+lc32-uikit-legacy-root-geometry_CFLAGS := -fno-objc-arc -target armv7s-apple-ios7.0
+lc32-uikit-legacy-root-geometry_LDFLAGS += -target armv7s-apple-ios7.0
+# Exercise the modern fixed-phone container using an SDK-11 host launcher.
+lc32-uikit-legacy-phone-canvas_USE_MODULES := 1
+lc32-uikit-legacy-phone-canvas_CFLAGS := -fno-objc-arc -target armv7s-apple-ios7.0 \
+	-I$(abspath ../GuestFrameworks) -I$(abspath ../include)
+lc32-uikit-legacy-phone-canvas_LDFLAGS += -target armv7s-apple-ios7.0
+# Run under a launcher with effective SDK < 8 to exercise the native adapter.
+lc32-uikit-legacy-rotation-duration_USE_MODULES := 1
+lc32-uikit-legacy-rotation-duration_CFLAGS := -fno-objc-arc -target armv7s-apple-ios7.0 \
+	-I$(abspath ../GuestFrameworks) -I$(abspath ../include)
+lc32-uikit-legacy-rotation-duration_LDFLAGS += -target armv7s-apple-ios7.0
+lc32-uikit-legacy-nested-renderer_USE_MODULES := 1
+lc32-uikit-legacy-nested-renderer_CFLAGS := -fno-objc-arc -target armv7s-apple-ios7.0 \
+	-I$(abspath ../GuestFrameworks) -I$(abspath ../include)
+lc32-uikit-legacy-nested-renderer_LDFLAGS += -target armv7s-apple-ios7.0
+lc32-uikit-legacy-direct-renderer_USE_MODULES := 1
+lc32-uikit-legacy-direct-renderer_CFLAGS := -fno-objc-arc -target armv7s-apple-ios7.0 \
+	-I$(abspath ../GuestFrameworks) -I$(abspath ../include)
+lc32-uikit-legacy-direct-renderer_LDFLAGS += -target armv7s-apple-ios7.0
+lc32-uikit-orientation-startup_CFLAGS := -fno-objc-arc -target armv7s-apple-ios7.0
+lc32-uikit-orientation-startup_LDFLAGS += -target armv7s-apple-ios7.0
+# Per-source flags follow Theos' DEBUG_CFLAGS, which otherwise restore -O0.
+uikit_orientation_startup.m_CFLAGS := -O2
 
 lc32-cxx-lifecycle_CCFLAGS := -std=c++14
 
+lc32-iconv-smoke_LDFLAGS += -liconv
+
 lc32-guest-proxy-lifetime_CFLAGS := -I$(abspath ../include)
+lc32-native-proxy-release_USE_MODULES := 1
+lc32-native-proxy-release_CFLAGS := -fno-objc-arc \
+	-I$(abspath ../GuestFrameworks) -I$(abspath ../include)
+# Theos has one recursive instance per executable. Its DEBUG schema adds -O0
+# after target CFLAGS, so select the optimization for this instance explicitly.
+ifeq ($(THEOS_CURRENT_INSTANCE),lc32-native-proxy-release)
+OPTFLAG = -O2
+DEBUG.CFLAGS := $(filter-out -O0,$(DEBUG.CFLAGS)) $(OPTFLAG)
+endif
 lc32-nsrange-bridge_USE_MODULES := 1
 lc32-nsrange-bridge_CFLAGS := -I$(abspath ../GuestFrameworks) -I$(abspath ../include)
+lc32-nsvalue-bytes_USE_MODULES := 1
+lc32-nsvalue-bytes_CFLAGS := -fno-objc-arc \
+	-I$(abspath ../GuestFrameworks) -I$(abspath ../include)
 lc32-scalar-pointer-bridge_USE_MODULES := 1
 lc32-scalar-pointer-bridge_CFLAGS := -I$(abspath ../GuestFrameworks) -I$(abspath ../include)
 
@@ -228,9 +518,11 @@ lc32-audio-queue-input_CFLAGS := -Wno-deprecated-declarations
 lc32-audio-queue-output_CFLAGS := -Wno-deprecated-declarations -Wno-nonnull
 lc32-audio-session_CFLAGS := -Wno-deprecated-declarations
 lc32-audio-unit-output_CFLAGS := -Wno-deprecated-declarations
+lc32-audio-unit-spatial-mixer_CFLAGS := -Wno-deprecated-declarations
 lc32-darwin-eperm_CFLAGS := -Wno-deprecated-declarations
 lc32-darwin-safe-syscalls_CFLAGS := -Wno-deprecated-declarations
 lc32-mremap-encrypted_CFLAGS := -Wno-deprecated-declarations
+lc32-mediaplayer-legacy_CFLAGS := -Wno-deprecated-declarations
 lc32-security-secitem_CFLAGS := -Wno-deprecated-declarations -Wno-nonnull
 lc32-socket-accept-abi_CFLAGS := -Wno-deprecated-declarations
 lc32-uikit-appearance_CFLAGS := -Wno-deprecated-declarations
@@ -242,15 +534,16 @@ ABI_TESTS := \
   lc32-getsockopt-abi lc32-host-info lc32-kqueue-kevent lc32-lseek-abi \
   lc32-mremap-encrypted lc32-native-pthread-smoke lc32-recvfrom-abi \
   lc32-setsockopt-abi \
-  lc32-socket-accept-abi lc32-sysctl-size-query \
+  lc32-socket-accept-abi lc32-statfs-abi lc32-sysctl-size-query \
   lc32-vm-allocate-collision lc32-vm-copy
 AUDIO_TESTS := $(filter lc32-audio-%,$(TOOL_NAME))
 COREFOUNDATION_TESTS := $(filter lc32-corefoundation-%,$(TOOL_NAME))
-GRAPHICS_TESTS := $(filter lc32-coregraphics-% lc32-quartzcore-% lc32-coretext-% lc32-openal-% lc32-opengles-%,$(TOOL_NAME))
-THREADING_TESTS := lc32-native-pthread-smoke lc32-ownership-publication-race lc32-thread-modes lc32-thread-perform
+GRAPHICS_TESTS := $(filter lc32-coregraphics-% lc32-quartzcore-% lc32-coretext-% lc32-corevideo-% lc32-openal-% lc32-opengles-%,$(TOOL_NAME))
+THREADING_TESTS := lc32-native-pthread-smoke lc32-ownership-publication-race lc32-thread-modes lc32-thread-perform lc32-thread-suspend lc32-thread-suspend-hostcall
 UIKIT_TESTS := $(filter lc32-uikit-%,$(TOOL_NAME)) lc32-guest-fp-return lc32-guest-host-aggregate-arguments lc32-scalar-pointer-bridge lc32-text-input-traits
 
 include $(THEOS_MAKE_PATH)/tool.mk
+include ../GuestMakefile/guest-build-config.mk
 
 # Cover both the normal internal-all fanout and direct per-test targets.
 ifneq ($(strip $(LC32_GUEST_SDK_DEPENDENCY)),)
@@ -283,14 +576,40 @@ after-$(THEOS_CURRENT_INSTANCE)-all::
 	./security_symbols.sh \
 		"$(GUEST_FRAMEWORK_DIR)/Security.framework/Security"
 endif
+ifeq ($(THEOS_CURRENT_INSTANCE),lc32-coremedia-time-values)
+after-$(THEOS_CURRENT_INSTANCE)-all::
+	LC32_GUEST_SDK="$(ISYSROOT)" ./coremedia_time_value_symbols.sh \
+		"$(GUEST_FRAMEWORK_DIR)/CoreMedia.framework/CoreMedia"
+endif
+ifeq ($(THEOS_CURRENT_INSTANCE),lc32-corevideo-buffers)
+after-$(THEOS_CURRENT_INSTANCE)-all::
+	sh ./corevideo_symbols.sh \
+		"$(GUEST_FRAMEWORK_DIR)/CoreVideo.framework/CoreVideo"
+endif
+ifeq ($(THEOS_CURRENT_INSTANCE),lc32-accelerate-vdsp)
+after-$(THEOS_CURRENT_INSTANCE)-all::
+	sh ./accelerate_symbols.sh \
+		"$(GUEST_FRAMEWORK_DIR)/Accelerate.framework/Accelerate"
+endif
 else
 
 SHORT_TESTS := $(patsubst lc32-%,%,$(TOOL_NAME))
 .PHONY: build list frameworks clean-outputs \
   abi audio corefoundation graphics threading uikit \
   check-symbols check-openal check-opengles check-security check-coretext \
-  check-graphics-symbols \
-  check-messenger $(SHORT_TESTS)
+  check-graphics-symbols check-imageio-symbols check-public-constants \
+  check-generated-framework-symbols check-generated-gameplay-symbols \
+  check-generated-ui-framework-symbols \
+  check-generated-public-symbols check-generated-legacy-public-symbols \
+  check-generated-nonui-public-symbols \
+  check-generated-ui-extension-symbols \
+  check-generated-ui-media-public-symbols \
+  check-framework-symbol-ownership \
+  check-foundation-public-symbols \
+  check-foundation-runtime-symbols \
+  check-corefoundation-low-risk-symbols corefoundation-low-risk-framework \
+  foundation-runtime-framework coremedia-time-values-framework \
+  check-coremedia-time-values check-corevideo check-accelerate check-messenger $(SHORT_TESTS)
 
 # Theos' per-instance convenience targets bypass the top-level `all` target,
 # which normally creates the Clang module validation stamp first.
@@ -309,12 +628,35 @@ $(foreach tool,$(TOOL_NAME),$(eval $(patsubst lc32-%,%,$(tool)): $(tool)))
 list:
 	@$(foreach tool,$(TOOL_NAME),printf '%s\n' '$(tool)';)
 
+# Do not let command-line Theos output overrides re-enter the recursive make
+# through MAKEFLAGS after env has removed their ordinary environment values.
+# Target-specific MAKEOVERRIDES preserves flags and the GNU make jobserver.
+frameworks: MAKEOVERRIDES =
 frameworks:
-	$(MAKE) -C ../GuestMakefile
+	env -u THEOS_OBJ_DIR -u THEOS_BUILD_DIR -u DEBUG -u FINALPACKAGE \
+		$(MAKE) -C ../GuestMakefile \
+		THEOS_PROJECT_DIR="$(abspath ../GuestMakefile)" THEOS_SCHEMA=DEFAULT \
+		_THEOS_CLEANED_SCHEMA_SET=
+
+# Symbol checks consume framework products directly.  Route their focused
+# link tests through the one normalized full framework build above instead of
+# starting overlapping recursive builds for several framework goals.
+SYMBOL_TESTS := lc32-openal-smoke lc32-opengles-smoke lc32-accelerate-vdsp \
+  lc32-security-secitem lc32-coretext-font-descriptor \
+  lc32-coregraphics-bitmap lc32-quartzcore-transform \
+  lc32-uikit-accessibility lc32-mobilecoreservices-uti lc32-cfnetwork-http \
+  lc32-foundation-zone lc32-corefoundation-low-risk \
+  lc32-coremedia-time-values lc32-corevideo-buffers lc32-gamecontroller-snapshot
+$(SYMBOL_TESTS): frameworks
 
 check-openal: lc32-openal-smoke
 check-opengles: lc32-opengles-smoke
 check-security: lc32-security-secitem
+coremedia-time-values-framework: frameworks
+lc32-coremedia-time-values: coremedia-time-values-framework
+check-coremedia-time-values: lc32-coremedia-time-values
+check-corevideo: lc32-corevideo-buffers
+check-accelerate: lc32-accelerate-vdsp
 check-coretext: lc32-coretext-font-descriptor
 	./coretext_font_descriptor_symbols.sh \
 		"$(GUEST_FRAMEWORK_DIR)/CoreText.framework/CoreText"
@@ -322,8 +664,65 @@ check-graphics-symbols: lc32-coregraphics-bitmap lc32-quartzcore-transform \
   lc32-uikit-accessibility
 	GUEST_FRAMEWORK_DIR="$(GUEST_FRAMEWORK_DIR)" \
 		./graphics_compat_symbols.sh
-check-symbols: check-openal check-opengles check-security check-coretext \
-  check-graphics-symbols
+check-imageio-symbols: frameworks
+	LC32_GUEST_SDK="$(ISYSROOT)" ./imageio_symbols.sh \
+		"$(GUEST_FRAMEWORK_DIR)/ImageIO.framework/ImageIO"
+check-public-constants: lc32-mobilecoreservices-uti lc32-cfnetwork-http
+	GUEST_FRAMEWORK_DIR="$(GUEST_FRAMEWORK_DIR)" SDKROOT="$(ISYSROOT)" \
+		./public_guest_constants.sh
+check-generated-framework-symbols: frameworks
+	GUEST_FRAMEWORK_DIR="$(GUEST_FRAMEWORK_DIR)" SDKROOT="$(ISYSROOT)" \
+		./generated_framework_symbols.sh
+check-generated-gameplay-symbols: frameworks
+	GUEST_FRAMEWORK_DIR="$(GUEST_FRAMEWORK_DIR)" SDKROOT="$(ISYSROOT)" \
+		./generated_gameplay_symbols.sh
+check-generated-ui-framework-symbols: frameworks lc32-gamecontroller-snapshot
+	GUEST_FRAMEWORK_DIR="$(GUEST_FRAMEWORK_DIR)" \
+		./generated_ui_framework_symbols.sh
+check-generated-public-symbols: frameworks
+	LC32_GUEST_SDK="$(ISYSROOT)" \
+		./generated_public_symbols.sh "$(GUEST_FRAMEWORK_DIR)"
+check-generated-legacy-public-symbols: frameworks
+	LC32_GUEST_SDK="$(ISYSROOT)" \
+		./generated_legacy_public_symbols.sh "$(GUEST_FRAMEWORK_DIR)"
+check-generated-nonui-public-symbols: frameworks
+	LC32_GUEST_SDK="$(ISYSROOT)" \
+		./generated_nonui_public_symbols.sh "$(GUEST_FRAMEWORK_DIR)"
+check-generated-ui-extension-symbols: frameworks
+	GUEST_FRAMEWORK_DIR="$(GUEST_FRAMEWORK_DIR)" SDKROOT="$(ISYSROOT)" \
+		./generated_ui_extension_symbols.sh
+check-generated-ui-media-public-symbols: frameworks
+	LC32_GUEST_SDK="$(ISYSROOT)" \
+		./generated_ui_media_public_symbols.sh "$(GUEST_FRAMEWORK_DIR)"
+check-framework-symbol-ownership: frameworks
+	GUEST_FRAMEWORK_DIR="$(GUEST_FRAMEWORK_DIR)" \
+		./framework_symbol_ownership.sh
+check-foundation-public-symbols: frameworks
+	LC32_GUEST_SDK="$(ISYSROOT)" ./foundation_public_symbols.sh \
+		"$(GUEST_FRAMEWORK_DIR)/Foundation.framework/Foundation"
+foundation-runtime-framework: frameworks
+lc32-foundation-zone: foundation-runtime-framework
+check-foundation-runtime-symbols: lc32-foundation-zone
+	SDKROOT="$(ISYSROOT)" ./foundation_runtime_symbols.sh \
+		"$(GUEST_FRAMEWORK_DIR)/Foundation.framework/Foundation"
+corefoundation-low-risk-framework: frameworks
+lc32-corefoundation-low-risk: corefoundation-low-risk-framework
+check-corefoundation-low-risk-symbols: lc32-corefoundation-low-risk
+	SDKROOT="$(ISYSROOT)" ./corefoundation_low_risk_symbols.sh \
+		"$(GUEST_FRAMEWORK_DIR)/CoreFoundation.framework/CoreFoundation"
+# Recursive framework builds share GuestMakefile/.theos, so keep this aggregate
+# target serial even when the caller supplied -j.
+.NOTPARALLEL: check-symbols
+check-symbols: frameworks check-openal check-opengles check-security check-coretext check-accelerate \
+	check-graphics-symbols check-imageio-symbols check-public-constants \
+	check-generated-framework-symbols check-generated-gameplay-symbols \
+	check-generated-ui-framework-symbols check-generated-public-symbols \
+	check-generated-legacy-public-symbols check-generated-nonui-public-symbols \
+	check-generated-ui-extension-symbols check-generated-ui-media-public-symbols \
+	check-framework-symbol-ownership \
+	check-foundation-public-symbols \
+	check-foundation-runtime-symbols \
+	check-corefoundation-low-risk-symbols check-coremedia-time-values check-corevideo
 
 check-messenger:
 	@test -n "$(MESSENGER)" || { \

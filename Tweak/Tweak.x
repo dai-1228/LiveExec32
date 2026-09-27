@@ -1,16 +1,21 @@
 @import Foundation;
 
 #import <installd/MIExecutableBundle.h>
+#import <MobileCoreServices/LSApplicationProxy.h>
 #import <libroot.h>
 
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #import "FatMachO.h"
+#import "LegacyBundleLayout.h"
 
 @interface MIExecutableBundle (LiveExec32Injector)
 @property (nonatomic, readonly) NSURL *bundleURL;
@@ -19,9 +24,95 @@
     (NSError *__autoreleasing *)error;
 @end
 
+/* Verified in installd 16.5 and 26.1. Keep these declarations direct so a
+ * private-API mismatch produces a useful crash report instead of silently
+ * disabling the compatibility link. */
+@interface MIContainer : NSObject
+@property (nonatomic, readonly) NSURL *containerURL;
+@property (nonatomic, readonly) NSString *identifier;
+@end
+@interface MIBundleContainer : MIContainer
+@property (nonatomic, readonly) MIExecutableBundle *bundle;
+@end
+@interface MIDataContainer : MIContainer
+@end
+@interface MIInstallableBundle : NSObject
+@property (nonatomic, readonly) MIBundleContainer *bundleContainer;
+@property (nonatomic, readonly) MIDataContainer *dataContainer;
+@property (nonatomic, readonly) BOOL isPlaceholderInstall;
+- (BOOL)finalizeInstallationWithError:(NSError *__autoreleasing *)error;
+@end
+
 static NSString *const LC32InjectorErrorDomain =
     @"com.kdt.LiveExec32.Injector";
 static pthread_mutex_t LC32InjectionMutex = PTHREAD_MUTEX_INITIALIZER;
+
+static BOOL LC32BundleNeedsLegacyLayout(NSURL *bundleURL,
+        NSString *bundleIdentifier) {
+    if(![bundleURL isKindOfClass:NSURL.class] || !bundleURL.isFileURL ||
+            ![bundleURL.path.pathExtension isEqualToString:@"app"] ||
+            ![bundleIdentifier isKindOfClass:NSString.class] ||
+            bundleIdentifier.length == 0) return NO;
+    int directory = open(bundleURL.fileSystemRepresentation,
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if(directory < 0) return NO;
+    BOOL eligible = NO;
+    int infoFD = openat(directory, "Info.plist", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    @try {
+      if(infoFD >= 0) {
+        struct stat metadata;
+        if(fstat(infoFD, &metadata) == 0 && S_ISREG(metadata.st_mode) &&
+                metadata.st_size > 0 && metadata.st_size <= 4 * 1024 * 1024) {
+            NSFileHandle *file = [[NSFileHandle alloc]
+                initWithFileDescriptor:infoFD closeOnDealloc:NO];
+            NSData *data = [file readDataOfLength:(NSUInteger)metadata.st_size];
+            id info = [NSPropertyListSerialization propertyListWithData:data
+                options:NSPropertyListImmutable format:NULL error:NULL];
+            if([info isKindOfClass:NSDictionary.class] &&
+                    [info[@"CFBundleIdentifier"] isEqual:bundleIdentifier]) {
+                NSString *name = info[@"CFBundleExecutable"];
+                if([name isKindOfClass:NSString.class] && name.length > 0 &&
+                        [name isEqualToString:name.lastPathComponent] &&
+                        ![name isEqualToString:@"."] && ![name isEqualToString:@".."]) {
+                    int executable = openat(directory, name.fileSystemRepresentation,
+                        O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+                    if(executable >= 0) {
+                        eligible = LC32ExecutableNeedsLegacyBundleLayout(executable);
+                        close(executable);
+                    }
+                }
+            }
+        }
+      }
+    } @finally {
+        if(infoFD >= 0) close(infoFD);
+        close(directory);
+    }
+    return eligible;
+}
+
+static void LC32InstallLegacyOuterLink(NSURL *bundleURL,
+        NSString *bundleIdentifier, NSURL *dataContainerURL) {
+    if(![dataContainerURL isKindOfClass:NSURL.class] ||
+            !dataContainerURL.isFileURL ||
+            !LC32BundleNeedsLegacyLayout(bundleURL, bundleIdentifier)) return;
+    int error = LC32CreateLegacyBundleOuterLink(
+        dataContainerURL.fileSystemRepresentation);
+    if(error != 0) {
+        NSLog(@"LiveExec32Injector: could not create legacy bundle link for %@: %s",
+            bundleIdentifier, strerror(error));
+    }
+}
+
+static BOOL LC32SameDirectory(NSURL *first, NSURL *second) {
+    if(![first isKindOfClass:NSURL.class] || !first.isFileURL ||
+            ![second isKindOfClass:NSURL.class] || !second.isFileURL) return NO;
+    struct stat a, b;
+    return stat(first.fileSystemRepresentation, &a) == 0 &&
+        stat(second.fileSystemRepresentation, &b) == 0 &&
+        S_ISDIR(a.st_mode) && S_ISDIR(b.st_mode) &&
+        a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+}
 
 static NSError *LC32InjectorError(
         NSString *message, NSError *underlyingError) {
@@ -121,7 +212,10 @@ static BOOL LC32InjectArm64ExecutableSliceWithError(
 - (BOOL)_validateWithError:
         (NSError *__autoreleasing *)error {
     NSString *pkgPath = [self.bundleURL.path stringByAppendingPathComponent:@"PkgInfo"];
-    BOOL isPlaceholder = ![NSFileManager.defaultManager fileExistsAtPath:pkgPath];
+    NSString *csPath = [self.bundleURL.path stringByAppendingPathComponent:@"_CodeSignature"];
+    BOOL isPlaceholder = ![NSFileManager.defaultManager fileExistsAtPath:pkgPath] &&
+        ![NSFileManager.defaultManager fileExistsAtPath:csPath];
+        
     BOOL isValid = %orig;
     if(isPlaceholder || self.bundleType != MIBundleTypeUserApp || !isValid)
         return isValid;
@@ -146,6 +240,30 @@ static BOOL LC32InjectArm64ExecutableSliceWithError(
     %orig(uid);
     return 0;
 }
+
+%end
+
+%group LC32InstalldLegacyLayoutHooks
+
+%hook MIInstallableBundle
+
+- (BOOL)finalizeInstallationWithError:(NSError *__autoreleasing *)error {
+    BOOL succeeded = %orig;
+    if(!succeeded || self.isPlaceholderInstall) return succeeded;
+    /* finalize commits the data/bundle containers after verification.
+     * Apple also has a compatibility-link helper, but its highest-SDK
+     * check sees our modern ARM64 shim and its direct-link replacement
+     * policy does not preserve conflicts or implement the two-hop layout. */
+    MIExecutableBundle *bundle = self.bundleContainer.bundle;
+    MIDataContainer *data = self.dataContainer;
+    if(bundle.bundleType == MIBundleTypeUserApp) {
+        LC32InstallLegacyOuterLink(bundle.bundleURL, bundle.identifier,
+            data.containerURL);
+    }
+    return succeeded;
+}
+
+%end
 
 %end
 
@@ -202,6 +320,33 @@ static BOOL LC32InjectArm64ExecutableSliceWithError(
 
 %end
 
+%group LC32TrollStoreLiteLegacyLayoutHooks
+
+%hookf(bool, registerPath, NSString *appPath, BOOL unregister, BOOL forceSystem) {
+    bool succeeded = %orig(appPath, unregister, forceSystem);
+    if(!succeeded || unregister) return succeeded;
+    if(![appPath isKindOfClass:NSString.class] || !appPath.isAbsolutePath)
+        return succeeded;
+    NSURL *bundleURL = [NSURL fileURLWithPath:
+        appPath.stringByResolvingSymlinksInPath isDirectory:YES];
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfURL:
+        [bundleURL URLByAppendingPathComponent:@"Info.plist"]];
+    NSString *identifier = info[@"CFBundleIdentifier"];
+    if(![identifier isKindOfClass:NSString.class] || identifier.length == 0)
+        return succeeded;
+    Class proxyClass = NSClassFromString(@"LSApplicationProxy");
+    LSApplicationProxy *proxy = [proxyClass applicationProxyForIdentifier:identifier];
+    /* registerPath creates the data container and registers its actual
+     * HOME. Never create a container from an incoming identifier at the
+     * earlier signApp stage, or use trollstorehelper's own HOME. */
+    if(proxy.isContainerized && LC32SameDirectory(bundleURL, proxy.bundleURL)) {
+        LC32InstallLegacyOuterLink(proxy.bundleURL, identifier, proxy.dataContainerURL);
+    }
+    return succeeded;
+}
+
+%end
+
 %ctor {
     @autoreleasepool {
         NSString *processName = NSProcessInfo.processInfo.processName;
@@ -217,6 +362,7 @@ static BOOL LC32InjectArm64ExecutableSliceWithError(
                 NSLog(@"LiveExec32Injector: supported MobileInstallation API "
                     "is unavailable; injector disabled");
             }
+            %init(LC32InstalldLegacyLayoutHooks);
         } else if([processName isEqualToString:@"trollstorehelper"] &&
                 [LC32CurrentExecutableBundleIdentifier()
                     isEqualToString:@"com.opa334.TrollStoreLite"]) {
@@ -227,6 +373,13 @@ static BOOL LC32InjectArm64ExecutableSliceWithError(
             } else {
                 NSLog(@"LiveExec32Injector: signApp is unavailable; "
                     "TrollStore Lite injector disabled");
+            }
+            void *registerPathFunction = dlsym(RTLD_DEFAULT, "registerPath");
+            if(registerPathFunction != NULL) {
+                %init(LC32TrollStoreLiteLegacyLayoutHooks,
+                    registerPath = registerPathFunction);
+            } else {
+                NSLog(@"LiveExec32Injector: registerPath is unavailable; TrollStore Lite legacy link setup disabled");
             }
         }
     }

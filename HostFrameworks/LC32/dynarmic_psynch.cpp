@@ -569,16 +569,16 @@ u32 GuestPsynchMutexDrop(
 
 u32 GuestPsynchConditionWait(
         u32 condition, u32 conditionSequence,
-        u32 conditionSSequence, u32 mutex,
+        u32 conditionSSequence, u32 mutex, u32 mutexMgen,
+        u32 mutexUgen, u32 flags,
         int64_t timeoutSeconds, u32 timeoutNanoseconds) {
     if (mutex != 0) {
-        if (NativeGuestThreadIsCurrent()) {
-            (void)WakeNativeGuestThreads(
-                GuestThreadWaitKind::Mutex, mutex, false);
-        } else {
-            (void)WakeGuestThreads(
-                GuestThreadWaitKind::Mutex, mutex, false);
-        }
+        /* libpthread has already dropped user-space ownership. Like XNU's
+         * cvwait, finish the kernel handoff with an ordinary mutexdrop: it
+         * selects the correct fair-share generation (or first-fit waiter)
+         * and preposts the grant if the contender has not entered wait yet.
+         * A plain address-only wake loses that late-arrival handoff. */
+        (void)GuestPsynchMutexDrop(mutex, mutexMgen, mutexUgen, flags);
     }
     if (NativeGuestThreadIsCurrent()) {
         return WaitNativeGuestThread(

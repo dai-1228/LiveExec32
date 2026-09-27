@@ -12,6 +12,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include <atomic>
 
 namespace {
 
@@ -20,6 +21,7 @@ constexpr size_t kMaximumColorComponents = 1024;
 constexpr size_t kMaximumGradientStops = 4096;
 constexpr size_t kMaximumGradientComponentsPerStop = 64;
 constexpr size_t kMaximumPathPoints = 1024u * 1024u;
+constexpr size_t kMaximumFontGlyphs = 1024u * 1024u;
 
 struct BitmapBacking {
     CGContextRef context = nullptr;
@@ -30,6 +32,43 @@ struct BitmapBacking {
     size_t guestByteCount = 0;
     std::unique_ptr<uint8_t[]> bytes;
 };
+
+struct DataProviderBacking {
+    std::vector<uint8_t> bytes;
+    u32 guestInfo = 0;
+    u32 guestData = 0;
+    u32 guestSize = 0;
+    u32 guestRelease = 0;
+    std::atomic<bool> releaseCalled{false};
+};
+
+void ReleaseDataProviderBacking(void *info, const void *, size_t) {
+    std::unique_ptr<std::shared_ptr<DataProviderBacking>> owner(
+        static_cast<std::shared_ptr<DataProviderBacking> *>(info));
+    const auto backing = *owner;
+    backing->releaseCalled.store(true, std::memory_order_release);
+    if(!backing->guestRelease) return;
+    u32 arguments[] = {
+        backing->guestInfo, backing->guestData, backing->guestSize,
+    };
+    if(Dynarmic_guest_thread_is_registered()) {
+        (void)LC32InvokeGuestC(backing->guestRelease, false, 3, arguments);
+        return;
+    }
+    LC32GuestBlockCallbackDescriptor descriptor = {};
+    descriptor.kind = LC32GuestBlockCallbackKindFunction;
+    descriptor.guestInvoke = backing->guestRelease;
+    descriptor.argumentCount = 3;
+    descriptor.resultKind = LC32GuestBlockValueVoid;
+    for(size_t index = 0; index < 3; ++index) {
+        descriptor.arguments[index].kind = LC32GuestBlockValueUnsigned32;
+        descriptor.arguments[index].value = arguments[index];
+    }
+    if(!Dynarmic_submit_guest_function_callback(&descriptor)) {
+        std::fprintf(stderr,
+            "LC32: could not deliver data-provider release callback\n");
+    }
+}
 
 std::mutex bitmapBackingsMutex;
 std::unordered_map<CGContextRef, BitmapBacking *> bitmapBackings;
@@ -434,12 +473,16 @@ u32 LC32_CoreGraphics_Dispatch(u32 opcode, u32 guestCall, u32) {
             SyncBitmapBacking(context, FindBitmapBacking(context));
             return 0;
         }
-        case LC32CoreGraphicsOpContextDrawImage: {
+        case LC32CoreGraphicsOpContextDrawImage:
+        case LC32CoreGraphicsOpContextDrawTiledImage: {
             if(!RequireCoreGraphicsSlots(call, 6)) return 0;
             CGContextRef context = SlotHostObject<CGContextRef>(call, 0);
             CGImageRef image = SlotHostObject<CGImageRef>(call, 5);
             if(!context || !image) return 0;
-            CGContextDrawImage(context, SlotRect(call, 1), image);
+            if(opcode == LC32CoreGraphicsOpContextDrawTiledImage)
+                CGContextDrawTiledImage(context, SlotRect(call, 1), image);
+            else
+                CGContextDrawImage(context, SlotRect(call, 1), image);
             SyncBitmapBacking(context, FindBitmapBacking(context));
             return 0;
         }
@@ -518,6 +561,18 @@ u32 LC32_CoreGraphics_Dispatch(u32 opcode, u32 guestCall, u32) {
                 ? CGColorSpaceGetModel(space)
                 : kCGColorSpaceModelUnknown);
         }
+        case LC32CoreGraphicsOpContextSetAlpha: {
+            if(!RequireCoreGraphicsSlots(call, 2)) return 0;
+            CGContextRef context = SlotHostObject<CGContextRef>(call, 0);
+            if(!context) return 0;
+            CGContextSetAlpha(context, SlotCGFloat(call, 1));
+            return 1;
+        }
+        case LC32CoreGraphicsOpColorSpaceGetNumberOfComponents: {
+            if(!RequireCoreGraphicsSlots(call, 1)) return 0;
+            CGColorSpaceRef space = SlotHostObject<CGColorSpaceRef>(call, 0);
+            return space ? static_cast<u32>(CGColorSpaceGetNumberOfComponents(space)) : 0;
+        }
         case LC32CoreGraphicsOpDataProviderCreateWithFilename: {
             if(!RequireCoreGraphicsSlots(call, 2)) return 0;
             const u32 guestFilename = SlotU32(call, 0);
@@ -549,6 +604,130 @@ u32 LC32_CoreGraphics_Dispatch(u32 opcode, u32 guestCall, u32) {
                 CGDataProviderCreateWithCFData(data);
             return provider
                 ? LC32GuestObjectForOwnedHostObject(provider) : 0;
+        }
+        case LC32CoreGraphicsOpDataProviderCreateWithData: {
+            if(!RequireCoreGraphicsSlots(call, 4)) return 0;
+            const u32 guestData = SlotU32(call, 1);
+            const size_t size = SlotU32(call, 2);
+            if(size > kMaximumBitmapBytes || (size && !guestData) ||
+               static_cast<uint64_t>(guestData) + size >
+                   static_cast<uint64_t>(UINT32_MAX) + 1) return 0;
+            auto backing = std::make_shared<DataProviderBacking>();
+            backing->bytes.resize(size ? size : 1);
+            if(size && Dynarmic_mem_1read(guestData, size,
+                    reinterpret_cast<char *>(backing->bytes.data())) != 0)
+                return 0;
+            backing->guestInfo = SlotU32(call, 0);
+            backing->guestData = guestData;
+            backing->guestSize = static_cast<u32>(size);
+            backing->guestRelease = SlotU32(call, 3);
+            auto *owner = new std::shared_ptr<DataProviderBacking>(backing);
+            CGDataProviderRef provider = CGDataProviderCreateWithData(owner,
+                backing->bytes.data(), size, ReleaseDataProviderBacking);
+            /* CoreGraphics may invoke its release callback synchronously
+             * when creation fails. The creator keeps its own reference so
+             * either failure path can dispose the backing exactly once. */
+            if(!provider &&
+                    !backing->releaseCalled.load(std::memory_order_acquire))
+                delete owner;
+            return provider
+                ? LC32GuestObjectForOwnedHostObject(provider) : 0;
+        }
+        case LC32CoreGraphicsOpDataProviderRelease:
+        case LC32CoreGraphicsOpDataProviderRetain: {
+            if(!RequireCoreGraphicsSlots(call, 1)) return 0;
+            CGDataProviderRef provider =
+                SlotHostObject<CGDataProviderRef>(call, 0);
+            if(!provider ||
+               CFGetTypeID(provider) != CGDataProviderGetTypeID()) return 0;
+            if(opcode == LC32CoreGraphicsOpDataProviderRetain)
+                return LC32GuestObjectForOwnedHostObject(
+                    CGDataProviderRetain(provider));
+            CGDataProviderRelease(provider);
+            return 0;
+        }
+        case LC32CoreGraphicsOpDataProviderCopyData: {
+            if(!RequireCoreGraphicsSlots(call, 1)) return 0;
+            CGDataProviderRef provider =
+                SlotHostObject<CGDataProviderRef>(call, 0);
+            if(!provider ||
+               CFGetTypeID(provider) != CGDataProviderGetTypeID()) return 0;
+            CFDataRef data = CGDataProviderCopyData(provider);
+            return data ? LC32GuestObjectForOwnedHostObject(data) : 0;
+        }
+        case LC32CoreGraphicsOpFontCreateWithDataProvider: {
+            if(!RequireCoreGraphicsSlots(call, 1)) return 0;
+            CGDataProviderRef provider =
+                SlotHostObject<CGDataProviderRef>(call, 0);
+            if(!provider ||
+               CFGetTypeID(provider) != CGDataProviderGetTypeID()) return 0;
+            CGFontRef font = CGFontCreateWithDataProvider(provider);
+            return font ? LC32GuestObjectForOwnedHostObject(font) : 0;
+        }
+        case LC32CoreGraphicsOpFontCopyTableForTag: {
+            if(!RequireCoreGraphicsSlots(call, 2)) return 0;
+            CGFontRef font = SlotHostObject<CGFontRef>(call, 0);
+            if(!font || CFGetTypeID(font) != CGFontGetTypeID()) return 0;
+            CFDataRef table = CGFontCopyTableForTag(font, SlotU32(call, 1));
+            if(!table) return 0;
+            /* CoreGraphics can return a no-copy view into the font's mapped
+             * provider. Keep the guest's Copy result valid even after the
+             * guest releases its font before accessing the table bytes. */
+            CFDataRef data = CFDataCreate(kCFAllocatorDefault,
+                CFDataGetBytePtr(table), CFDataGetLength(table));
+            CFRelease(table);
+            return data ? LC32GuestObjectForOwnedHostObject(data) : 0;
+        }
+        case LC32CoreGraphicsOpFontGetUnitsPerEm:
+        case LC32CoreGraphicsOpFontGetAscent:
+        case LC32CoreGraphicsOpFontGetDescent:
+        case LC32CoreGraphicsOpFontGetCapHeight:
+        case LC32CoreGraphicsOpFontGetXHeight: {
+            if(!RequireCoreGraphicsSlots(call, 1)) return 0;
+            CGFontRef font = SlotHostObject<CGFontRef>(call, 0);
+            if(!font || CFGetTypeID(font) != CGFontGetTypeID()) return 0;
+            int value;
+            switch(opcode) {
+                case LC32CoreGraphicsOpFontGetUnitsPerEm:
+                    value = CGFontGetUnitsPerEm(font); break;
+                case LC32CoreGraphicsOpFontGetAscent:
+                    value = CGFontGetAscent(font); break;
+                case LC32CoreGraphicsOpFontGetDescent:
+                    value = CGFontGetDescent(font); break;
+                case LC32CoreGraphicsOpFontGetCapHeight:
+                    value = CGFontGetCapHeight(font); break;
+                default:
+                    value = CGFontGetXHeight(font); break;
+            }
+            return static_cast<u32>(value);
+        }
+        case LC32CoreGraphicsOpFontGetGlyphAdvances: {
+            if(!RequireCoreGraphicsSlots(call, 4)) return 0;
+            CGFontRef font = SlotHostObject<CGFontRef>(call, 0);
+            const u32 guestGlyphs = SlotU32(call, 1);
+            const size_t count = SlotU32(call, 2);
+            const u32 guestAdvances = SlotU32(call, 3);
+            if(!font || CFGetTypeID(font) != CGFontGetTypeID() ||
+               count > kMaximumFontGlyphs) return 0;
+            if(!count) return 1;
+            static_assert(sizeof(CGGlyph) == 2 && sizeof(int) == 4,
+                "CGFont glyphs and advances must match the ARM32 ABI");
+            const size_t glyphBytes = count * sizeof(CGGlyph);
+            const size_t advanceBytes = count * sizeof(int);
+            if(!guestGlyphs || !guestAdvances ||
+               static_cast<uint64_t>(guestGlyphs) + glyphBytes >
+                   static_cast<uint64_t>(UINT32_MAX) + 1 ||
+               static_cast<uint64_t>(guestAdvances) + advanceBytes >
+                   static_cast<uint64_t>(UINT32_MAX) + 1) return 0;
+
+            std::vector<CGGlyph> glyphs(count);
+            std::vector<int> advances(count);
+            if(Dynarmic_mem_1read(guestGlyphs, glyphBytes,
+                    reinterpret_cast<char *>(glyphs.data())) != 0 ||
+               !CGFontGetGlyphAdvances(font, glyphs.data(), count,
+                   advances.data())) return 0;
+            return Dynarmic_mem_1write(guestAdvances, advanceBytes,
+                reinterpret_cast<char *>(advances.data())) == 0;
         }
         case LC32CoreGraphicsOpImageCreate: {
             if(!RequireCoreGraphicsSlots(call, 11)) return 0;
@@ -714,6 +893,12 @@ u32 LC32_CoreGraphics_Dispatch(u32 opcode, u32 guestCall, u32) {
             CGColorRef color = CGColorCreate(space, hostValues.data());
             return color ? LC32GuestObjectForOwnedHostObject(color) : 0;
         }
+        case LC32CoreGraphicsOpColorEqualToColor: {
+            if(!RequireCoreGraphicsSlots(call, 2)) return 0;
+            CGColorRef color1 = SlotHostObject<CGColorRef>(call, 0);
+            CGColorRef color2 = SlotHostObject<CGColorRef>(call, 1);
+            return CGColorEqualToColor(color1, color2);
+        }
         case LC32CoreGraphicsOpColorGetAlpha: {
             if(!RequireCoreGraphicsSlots(call, 1)) return 0;
             CGColorRef color = SlotHostObject<CGColorRef>(call, 0);
@@ -823,6 +1008,68 @@ u32 LC32_CoreGraphics_Dispatch(u32 opcode, u32 guestCall, u32) {
             if(context && backing) SyncBitmapBacking(context, backing);
             return backing ? backing->guestData : 0;
         }
+        case LC32CoreGraphicsOpContextSetFont: {
+            if(!RequireCoreGraphicsSlots(call, 2)) return 0;
+            CGContextRef context = SlotHostObject<CGContextRef>(call, 0);
+            CGFontRef font = SlotHostObject<CGFontRef>(call, 1);
+            if(context && font && CFGetTypeID(font) == CGFontGetTypeID())
+                CGContextSetFont(context, font);
+            return 0;
+        }
+        case LC32CoreGraphicsOpContextSetFontSize: {
+            if(!RequireCoreGraphicsSlots(call, 2)) return 0;
+            CGContextRef context = SlotHostObject<CGContextRef>(call, 0);
+            if(context) CGContextSetFontSize(context, SlotCGFloat(call, 1));
+            return 0;
+        }
+        case LC32CoreGraphicsOpContextSetTextDrawingMode: {
+            if(!RequireCoreGraphicsSlots(call, 2)) return 0;
+            CGContextRef context = SlotHostObject<CGContextRef>(call, 0);
+            const u32 mode = SlotU32(call, 1);
+            if(context && mode <= kCGTextClip)
+                CGContextSetTextDrawingMode(context,
+                    static_cast<CGTextDrawingMode>(mode));
+            return 0;
+        }
+        case LC32CoreGraphicsOpContextShowGlyphsAtPoint: {
+            if(!RequireCoreGraphicsSlots(call, 5)) return 0;
+            CGContextRef context = SlotHostObject<CGContextRef>(call, 0);
+            const u32 guestGlyphs = SlotU32(call, 3);
+            const size_t count = SlotU32(call, 4);
+            if(!context || !guestGlyphs || !count ||
+               count > kMaximumFontGlyphs ||
+               static_cast<uint64_t>(guestGlyphs) + count * sizeof(CGGlyph) >
+                   static_cast<uint64_t>(UINT32_MAX) + 1) return 0;
+            std::vector<CGGlyph> glyphs(count);
+            if(Dynarmic_mem_1read(guestGlyphs, count * sizeof(CGGlyph),
+                    reinterpret_cast<char *>(glyphs.data())) != 0) return 0;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            CGContextShowGlyphsAtPoint(context, SlotCGFloat(call, 1),
+                SlotCGFloat(call, 2), glyphs.data(), count);
+#pragma clang diagnostic pop
+            SyncBitmapBacking(context, FindBitmapBacking(context));
+            return 1;
+        }
+        case LC32CoreGraphicsOpContextBeginTransparencyLayer: {
+            if(!RequireCoreGraphicsSlots(call, 2)) return 0;
+            CGContextRef context = SlotHostObject<CGContextRef>(call, 0);
+            CFDictionaryRef auxiliaryInfo =
+                SlotHostObject<CFDictionaryRef>(call, 1);
+            if(!context || (auxiliaryInfo &&
+                CFGetTypeID(auxiliaryInfo) != CFDictionaryGetTypeID()))
+                return 0;
+            CGContextBeginTransparencyLayer(context, auxiliaryInfo);
+            return 1;
+        }
+        case LC32CoreGraphicsOpContextEndTransparencyLayer: {
+            if(!RequireCoreGraphicsSlots(call, 1)) return 0;
+            CGContextRef context = SlotHostObject<CGContextRef>(call, 0);
+            if(!context) return 0;
+            CGContextEndTransparencyLayer(context);
+            SyncBitmapBacking(context, FindBitmapBacking(context));
+            return 1;
+        }
         case LC32CoreGraphicsOpContextSaveGState:
         case LC32CoreGraphicsOpContextRestoreGState:
         case LC32CoreGraphicsOpContextBeginPath:
@@ -905,6 +1152,21 @@ u32 LC32_CoreGraphics_Dispatch(u32 opcode, u32 guestCall, u32) {
                     break;
             }
             return 1;
+        }
+        case LC32CoreGraphicsOpContextGetTextPosition: {
+            if(!RequireCoreGraphicsSlots(call, 2)) return 0;
+            CGContextRef context = SlotHostObject<CGContextRef>(call, 0);
+            const u32 guestAddress = SlotU32(call, 1);
+            if(!context || !guestAddress ||
+               static_cast<uint64_t>(guestAddress) + 2 * sizeof(float) >
+                   static_cast<uint64_t>(UINT32_MAX) + 1) return 0;
+            const CGPoint position = CGContextGetTextPosition(context);
+            float guestPosition[] = {
+                static_cast<float>(position.x),
+                static_cast<float>(position.y),
+            };
+            return Dynarmic_mem_1write(guestAddress, sizeof(guestPosition),
+                reinterpret_cast<char *>(guestPosition)) == 0;
         }
         case LC32CoreGraphicsOpContextAddLines: {
             if(!RequireCoreGraphicsSlots(call, 3)) return 0;
@@ -1180,6 +1442,27 @@ u32 LC32_CoreGraphics_Dispatch(u32 opcode, u32 guestCall, u32) {
             CGContextSetLineWidth(context, SlotCGFloat(call, 1));
             return 1;
         }
+        case LC32CoreGraphicsOpContextSetAllowsAntialiasing: {
+            if(!RequireCoreGraphicsSlots(call, 2)) return 0;
+            CGContextRef context = SlotHostObject<CGContextRef>(call, 0);
+            const u32 allowsAntialiasing = SlotU32(call, 1);
+            if(!context || allowsAntialiasing > 1) return 0;
+            CGContextSetAllowsAntialiasing(context, allowsAntialiasing != 0);
+            return 1;
+        }
+        case LC32CoreGraphicsOpContextSetAllowsFontSubpixelPositioning:
+        case LC32CoreGraphicsOpContextSetShouldSubpixelQuantizeFonts: {
+            if(!RequireCoreGraphicsSlots(call, 2)) return 0;
+            CGContextRef context = SlotHostObject<CGContextRef>(call, 0);
+            const u32 enabled = SlotU32(call, 1);
+            if(!context || enabled > 1) return 0;
+            if(static_cast<LC32CoreGraphicsOpcode>(opcode) ==
+                    LC32CoreGraphicsOpContextSetAllowsFontSubpixelPositioning)
+                CGContextSetAllowsFontSubpixelPositioning(context, enabled != 0);
+            else
+                CGContextSetShouldSubpixelQuantizeFonts(context, enabled != 0);
+            return 1;
+        }
         case LC32CoreGraphicsOpContextSetShouldAntialias: {
             if(!RequireCoreGraphicsSlots(call, 2)) return 0;
             CGContextRef context = SlotHostObject<CGContextRef>(call, 0);
@@ -1253,7 +1536,9 @@ u32 LC32_CoreGraphics_Dispatch(u32 opcode, u32 guestCall, u32) {
         }
         case LC32CoreGraphicsOpPathAddArcToPoint:
         case LC32CoreGraphicsOpPathAddCurveToPoint:
-        case LC32CoreGraphicsOpPathAddRect: {
+        case LC32CoreGraphicsOpPathAddRect:
+        case LC32CoreGraphicsOpPathAddEllipseInRect:
+        case LC32CoreGraphicsOpPathAddQuadCurveToPoint: {
             const auto operation =
                 static_cast<LC32CoreGraphicsOpcode>(opcode);
             const u32 expectedSlots =
@@ -1278,8 +1563,15 @@ u32 LC32_CoreGraphics_Dispatch(u32 opcode, u32 guestCall, u32) {
                     SlotCGFloat(call, 8), SlotCGFloat(call, 9),
                     SlotCGFloat(call, 10), SlotCGFloat(call, 11),
                     SlotCGFloat(call, 12), SlotCGFloat(call, 13));
+            } else if(operation == LC32CoreGraphicsOpPathAddQuadCurveToPoint) {
+                CGPathAddQuadCurveToPoint(path, transform,
+                    SlotCGFloat(call, 8), SlotCGFloat(call, 9),
+                    SlotCGFloat(call, 10), SlotCGFloat(call, 11));
             } else {
-                CGPathAddRect(path, transform, SlotRect(call, 8));
+                if(operation == LC32CoreGraphicsOpPathAddEllipseInRect)
+                    CGPathAddEllipseInRect(path, transform, SlotRect(call, 8));
+                else
+                    CGPathAddRect(path, transform, SlotRect(call, 8));
             }
             return 1;
         }

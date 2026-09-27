@@ -1,4 +1,7 @@
 #include "dynarmic_internal.h"
+#include "darwin_file_syscalls.h"
+#include "guest_dispatch.h"
+#include "guest_timers.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -185,6 +188,8 @@ void Dynarmic_nativeDestroy() {
          */
         nativeShutdownRequested.store(
             true, std::memory_order_release);
+        LC32RemoveGuestMainQueueSource();
+        RequestGuestWorkqueueTimersStop();
         StopGuestCallbackExecutor();
         HaltAllGuestJits(LC32HaltReasonExit);
         InterruptDebuggerMachCalls();
@@ -215,6 +220,10 @@ void Dynarmic_nativeDestroy() {
         nativeShutdownRequested.store(
             true, std::memory_order_release);
     }
+    // Disable native run-loop delivery after publishing shutdown, before
+    // destroying the guest JIT and its callback address space.
+    LC32RemoveGuestMainQueueSource();
+    StopGuestWorkqueueTimers();
     StopGuestCallbackExecutor();
 
     {
@@ -243,6 +252,7 @@ void Dynarmic_nativeDestroy() {
         DestroyNativeGuestJit(runtime);
     }
     CloseAllGuestAesFileDescriptors();
+    ClearGuestAioOperations();
 
     Dynarmic::A32::Jit *jit = threadHandle.jit;
     DynarmicCallbacks32 *cb = sharedHandle.cb;
@@ -708,7 +718,7 @@ static u64 Dynarmic_mem_reserve(
         kh_value(memory, k) = page;
     }
 
-    printf("Dynarmic_mem_reserve: 0x%llx-0x%llx\n", address, address + size);
+    LC32_DEBUG_PRINTF("Dynarmic_mem_reserve: 0x%llx-0x%llx\n", address, address + size);
     return address;
 }
 
@@ -782,7 +792,8 @@ u32 Dynarmic_direct_mmap(
 
 u32 Dynarmic_mmap(
         u32 address, u64 size, int protection,
-        int flags, int fildes, u64 off, u64 mask) {
+        int flags, int fildes, u64 off, u64 mask,
+        bool purgable) {
     std::unique_lock<std::recursive_mutex> lock(
         guestVmMutex);
     if(address & DYN_PAGE_MASK) {
@@ -842,9 +853,36 @@ u32 Dynarmic_mmap(
     if (debuggerWritableExecutableFile) {
         hostProtection |= PROT_READ | PROT_WRITE;
     }
-    void *mappingAddress = mmap(
-        NULL, mappingSize, hostProtection,
-        flags & ~MAP_FIXED, fildes, aligned_off);
+    void *mappingAddress = MAP_FAILED;
+    if (purgable) {
+        /*
+         * mmap() creates a non-purgeable VM object. Guest mach_vm_allocate
+         * requests carrying VM_FLAGS_PURGABLE therefore need a real Mach VM
+         * allocation, otherwise their subsequent vm_purgable_control trap
+         * would always fail with KERN_INVALID_ARGUMENT.
+         */
+        if ((flags & MAP_ANONYMOUS) == 0 || fildes != -1 ||
+                aligned_off != 0) {
+            errno = EINVAL;
+        } else {
+            vm_address_t purgableAddress = 0;
+            const kern_return_t result = vm_allocate(
+                mach_task_self(), &purgableAddress, mappingSize,
+                VM_FLAGS_ANYWHERE | VM_FLAGS_PURGABLE);
+            if (result == KERN_SUCCESS) {
+                mappingAddress = reinterpret_cast<void *>(
+                    purgableAddress);
+            } else {
+                errno = result == KERN_NO_SPACE ||
+                        result == KERN_RESOURCE_SHORTAGE
+                    ? ENOMEM : EINVAL;
+            }
+        }
+    } else {
+        mappingAddress = mmap(
+            NULL, mappingSize, hostProtection,
+            flags & ~MAP_FIXED, fildes, aligned_off);
+    }
     if(mappingAddress == MAP_FAILED) {
         fprintf(stderr, "mmap failed[%s->%s:%d]: addr=%p\n", __FILE__, __func__, __LINE__, mappingAddress);
         RollbackGuestPageReservations(
@@ -868,7 +906,7 @@ u32 Dynarmic_mmap(
     u64 addr = reinterpret_cast<u64>(mappingAddress) +
         (off - aligned_off);
 
-    printf("DBG: mmaping host 0x%llx to 0x%x\n", addr, address);
+    LC32_DEBUG_PRINTF("DBG: mmaping host 0x%llx to 0x%x\n", addr, address);
 
 #ifdef LC32_GUEST_MEMORY_WATCH_ADDRESS
     if (GuestMemoryWatchOverlaps(

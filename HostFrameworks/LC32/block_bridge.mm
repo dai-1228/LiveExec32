@@ -922,3 +922,26 @@ extern "C" u32 LC32TestInvokeTypedGuestBlockOnWorker(
     objc_release(nativeBlock);
     return passed;
 }
+
+/* Selector-based NSNotificationCenter observers are represented by native
+ * mirror objects.  Post from an ordinary host worker so the integration test
+ * also covers delivery when that worker has no guest JIT in TLS. */
+extern "C" u32 LC32TestPostNotificationOnWorker(u32, u32, u32) {
+    dispatch_semaphore_t finished = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_global_queue(
+            DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @autoreleasepool {
+            [[NSNotificationCenter defaultCenter]
+                postNotificationName:
+                    @"LC32GuestSelectorWorkerNotification"
+                              object:nil];
+        }
+        dispatch_semaphore_signal(finished);
+    });
+    const long result = dispatch_semaphore_wait(finished,
+        dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+#if !OS_OBJECT_USE_OBJC
+    dispatch_release(finished);
+#endif
+    return result == 0;
+}

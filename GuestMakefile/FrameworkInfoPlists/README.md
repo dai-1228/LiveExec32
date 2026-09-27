@@ -7,3 +7,9 @@ to be mounted.
 refreshing or testing metadata from another mounted system image. Set
 `FRAMEWORK_INFO_ROOT` to use another metadata snapshot without mounting an
 image.
+
+`CoreVideo.plist` is minimal generated compatibility metadata rather than an
+Apple metadata snapshot. Its bundle versions use the current dylib version
+1.5.0 read from the extracted iOS 10.3.3 CoreVideo image; the guest build also
+preserves that image's 1.2.0 compatibility version. No Apple build provenance
+is asserted for this generated plist.

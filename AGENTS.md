@@ -33,7 +33,7 @@ Optional: `gmake LC32_BUILD_CATALYST=1` — rewrites binaries with `vtool -set-b
 
 - `HostFrameworks/LC32/` — emulator core (`dynarmic*.cpp`, `bridge.mm`/`block_bridge.mm`/`bridge.s`, `guest_bootstrap.cpp`, `filesystem.cpp`, `debugger_server.cpp`). `LiveExec32Shared.framework` re-exports via `HostFrameworks/*/Foundation.mm` etc. Entry `App/main.c:1`.
 - `GuestFrameworks/<Framework>/` — hand-written shims (tracked). `GuestFrameworks/.generated/<Framework>/` — generated forwarding shims (ignored, `// Generated file` marker). Generator sources: `Generator/GenerateShimAPI/main.m`, `Generator/templates/`.
-- `GuestLibraries/libiconv/` — guest `libiconv.2.dylib` (installs to `/usr/lib` in RootFS).
+- `GuestMakefile/build-libiconv.sh` — guest `libiconv.2.dylib`, built from the apple-oss-distributions tarball (installs to `/usr/lib` in RootFS via `pack-ramdisk.sh`).
 - `Tweak/` — `LiveExec32Injector` (deb only, `Tweak.x`, `FatMachO.c`, `AdHocSigner.c`). `include/LC32*ABI.h` — bridge ABIs.
 - `ObjCProxy.md:1` explains dual-runtime proxy model.
 

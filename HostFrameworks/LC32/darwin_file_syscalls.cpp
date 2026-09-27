@@ -4,11 +4,56 @@
 
 #include <limits.h>
 #include <poll.h>
+#include <stddef.h>
 #include <sys/uio.h>
 
 namespace {
 
 constexpr size_t LC32MaximumStagedIOBytes = 64 * 1024 * 1024;
+
+/*
+ * Darwin's armv7 aiocb uses four-byte alignment even for its off_t.  Do not
+ * decode it with the native SDK structure: the arm64 layout is 80 bytes while
+ * the guest layout is 48 bytes.
+ */
+struct GuestAiocb {
+    int32_t fileDescriptor;
+    u32 offsetLow;
+    u32 offsetHigh;
+    u32 buffer;
+    u32 byteCount;
+    int32_t requestPriority;
+    int32_t notificationType;
+    int32_t signalNumber;
+    u32 signalValue;
+    u32 notificationFunction;
+    u32 notificationAttributes;
+    int32_t operation;
+};
+
+static_assert(sizeof(GuestAiocb) == 48,
+    "unexpected armv7 aiocb size");
+static_assert(offsetof(GuestAiocb, fileDescriptor) == 0 &&
+              offsetof(GuestAiocb, offsetLow) == 4 &&
+              offsetof(GuestAiocb, buffer) == 12 &&
+              offsetof(GuestAiocb, byteCount) == 16 &&
+              offsetof(GuestAiocb, notificationType) == 24 &&
+              offsetof(GuestAiocb, operation) == 44,
+    "unexpected armv7 aiocb layout");
+
+struct GuestAioCompletion {
+    int error = EINPROGRESS;
+    int32_t result = -1;
+};
+
+std::mutex guestAioOperationsMutex;
+std::unordered_map<u32, GuestAioCompletion> guestAioOperations;
+
+off_t GuestAiocbOffset(const GuestAiocb &controlBlock) {
+    const uint64_t bits = static_cast<uint64_t>(controlBlock.offsetLow) |
+        (static_cast<uint64_t>(controlBlock.offsetHigh) << 32);
+    return static_cast<off_t>(bits);
+}
 
 int GuestPathToHost(u32 guest_path, char host_path[PATH_MAX]) {
     return LC32GuestPathToHost(guest_path, host_path);
@@ -730,4 +775,153 @@ ssize_t guest_pwrite(int syscall_number, int fildes,
         NativeGuestWorkqueueHostBlockExit();
     }
     return result;
+}
+
+int guest_aio_read(u32 guest_control_block) {
+    GuestAiocb controlBlock = {};
+    if (!read_guest_memory_with_permissions(
+            guest_control_block, &controlBlock,
+            sizeof(controlBlock), PROT_READ)) {
+        return return_with_carry_direct(EFAULT, true);
+    }
+
+    /* Callback and signal delivery need guest-lifetime coordination which is
+     * not available here. Support the common zero-initialized SIGEV_NONE form
+     * for now. */
+    if (controlBlock.notificationType != SIGEV_NONE) {
+        return return_with_carry_direct(EINVAL, true);
+    }
+    const off_t offset = GuestAiocbOffset(controlBlock);
+    if (controlBlock.buffer == 0 || offset < 0) {
+        return return_with_carry_direct(EINVAL, true);
+    }
+    if (controlBlock.byteCount > INT_MAX) {
+        return return_with_carry_direct(EINVAL, true);
+    }
+    if (controlBlock.byteCount > LC32MaximumStagedIOBytes) {
+        return return_with_carry_direct(EAGAIN, true);
+    }
+
+    errno = 0;
+    const int descriptorFlags = fcntl(
+        controlBlock.fileDescriptor, F_GETFL);
+    if (descriptorFlags == -1) {
+        return return_with_carry_direct(
+            errno != 0 ? errno : EBADF, true);
+    }
+    if ((descriptorFlags & O_ACCMODE) == O_WRONLY) {
+        return return_with_carry_direct(EBADF, true);
+    }
+    struct stat descriptorStatus = {};
+    if (fstat(controlBlock.fileDescriptor, &descriptorStatus) != 0) {
+        return return_with_carry_direct(
+            errno != 0 ? errno : EBADF, true);
+    }
+    if (S_ISFIFO(descriptorStatus.st_mode) ||
+            S_ISSOCK(descriptorStatus.st_mode)) {
+        return return_with_carry_direct(ESPIPE, true);
+    }
+
+    std::vector<char> buffer;
+    try {
+        buffer.resize(controlBlock.byteCount);
+    } catch (const std::bad_alloc &) {
+        return return_with_carry_direct(EAGAIN, true);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(guestAioOperationsMutex);
+        try {
+            const auto inserted = guestAioOperations.emplace(
+                guest_control_block, GuestAioCompletion{});
+            if (!inserted.second) {
+                return return_with_carry_direct(EAGAIN, true);
+            }
+        } catch (const std::bad_alloc &) {
+            return return_with_carry_direct(EAGAIN, true);
+        }
+    }
+
+    struct HostResult {
+        ssize_t value;
+        int error;
+    };
+    const bool workqueue_may_block = NativeGuestWorkqueueIsCurrent();
+    if (workqueue_may_block) {
+        NativeGuestWorkqueueHostBlockEnter();
+    }
+    const HostResult hostResult = debugger_aware_host_wait(
+        [&] {
+            errno = 0;
+            const ssize_t value = pread(
+                controlBlock.fileDescriptor,
+                buffer.empty() ? nullptr : buffer.data(),
+                buffer.size(), offset);
+            return HostResult{
+                value,
+                value < 0 ? (errno != 0 ? errno : EIO) : 0,
+            };
+        },
+        HostResult{-1, EINTR});
+    if (workqueue_may_block) {
+        NativeGuestWorkqueueHostBlockExit();
+    }
+
+    int completionError = hostResult.error;
+    int32_t completionResult = -1;
+    if (completionError == 0) {
+        if (hostResult.value < 0 ||
+                hostResult.value > INT32_MAX) {
+            completionError = EIO;
+        } else if (hostResult.value != 0 &&
+                !write_guest_memory_with_permissions(
+                    controlBlock.buffer, buffer.data(),
+                    static_cast<size_t>(hostResult.value),
+                    PROT_WRITE)) {
+            completionError = EFAULT;
+        } else {
+            completionResult = static_cast<int32_t>(hostResult.value);
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(guestAioOperationsMutex);
+        auto operation = guestAioOperations.find(guest_control_block);
+        if (operation != guestAioOperations.end()) {
+            operation->second.error = completionError;
+            operation->second.result = completionResult;
+        }
+    }
+    return return_with_carry_direct(0, false);
+}
+
+int guest_aio_error(u32 guest_control_block) {
+    std::lock_guard<std::mutex> lock(guestAioOperationsMutex);
+    const auto operation = guestAioOperations.find(guest_control_block);
+    if (operation == guestAioOperations.end()) {
+        return return_with_carry_direct(EINVAL, true);
+    }
+    return return_with_carry_direct(operation->second.error, false);
+}
+
+int guest_aio_return(u32 guest_control_block) {
+    std::lock_guard<std::mutex> lock(guestAioOperationsMutex);
+    const auto operation = guestAioOperations.find(guest_control_block);
+    if (operation == guestAioOperations.end()) {
+        return return_with_carry_direct(EINVAL, true);
+    }
+    if (operation->second.error == EINPROGRESS) {
+        return return_with_carry_direct(EINPROGRESS, true);
+    }
+
+    const GuestAioCompletion completion = operation->second;
+    guestAioOperations.erase(operation);
+    /* aio_error reports the completion errno. aio_return itself succeeds and
+     * returns the value that read(2) would have returned, including -1. */
+    return return_with_carry_direct(completion.result, false);
+}
+
+void ClearGuestAioOperations() {
+    std::lock_guard<std::mutex> lock(guestAioOperationsMutex);
+    guestAioOperations.clear();
 }

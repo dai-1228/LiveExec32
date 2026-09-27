@@ -41,16 +41,59 @@ const CFStringRef kCFBundleDevelopmentRegionKey =
 const CFStringRef kCFBundleNameKey = CFSTR("CFBundleName");
 const CFStringRef kCFBundleLocalizationsKey = CFSTR("CFBundleLocalizations");
 
+/*
+ * Run-loop common modes is a native pointer sentinel, not an ordinary mode
+ * name. A freshly bridged string with equal contents can strand sources in
+ * a mode which the main run loop never runs. Give the CF/Foundation aliases
+ * one guest identity each and bind them to their native constants below.
+ */
+static LC32ConstantStringProxy LC32CFRunLoopDefaultMode = {
+    __CFConstantStringClassReference, 0x7c8,
+    "kCFRunLoopDefaultMode", sizeof("kCFRunLoopDefaultMode") - 1,
+};
+static LC32ConstantStringProxy LC32CFRunLoopCommonModes = {
+    __CFConstantStringClassReference, 0x7c8,
+    "kCFRunLoopCommonModes", sizeof("kCFRunLoopCommonModes") - 1,
+};
+
 const CFRunLoopMode kCFRunLoopDefaultMode =
-    CFSTR("kCFRunLoopDefaultMode");
+    (CFRunLoopMode)(const void *)&LC32CFRunLoopDefaultMode;
+const CFRunLoopMode kCFRunLoopCommonModes =
+    (CFRunLoopMode)(const void *)&LC32CFRunLoopCommonModes;
+NSString * const NSDefaultRunLoopMode =
+    (NSString *)(void *)&LC32CFRunLoopDefaultMode;
+NSString * const NSRunLoopCommonModes =
+    (NSString *)(void *)&LC32CFRunLoopCommonModes;
 
 /* These CFStream constants are exported by CoreFoundation on iOS 10. */
+const int kCFStreamErrorDomainSSL = 3;
+const int kCFStreamErrorDomainSOCKS = 5;
 const CFStringRef kCFStreamPropertyShouldCloseNativeSocket =
     CFSTR("kCFStreamPropertyShouldCloseNativeSocket");
 const CFStreamPropertyKey kCFStreamPropertySocketNativeHandle =
     CFSTR("kCFStreamPropertySocketNativeHandle");
+const CFStringRef kCFStreamPropertySOCKSPassword =
+    CFSTR("kCFStreamPropertySOCKSPassword");
+const CFStringRef kCFStreamPropertySOCKSProxy =
+    CFSTR("kCFStreamPropertySOCKSProxy");
+const CFStringRef kCFStreamPropertySOCKSProxyHost = CFSTR("SOCKSProxy");
+const CFStringRef kCFStreamPropertySOCKSProxyPort = CFSTR("SOCKSPort");
+const CFStringRef kCFStreamPropertySOCKSUser =
+    CFSTR("kCFStreamPropertySOCKSUser");
+const CFStringRef kCFStreamPropertySOCKSVersion =
+    CFSTR("kCFStreamPropertySOCKSVersion");
+const CFStringRef kCFStreamPropertySocketSecurityLevel =
+    CFSTR("kCFStreamPropertySocketSecurityLevel");
+const CFStringRef kCFStreamSocketSOCKSVersion4 =
+    CFSTR("kCFStreamSocketSOCKSVersion4");
+const CFStringRef kCFStreamSocketSOCKSVersion5 =
+    CFSTR("kCFStreamSocketSOCKSVersion5");
 const CFStringRef kCFStreamSocketSecurityLevelNegotiatedSSL =
     CFSTR("kCFStreamSocketSecurityLevelNegotiatedSSL");
+const CFStringRef kCFStreamSocketSecurityLevelNone =
+    CFSTR("kCFStreamSocketSecurityLevelNone");
+const CFStringRef kCFStreamSocketSecurityLevelSSLv2 =
+    CFSTR("kCFStreamSocketSecurityLevelSSLv2");
 const CFStringRef kCFStreamSocketSecurityLevelSSLv3 =
     CFSTR("kCFStreamSocketSecurityLevelSSLv3");
 const CFStringRef kCFStreamSocketSecurityLevelTLSv1 =
@@ -250,11 +293,15 @@ NSString * const NSMallocException = @"NSMallocException";
 NSString * const NSRangeException = @"NSRangeException";
 NSString * const NSLocaleCountryCode = @"kCFLocaleCountryCodeKey";
 NSString * const NSLocaleCurrencyCode = @"currency";
+const NSLocaleKey NSLocaleCurrencySymbol = @"kCFLocaleCurrencySymbolKey";
 NSString * const NSLocaleIdentifier = @"kCFLocaleIdentifierKey";
 NSString * const NSLocaleLanguageCode = @"kCFLocaleLanguageCodeKey";
 NSNotificationName const NSCurrentLocaleDidChangeNotification =
     @"kCFLocaleCurrentLocaleDidChangeNotification";
-NSString * const NSRunLoopCommonModes = @"kCFRunLoopCommonModes";
+const NSStreamPropertyKey NSStreamDataWrittenToMemoryStreamKey =
+    @"kCFStreamPropertyDataWritten";
+const NSStreamPropertyKey NSStreamFileCurrentOffsetKey =
+    @"kCFStreamPropertyFileCurrentOffset";
 NSString * const NSURLIsExcludedFromBackupKey =
     @"NSURLIsExcludedFromBackupKey";
 
@@ -281,6 +328,24 @@ const CFDictionaryKeyCallBacks kCFCopyStringDictionaryKeyCallBacks = {
     LC32CFObjectHash,
 };
 
+const CFBagCallBacks kCFTypeBagCallBacks = {
+    0,
+    __CFTypeCollectionRetain,
+    __CFTypeCollectionRelease,
+    (CFBagCopyDescriptionCallBack)CFCopyDescription,
+    (CFBagEqualCallBack)CFEqual,
+    LC32CFObjectHash,
+};
+
+const CFBagCallBacks kCFCopyStringBagCallBacks = {
+    0,
+    LC32CFCopyString,
+    __CFTypeCollectionRelease,
+    (CFBagCopyDescriptionCallBack)CFCopyDescription,
+    (CFBagEqualCallBack)CFEqual,
+    LC32CFObjectHash,
+};
+
 const CFSetCallBacks kCFTypeSetCallBacks = {
     0,
     __CFTypeCollectionRetain,
@@ -288,6 +353,29 @@ const CFSetCallBacks kCFTypeSetCallBacks = {
     (CFSetCopyDescriptionCallBack)CFCopyDescription,
     (CFSetEqualCallBack)CFEqual,
     LC32CFObjectHash,
+};
+
+const CFSetCallBacks kCFCopyStringSetCallBacks = {
+    0,
+    LC32CFCopyString,
+    __CFTypeCollectionRelease,
+    (CFSetCopyDescriptionCallBack)CFCopyDescription,
+    (CFSetEqualCallBack)CFEqual,
+    LC32CFObjectHash,
+};
+
+static CFComparisonResult LC32CFStringBinaryHeapCompare(
+        const void *left, const void *right, void *context) {
+    (void)context;
+    return CFStringCompare((CFStringRef)left, (CFStringRef)right, 0);
+}
+
+const CFBinaryHeapCallBacks kCFStringBinaryHeapCallBacks = {
+    0,
+    __CFTypeCollectionRetain,
+    __CFTypeCollectionRelease,
+    CFCopyDescription,
+    LC32CFStringBinaryHeapCompare,
 };
 
 /*
@@ -354,6 +442,10 @@ static id LC32CreateCoreFoundationConstantProxy(const char *className,
 
 __attribute__((constructor))
 static void LC32InitializeCoreFoundationObjectConstants(void) {
+    LC32BindHostObjectConstant((id)kCFRunLoopDefaultMode,
+        "kCFRunLoopDefaultMode");
+    LC32BindHostObjectConstant((id)kCFRunLoopCommonModes,
+        "kCFRunLoopCommonModes");
     LC32CFBooleanTrue = (CFBooleanRef)
         LC32CreateCoreFoundationConstantProxy(
             "LC32CFImmortalNumber", "kCFBooleanTrue");

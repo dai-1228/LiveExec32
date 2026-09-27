@@ -8,6 +8,7 @@ STRIP = 0
 TARGET_CODESIGN =
 
 include module-cache.mk
+include version.mk
 
 include $(THEOS)/makefiles/common.mk
 
@@ -34,7 +35,6 @@ LiveExec32_LDFLAGS = \
 	-Wl,-rpath,@loader_path/.jbroot/Applications/LiveExec32.app/Frameworks \
 	-Wl,-rpath,/var/jb/Applications/LiveExec32.app/Frameworks \
 	-Wl,-rpath,/var/jb/usr/lib
-LiveExec32_FRAMEWORKS = UIKit
 LiveExec32_RESOURCE_DIRS = Resources
 
 SHARED_FRAMEWORK_BUILD := \
@@ -60,6 +60,7 @@ before-LiveExec32-all::
 # only touches aggregate copies; restoring the launcher from its architecture
 # product also makes Catalyst -> iOS mode switches incremental.
 after-LiveExec32-all::
+	$(call lc32_stamp_version,$(THEOS_OBJ_DIR)/LiveExec32.app/Info.plist)
 	@set -e; \
 	frameworks="$(THEOS_OBJ_DIR)/LiveExec32.app/Frameworks"; \
 	mkdir -p "$$frameworks/LiveExec32Shared.framework" \

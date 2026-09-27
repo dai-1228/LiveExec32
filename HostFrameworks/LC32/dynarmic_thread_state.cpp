@@ -1,4 +1,5 @@
 #include "dynarmic_internal.h"
+#include "guest_timers.h"
 
 NativeThreadStateSlot mainNativeThreadState;
 std::recursive_mutex guestThreadMutex;
@@ -260,6 +261,41 @@ static NativeThreadStateSlot *CurrentNativeThreadStateSlot() {
         : &mainNativeThreadState;
 }
 
+/* A native call may continue while its guest register file is quiescent, but
+ * its return/callback must not re-enter a suspended guest. Keep the check and
+ * the caller's quiescence transition under registerAccessMutex together: the
+ * suspender takes that same mutex before acknowledging a native host call.
+ * Lock ordering for these two locks is registerAccessMutex -> mutex. */
+static std::unique_lock<std::mutex> LockUnsuspendedGuestRegisters(
+        NativeThreadStateSlot &slot) {
+    for (;;) {
+        std::unique_lock<std::mutex> registers(slot.registerAccessMutex);
+        /* Ordinary host calls pay only an atomic load beyond their existing
+         * register lock. If a suspend races this zero check, its quiescent
+         * acknowledgement must still acquire this lock after our transition. */
+        if (slot.suspendCount.load(std::memory_order_acquire) == 0) {
+            return registers;
+        }
+        std::unique_lock<std::mutex> state(slot.mutex);
+        if (slot.suspendCount == 0 || slot.ownerExited ||
+                nativeGuestThreadRetiring ||
+                nativeShutdownRequested.load(std::memory_order_acquire) ||
+                guestProcessExitRequested.load(std::memory_order_acquire)) {
+            return registers;
+        }
+        SaveGuestContext(slot.snapshot);
+        slot.snapshotValid = true;
+        slot.suspendAcknowledged = true;
+        slot.acknowledgedGeneration = slot.requestedGeneration;
+        slot.condition.notify_all();
+        registers.unlock();
+        state.unlock();
+        (void)NativeDebuggerPauseHostWaitIfNeeded();
+        state.lock();
+        (void)slot.condition.wait_for(state, std::chrono::milliseconds(20));
+    }
+}
+
 /*
  * Generic Objective-C/C host calls are not necessarily backed by one of the
  * interruptible Mach waits tracked elsewhere in this file.  Once an outer
@@ -357,33 +393,34 @@ static bool NativeDebuggerResumeQuiescentHostCall(
  * invocation; a nested host-to-guest callback temporarily revokes it before
  * saving or changing registers.
  */
-void NativeGuestHostCallEnter() {
+NativeGuestHostCallState NativeGuestHostCallEnter() {
     NativeThreadStateSlot *slot =
         CurrentNativeThreadStateSlot();
     if (slot == nullptr) {
-        return;
+        return {};
     }
-    std::lock_guard<std::mutex> lock(
-        slot->registerAccessMutex);
+    auto lock = LockUnsuspendedGuestRegisters(*slot);
     ++slot->hostCallDepth;
     /* Argument marshalling is still guest work.  The bridge explicitly
      * publishes quiescence only around the actual native invocation. */
     slot->hostRegistersQuiescent = false;
+    return {slot, slot->hostCallQuiescenceDepth};
 }
 
-void NativeGuestHostCallExit() {
-    NativeThreadStateSlot *slot =
-        CurrentNativeThreadStateSlot();
+void NativeGuestHostCallExit(const NativeGuestHostCallState &state) {
+    NativeThreadStateSlot *slot = state.slot;
     if (slot == nullptr) {
         return;
     }
-    std::lock_guard<std::mutex> lock(
-        slot->registerAccessMutex);
+    assert(slot == CurrentNativeThreadStateSlot());
+    auto lock = LockUnsuspendedGuestRegisters(*slot);
     assert(slot->hostCallDepth != 0);
-    /* A host-to-guest callback may contain a nested host call while the
-     * outer native invocation's quiescence scope remains on its stack. */
-    assert(slot->hostCallQuiescenceDepth <
-        slot->hostCallDepth);
+    /* One host call can nest several native quiescence scopes, for example
+     * receiver-guard release followed by a final mirror release. A callback
+     * may reenter the guest while all those scopes remain on the native
+     * stack, so their count need not be less than the host-call count.
+     * Only scopes opened by this call must have ended before it returns. */
+    assert(slot->hostCallQuiescenceDepth == state.quiescenceDepth);
     --slot->hostCallDepth;
     /* The host return value has not yet been written to the guest JIT. */
     slot->hostRegistersQuiescent = false;
@@ -399,8 +436,7 @@ bool Dynarmic_guest_host_call_quiescence_begin() {
 
     bool registersQuiescent;
     {
-        std::lock_guard<std::mutex> lock(
-            slot->registerAccessMutex);
+        auto lock = LockUnsuspendedGuestRegisters(*slot);
         if (slot->hostCallDepth == 0) {
             return false;
         }
@@ -438,8 +474,7 @@ void Dynarmic_guest_host_call_quiescence_end() {
         (void)NativeDebuggerResumeQuiescentHostCall(true);
     }
     {
-        std::lock_guard<std::mutex> lock(
-            slot->registerAccessMutex);
+        auto lock = LockUnsuspendedGuestRegisters(*slot);
         assert(slot->hostCallQuiescenceDepth != 0);
         --slot->hostCallQuiescenceDepth;
         slot->hostRegistersQuiescent = false;
@@ -455,8 +490,7 @@ void NativeGuestCallbackRegisterAccessBegin() {
     /* A reverse callback is guest execution, so it must own an open epoch. */
     (void)NativeDebuggerResumeQuiescentHostCall(false);
     {
-        std::lock_guard<std::mutex> lock(
-            slot->registerAccessMutex);
+        auto lock = LockUnsuspendedGuestRegisters(*slot);
         ++slot->guestCallbackDepth;
         slot->hostRegistersQuiescent = false;
     }
@@ -516,8 +550,8 @@ bool NativeThreadStatePauseRequestedForCurrent() {
         return false;
     }
     std::lock_guard<std::mutex> lock(slot->mutex);
-    return slot->requestedGeneration >
-        slot->releasedGeneration;
+    return slot->suspendCount != 0 ||
+        slot->requestedGeneration > slot->releasedGeneration;
 }
 
 /*
@@ -535,8 +569,8 @@ static bool PublishNativeThreadStateAndWaitIfNeeded() {
 
     std::unique_lock<std::mutex> lock(slot->mutex);
     bool paused = false;
-    while (slot->requestedGeneration >
-            slot->releasedGeneration &&
+    while ((slot->suspendCount != 0 ||
+            slot->requestedGeneration > slot->releasedGeneration) &&
             !slot->ownerExited &&
             !nativeGuestThreadRetiring &&
             !nativeShutdownRequested.load(
@@ -545,22 +579,21 @@ static bool PublishNativeThreadStateAndWaitIfNeeded() {
                 std::memory_order_acquire)) {
         const uint64_t generation =
             slot->requestedGeneration;
-        if (slot->acknowledgedGeneration < generation) {
+        if (slot->acknowledgedGeneration < generation ||
+                (slot->suspendCount != 0 && !slot->suspendAcknowledged)) {
             SaveGuestContext(slot->snapshot);
             slot->snapshotValid = true;
             slot->acknowledgedGeneration = generation;
         }
+        slot->suspendAcknowledged = slot->suspendCount != 0;
         paused = true;
         slot->condition.notify_all();
-        slot->condition.wait(lock, [slot, generation] {
-            return slot->releasedGeneration >= generation ||
-                slot->ownerExited ||
-                nativeGuestThreadRetiring ||
-                nativeShutdownRequested.load(
-                    std::memory_order_acquire) ||
-                guestProcessExitRequested.load(
-                    std::memory_order_acquire);
-        });
+        lock.unlock();
+        (void)NativeDebuggerPauseHostWaitIfNeeded();
+        lock.lock();
+        /* A suspended owner must still acknowledge subsequent get_state
+         * requests. Recheck generations as well as suspend counts on wake. */
+        (void)slot->condition.wait_for(lock, std::chrono::milliseconds(20));
     }
 
     Dynarmic::A32::Jit *jit = threadHandle.jit;
@@ -586,17 +619,19 @@ static bool AcknowledgeNestedNativeThreadStateRequest() {
         return false;
     }
     std::lock_guard<std::mutex> lock(slot->mutex);
-    if (slot->requestedGeneration <=
-            slot->releasedGeneration ||
-            slot->acknowledgedGeneration >=
-                slot->requestedGeneration ||
-            slot->ownerExited) {
+    const bool snapshotPending = slot->requestedGeneration >
+            slot->releasedGeneration &&
+        slot->acknowledgedGeneration < slot->requestedGeneration;
+    const bool suspensionPending = slot->suspendCount != 0 &&
+        !slot->suspendAcknowledged;
+    if ((!snapshotPending && !suspensionPending) || slot->ownerExited) {
         return false;
     }
     SaveGuestContext(slot->snapshot);
     slot->snapshotValid = true;
     slot->acknowledgedGeneration =
         slot->requestedGeneration;
+    slot->suspendAcknowledged = slot->suspendCount != 0;
     slot->condition.notify_all();
     return true;
 }
@@ -626,6 +661,8 @@ void NativeThreadStateOwnerExited(
         NativeThreadStateSlot &slot) {
     std::lock_guard<std::mutex> lock(slot.mutex);
     slot.ownerExited = true;
+    slot.suspendCount = 0;
+    slot.suspendAcknowledged = false;
     slot.releasedGeneration = std::max(
         slot.releasedGeneration,
         slot.requestedGeneration);
@@ -643,6 +680,8 @@ void ResetNativeThreadStateSlot(
         slot.snapshot = {};
         slot.snapshotValid = false;
         slot.ownerExited = false;
+        slot.suspendCount = 0;
+        slot.suspendAcknowledged = false;
         slot.condition.notify_all();
     }
     {
@@ -698,6 +737,16 @@ static kern_return_t RequestNativeThreadStateSnapshot(
     };
     if (jit == nullptr || callbacks == nullptr) {
         return finish(KERN_FAILURE);
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(slot.mutex);
+        if (slot.suspendCount != 0 && slot.suspendAcknowledged &&
+                slot.snapshotValid) {
+            snapshot = slot.snapshot;
+            lock.unlock();
+            return finish(KERN_SUCCESS);
+        }
     }
 
     if (TryCopyQuiescentNativeThreadState(
@@ -817,10 +866,184 @@ static kern_return_t RequestNativeThreadStateSnapshot(
     slot.releasedGeneration = std::max(
         slot.releasedGeneration, generation);
     /* Serialize clearing the old level-triggered bit with the next request. */
-    jit->ClearHalt(LC32HaltReasonThreadState);
+    if (slot.suspendCount == 0) {
+        jit->ClearHalt(LC32HaltReasonThreadState);
+    }
     slot.condition.notify_all();
     lock.unlock();
     return finish(succeeded ? KERN_SUCCESS : KERN_ABORTED);
+}
+
+static void AcknowledgeQuiescentGuestSuspension(
+        NativeThreadStateSlot &slot, Dynarmic::A32::Jit *jit,
+        DynarmicCallbacks32 *callbacks) {
+    std::lock_guard<std::mutex> registers(slot.registerAccessMutex);
+    if (!slot.hostRegistersQuiescent || slot.hostCallDepth == 0 ||
+            slot.hostCallQuiescenceDepth == 0 || slot.guestCallbackDepth != 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> state(slot.mutex);
+    if (slot.suspendCount == 0 || slot.suspendAcknowledged || slot.ownerExited) {
+        return;
+    }
+    slot.snapshot.regs = jit->Regs();
+    slot.snapshot.extRegs = jit->ExtRegs();
+    slot.snapshot.cpsr = jit->Cpsr();
+    slot.snapshot.fpscr = jit->Fpscr();
+    slot.snapshot.uro = DynarmicCallbacks32CP15(callbacks)->uro;
+    slot.snapshotValid = true;
+    slot.suspendAcknowledged = true;
+    slot.acknowledgedGeneration = slot.requestedGeneration;
+    slot.condition.notify_all();
+}
+
+static void AcknowledgeDebuggerStoppedGuestSuspension(
+        NativeThreadStateSlot &slot, Dynarmic::A32::Jit *jit,
+        DynarmicCallbacks32 *callbacks, NativeGuestJit *runtime) {
+    if (!NativeDebuggerActive()) {
+        return;
+    }
+    /* A debugger-stopped worker cannot service a newly armed JIT halt until
+     * Continue. Its register file is already stable under the coordinator,
+     * so acknowledge now rather than trapping the suspender in an all-stop.
+     * The persistent halt and host-call gates keep it suspended on Continue. */
+    std::lock_guard<std::mutex> debugger(nativeDebugger.mutex);
+    if (runtime == nullptr || runtime->debuggerExecuting) {
+        return;
+    }
+    std::lock_guard<std::mutex> state(slot.mutex);
+    if (slot.suspendCount == 0 || slot.suspendAcknowledged || slot.ownerExited) {
+        return;
+    }
+    slot.snapshot.regs = jit->Regs();
+    slot.snapshot.extRegs = jit->ExtRegs();
+    slot.snapshot.cpsr = jit->Cpsr();
+    slot.snapshot.fpscr = jit->Fpscr();
+    slot.snapshot.uro = DynarmicCallbacks32CP15(callbacks)->uro;
+    slot.snapshotValid = true;
+    slot.suspendAcknowledged = true;
+    slot.acknowledgedGeneration = slot.requestedGeneration;
+    slot.condition.notify_all();
+}
+
+kern_return_t ChangeGuestThreadSuspendCount(mach_port_t target, bool suspend) {
+    if (!MACH_PORT_VALID(target)) {
+        return KERN_INVALID_ARGUMENT;
+    }
+    EnsureGuestThreadRegistry();
+    NativeThreadStateSlot *slot = nullptr;
+    NativeGuestJit *pinnedRuntime = nullptr;
+    Dynarmic::A32::Jit *jit = nullptr;
+    DynarmicCallbacks32 *callbacks = nullptr;
+    gdb_thread_id_t threadId = 0;
+    bool overlayActive;
+    {
+        std::lock_guard<std::recursive_mutex> lock(guestWorkqueueMutex);
+        overlayActive = guestWorkqueueUpcallActive &&
+            guestWorkqueueWaitingContextValid;
+        if (overlayActive && target == guestWorkqueueThreadPort) {
+            return KERN_NOT_SUPPORTED;
+        }
+    }
+    {
+        std::lock_guard<std::recursive_mutex> lock(guestThreadMutex);
+        for (const GuestThreadContext &thread : guestThreads) {
+            if (!thread.alive || thread.threadPort != target) {
+                continue;
+            }
+            /* A cooperative/overlaid JIT cannot be parked without also
+             * stopping a different logical thread needed to resume it. The
+             * main guest-debugger coordinator likewise must remain able to
+             * unwind host callbacks to drive its all-stop command loop. */
+            if (!NativeGuestThreadsEnabled() ||
+                    (suspend && thread.debuggerId == 1 &&
+                        (overlayActive || NativeDebuggerActive()))) {
+                return KERN_NOT_SUPPORTED;
+            }
+            threadId = thread.debuggerId;
+            if (threadId == 1) {
+                slot = &mainNativeThreadState;
+                callbacks = sharedHandle.cb;
+                jit = callbacks != nullptr
+                    ? DynarmicCallbacks32Jit(callbacks) : nullptr;
+            } else if (PinNativeGuestJitForThreadState(thread.nativeJit)) {
+                pinnedRuntime = thread.nativeJit;
+                slot = &pinnedRuntime->threadState;
+                jit = pinnedRuntime->jit;
+                callbacks = pinnedRuntime->callbacks;
+            }
+            break;
+        }
+    }
+    const auto finish = [pinnedRuntime](kern_return_t result) {
+        UnpinNativeGuestJitForThreadState(pinnedRuntime);
+        (void)PublishNativeThreadStateAndWaitIfNeeded();
+        return result;
+    };
+    if (slot == nullptr || jit == nullptr || callbacks == nullptr) {
+        return finish(KERN_INVALID_ARGUMENT);
+    }
+
+    std::unique_lock<std::mutex> lock(slot->mutex);
+    if (slot->ownerExited) {
+        lock.unlock();
+        return finish(KERN_INVALID_ARGUMENT);
+    }
+    if (!suspend) {
+        if (slot->suspendCount == 0) {
+            lock.unlock();
+            return finish(KERN_FAILURE);
+        }
+        if (--slot->suspendCount == 0) {
+            slot->suspendAcknowledged = false;
+            if (slot->requestedGeneration <= slot->releasedGeneration) {
+                jit->ClearHalt(LC32HaltReasonThreadState);
+            }
+        }
+        slot->condition.notify_all();
+        lock.unlock();
+        return finish(KERN_SUCCESS);
+    }
+    if (slot->suspendCount == INT_MAX) {
+        lock.unlock();
+        return finish(KERN_RESOURCE_SHORTAGE);
+    }
+    if (slot->suspendCount++ == 0) {
+        slot->suspendAcknowledged = false;
+    }
+    jit->HaltExecution(LC32HaltReasonThreadState);
+    slot->condition.notify_all();
+    lock.unlock();
+    NotifyNativeDebuggerWaiters();
+    InterruptNativeThreadStateHostCalls(threadId);
+
+    /* Self-suspend returns only after a different guest thread resumes it. */
+    if (threadId == CurrentGuestThreadId()) {
+        return finish(KERN_SUCCESS);
+    }
+    lock.lock();
+    while (slot->suspendCount != 0 && !slot->suspendAcknowledged &&
+            !slot->ownerExited &&
+            !nativeShutdownRequested.load(std::memory_order_acquire) &&
+            !guestProcessExitRequested.load(std::memory_order_acquire)) {
+        lock.unlock();
+        AcknowledgeQuiescentGuestSuspension(*slot, jit, callbacks);
+        AcknowledgeDebuggerStoppedGuestSuspension(
+            *slot, jit, callbacks, pinnedRuntime);
+        (void)AcknowledgeNestedNativeThreadStateRequest();
+        NotifyNativeDebuggerWaiters();
+        InterruptNativeThreadStateHostCalls(threadId);
+        lock.lock();
+        if (!slot->suspendAcknowledged) {
+            (void)slot->condition.wait_for(lock, std::chrono::milliseconds(20));
+        }
+    }
+    const kern_return_t result = slot->ownerExited
+        ? KERN_INVALID_ARGUMENT
+        : (slot->suspendCount == 0 || slot->suspendAcknowledged)
+            ? KERN_SUCCESS : KERN_ABORTED;
+    lock.unlock();
+    return finish(result);
 }
 
 void LoadGuestContext(const context32 &context) {
@@ -844,7 +1067,9 @@ gdb_thread_id_t CurrentGuestThreadId() {
 void EnsureGuestThreadRegistry() {
     std::lock_guard<std::recursive_mutex> lock(guestThreadMutex);
     if (guestThreadRegistryInitialized) {
-        if (NativeGuestThreadsEnabled() && nativeGuestThreadId == 0) {
+        if (NativeGuestThreadsEnabled() && nativeGuestThreadId == 0 &&
+                nativeGuestRuntime == nullptr && threadHandle.jit != nullptr &&
+                threadHandle.cb != nullptr && threadHandle.cb == sharedHandle.cb) {
             nativeGuestThreadId = 1;
         }
         return;
@@ -1267,6 +1492,199 @@ kern_return_t CopyGuestThreadState(
     return KERN_SUCCESS;
 }
 
+static GuestThreadPolicyState &CooperativeWorkqueuePolicyLocked() {
+    static mach_port_t port = MACH_PORT_NULL;
+    static u64 threadSelfId = 0;
+    static GuestThreadPolicyState policy;
+    if(port != guestWorkqueueThreadPort ||
+            threadSelfId != guestWorkqueueThreadSelfId) {
+        policy = {};
+        port = guestWorkqueueThreadPort;
+        threadSelfId = guestWorkqueueThreadSelfId;
+    }
+    return policy;
+}
+
+template <typename Function>
+static kern_return_t WithGuestThreadPolicy(
+        mach_port_t target, Function &&function) {
+    if(!MACH_PORT_VALID(target)) return KERN_INVALID_ARGUMENT;
+    EnsureGuestThreadRegistry();
+    const mach_port_t cooperativeMainPort = !NativeGuestThreadsEnabled()
+        ? pthread_mach_thread_np(pthread_self()) : MACH_PORT_NULL;
+    {
+        std::lock_guard<std::recursive_mutex> lock(guestThreadMutex);
+        for(GuestThreadContext &thread : guestThreads) {
+            if(thread.alive && (thread.threadPort == target ||
+                    (thread.debuggerId == 1 &&
+                     !MACH_PORT_VALID(thread.threadPort) &&
+                     target == cooperativeMainPort))) {
+                return function(thread.policy);
+            }
+        }
+    }
+    {
+        std::lock_guard<std::recursive_mutex> lock(guestWorkqueueMutex);
+        if(guestWorkqueueUpcallActive &&
+                MACH_PORT_VALID(guestWorkqueueThreadPort) &&
+                target == guestWorkqueueThreadPort) {
+            return function(CooperativeWorkqueuePolicyLocked());
+        }
+    }
+    return KERN_INVALID_ARGUMENT;
+}
+
+kern_return_t SetGuestThreadPolicy(
+        mach_port_t target, thread_policy_flavor_t flavor,
+        const integer_t *info, mach_msg_type_number_t count) {
+    if(count > 16 || (count != 0 && info == nullptr)) {
+        return KERN_INVALID_ARGUMENT;
+    }
+    return WithGuestThreadPolicy(target,
+        [&](GuestThreadPolicyState &policy) -> kern_return_t {
+        switch(flavor) {
+        case THREAD_EXTENDED_POLICY:
+            /* STANDARD is the same flavor with a zero-word payload. */
+            policy.timeshare = count == 0 || info[0] == TRUE;
+            policy.realtimeActive = false;
+            return KERN_SUCCESS;
+        case THREAD_TIME_CONSTRAINT_POLICY: {
+            if(count < THREAD_TIME_CONSTRAINT_POLICY_COUNT) {
+                return KERN_INVALID_ARGUMENT;
+            }
+            thread_time_constraint_policy_data_t requested;
+            memcpy(&requested, info, sizeof(requested));
+            mach_timebase_info_data_t timebase = {};
+            if(mach_timebase_info(&timebase) != KERN_SUCCESS ||
+                    !timebase.numer || !timebase.denom) return KERN_FAILURE;
+            /* XNU's accepted computation interval is 50us through 50ms,
+             * expressed in the same absolute-time units exposed to guests. */
+            const uint64_t minimum = 50000ULL * timebase.denom / timebase.numer;
+            const uint64_t maximum = 50000000ULL * timebase.denom / timebase.numer;
+            if(requested.computation == 0 ||
+                    requested.computation < minimum ||
+                    requested.computation > maximum ||
+                    requested.constraint < requested.computation) {
+                return KERN_INVALID_ARGUMENT;
+            }
+            policy.realtime = requested;
+            policy.realtimeActive = true;
+            return KERN_SUCCESS;
+        }
+        case THREAD_PRECEDENCE_POLICY:
+            if(count < THREAD_PRECEDENCE_POLICY_COUNT) return KERN_INVALID_ARGUMENT;
+            policy.importance = info[0];
+            return KERN_SUCCESS;
+        case THREAD_AFFINITY_POLICY:
+            if(count < THREAD_AFFINITY_POLICY_COUNT) return KERN_INVALID_ARGUMENT;
+            policy.affinityTag = info[0];
+            return KERN_SUCCESS;
+        case THREAD_BACKGROUND_POLICY:
+            if(count < THREAD_BACKGROUND_POLICY_COUNT) return KERN_INVALID_ARGUMENT;
+            policy.backgroundPriority = info[0] == THREAD_BACKGROUND_POLICY_DARWIN_BG
+                ? THREAD_BACKGROUND_POLICY_DARWIN_BG : 0;
+            return KERN_SUCCESS;
+        case THREAD_LATENCY_QOS_POLICY:
+            if(count < THREAD_LATENCY_QOS_POLICY_COUNT ||
+                    (info[0] != LATENCY_QOS_TIER_UNSPECIFIED &&
+                     (info[0] < LATENCY_QOS_TIER_0 || info[0] > LATENCY_QOS_TIER_5))) {
+                return KERN_INVALID_ARGUMENT;
+            }
+            policy.latencyQos = info[0];
+            return KERN_SUCCESS;
+        case THREAD_THROUGHPUT_QOS_POLICY:
+            if(count < THREAD_THROUGHPUT_QOS_POLICY_COUNT ||
+                    (info[0] != THROUGHPUT_QOS_TIER_UNSPECIFIED &&
+                     (info[0] < THROUGHPUT_QOS_TIER_0 ||
+                      info[0] > THROUGHPUT_QOS_TIER_5))) return KERN_INVALID_ARGUMENT;
+            policy.throughputQos = info[0];
+            return KERN_SUCCESS;
+        default:
+            return KERN_INVALID_ARGUMENT;
+        }
+    });
+}
+
+kern_return_t CopyGuestThreadPolicy(
+        mach_port_t target, thread_policy_flavor_t flavor,
+        mach_msg_type_number_t capacity, integer_t *info,
+        mach_msg_type_number_t *count, boolean_t *getDefault) {
+    if(capacity > 16 || (capacity != 0 && info == nullptr) ||
+            count == nullptr || getDefault == nullptr) return KERN_INVALID_ARGUMENT;
+    const bool requestedDefault = *getDefault != FALSE;
+    return WithGuestThreadPolicy(target,
+        [&](GuestThreadPolicyState &policy) -> kern_return_t {
+        boolean_t returnedDefault = requestedDefault;
+        integer_t value = 0;
+        switch(flavor) {
+        case THREAD_EXTENDED_POLICY:
+            returnedDefault = requestedDefault || policy.realtimeActive;
+            value = returnedDefault ? TRUE : policy.timeshare;
+            /* Zero-word STANDARD queries are legal, like zero-word sets. */
+            if(capacity == 0) {
+                *count = 0;
+                *getDefault = returnedDefault;
+                return KERN_SUCCESS;
+            }
+            break;
+        case THREAD_TIME_CONSTRAINT_POLICY: {
+            if(capacity < THREAD_TIME_CONSTRAINT_POLICY_COUNT) {
+                return KERN_INVALID_ARGUMENT;
+            }
+            thread_time_constraint_policy_data_t value = policy.realtime;
+            returnedDefault = requestedDefault || !policy.realtimeActive;
+            if(returnedDefault) {
+                /* Read only the host's machine-dependent DEFAULT quantum;
+                 * never query/apply a synthetic port as a native thread. */
+                static const auto defaults = [] {
+                    struct DefaultPolicy {
+                        thread_time_constraint_policy_data_t value = {};
+                        kern_return_t result = KERN_FAILURE;
+                    } result;
+                    mach_msg_type_number_t words = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+                    boolean_t useDefault = TRUE;
+                    result.result = thread_policy_get(
+                        pthread_mach_thread_np(pthread_self()),
+                        THREAD_TIME_CONSTRAINT_POLICY,
+                        reinterpret_cast<thread_policy_t>(&result.value),
+                        &words, &useDefault);
+                    if(result.result == KERN_SUCCESS &&
+                            (words != THREAD_TIME_CONSTRAINT_POLICY_COUNT ||
+                             !useDefault)) result.result = KERN_FAILURE;
+                    return result;
+                }();
+                if(defaults.result != KERN_SUCCESS) return defaults.result;
+                value = defaults.value;
+            }
+            memcpy(info, &value, sizeof(value));
+            *count = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+            *getDefault = returnedDefault;
+            return KERN_SUCCESS;
+        }
+        case THREAD_PRECEDENCE_POLICY:
+            value = requestedDefault ? 0 : policy.importance;
+            break;
+        case THREAD_AFFINITY_POLICY:
+            value = requestedDefault ? THREAD_AFFINITY_TAG_NULL : policy.affinityTag;
+            break;
+        case THREAD_LATENCY_QOS_POLICY:
+            value = requestedDefault ? LATENCY_QOS_TIER_UNSPECIFIED : policy.latencyQos;
+            break;
+        case THREAD_THROUGHPUT_QOS_POLICY:
+            value = requestedDefault ? THROUGHPUT_QOS_TIER_UNSPECIFIED : policy.throughputQos;
+            break;
+        /* XNU exposes BACKGROUND through set, but has no matching get flavor. */
+        default:
+            return KERN_INVALID_ARGUMENT;
+        }
+        if(capacity < 1) return KERN_INVALID_ARGUMENT;
+        info[0] = value;
+        *count = 1;
+        *getDefault = returnedDefault;
+        return KERN_SUCCESS;
+    });
+}
+
 kern_return_t CopyGuestThreadInfo(
         mach_port_t target, thread_flavor_t flavor,
         mach_msg_type_number_t capacity, integer_t *info,
@@ -1278,16 +1696,18 @@ kern_return_t CopyGuestThreadInfo(
 
     const auto copyLogicalInfo = [=](
             u64 threadSelfId, u32 pthreadAddress,
-            bool runnable) -> kern_return_t {
+            bool runnable, uint32_t suspendCount,
+            const GuestThreadPolicyState &policy) -> kern_return_t {
         if (flavor == THREAD_BASIC_INFO) {
             if (capacity < THREAD_BASIC_INFO_COUNT) {
                 return KERN_INVALID_ARGUMENT;
             }
             thread_basic_info_data_t basic = {};
-            basic.policy = POLICY_TIMESHARE;
-            basic.run_state = runnable
-                ? TH_STATE_RUNNING
-                : TH_STATE_WAITING;
+            basic.policy = policy.timeshare && !policy.realtimeActive
+                ? POLICY_TIMESHARE : POLICY_RR;
+            basic.suspend_count = static_cast<integer_t>(suspendCount);
+            basic.run_state = suspendCount != 0 ? TH_STATE_STOPPED
+                : runnable ? TH_STATE_RUNNING : TH_STATE_WAITING;
             memcpy(info, &basic, sizeof(basic));
             *count = THREAD_BASIC_INFO_COUNT;
             return KERN_SUCCESS;
@@ -1336,9 +1756,18 @@ kern_return_t CopyGuestThreadInfo(
              * runtime snapshot preserves the guest identity and scheduler
              * state without racing the native runtime lifecycle.
              */
+            uint32_t suspendCount = 0;
+            NativeThreadStateSlot *slot = thread.debuggerId == 1
+                ? &mainNativeThreadState
+                : thread.nativeJit != nullptr
+                    ? &thread.nativeJit->threadState : nullptr;
+            if (slot != nullptr) {
+                std::lock_guard<std::mutex> state(slot->mutex);
+                suspendCount = slot->suspendCount;
+            }
             return copyLogicalInfo(
                 thread.threadSelfId, thread.pthreadAddress,
-                thread.runnable);
+                thread.runnable, suspendCount, thread.policy);
         }
     }
 
@@ -1350,7 +1779,8 @@ kern_return_t CopyGuestThreadInfo(
                 target == guestWorkqueueThreadPort) {
             return copyLogicalInfo(
                 guestWorkqueueThreadSelfId,
-                guestWorkqueuePthread, true);
+                guestWorkqueuePthread, true, 0,
+                CooperativeWorkqueuePolicyLocked());
         }
     }
     return KERN_INVALID_ARGUMENT;
@@ -1894,10 +2324,14 @@ bool PrepareGuestWorkqueueUpcall(const GuestWorkqueueDelivery *delivery,
     return true;
 }
 
-bool NextGuestWorkqueueEvent(GuestWorkqueueDelivery &delivery) {
+bool NextGuestWorkqueueEvent(GuestWorkqueueDelivery &delivery,
+        bool allowEventManager, bool allowOrdinary) {
+    if(NextGuestWorkqueueTimerEvent(delivery, allowEventManager, allowOrdinary)) return true;
     for (size_t i = 0; i < guestWorkqueueKevents.size(); ++i) {
         GuestWorkqueueKevent &registered = guestWorkqueueKevents[i];
-        if (!registered.enabled) {
+        const bool eventManager =
+            (registered.event.qos & PTHREAD_PRIORITY_EVENT_MANAGER_FLAG) != 0;
+        if (!registered.enabled || (eventManager ? !allowEventManager : !allowOrdinary)) {
             continue;
         }
 

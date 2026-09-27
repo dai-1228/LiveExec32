@@ -9,8 +9,30 @@
 
 static int cleanupPassed = 1;
 
+#ifdef LC32_TEST_VM_READ_OVERWRITE
+#define VM_OPERATION_NAME "vm-read-overwrite"
+
+static kern_return_t copy_memory(mach_port_t task, vm_address_t source,
+        vm_size_t size, vm_address_t destination) {
+    const vm_size_t sentinel = ~(vm_size_t)0;
+    vm_size_t copied = sentinel;
+    const kern_return_t result = vm_read_overwrite(
+        task, source, size, destination, &copied);
+    /* MIG must not overwrite the caller's outsize on an error reply. */
+    if(copied != (result == KERN_SUCCESS ? size : sentinel)) {
+        fprintf(stderr, "vm-read-overwrite: invalid returned size %llu\n",
+            (unsigned long long)copied);
+        return KERN_FAILURE;
+    }
+    return result;
+}
+#else
+#define VM_OPERATION_NAME "vm-copy"
+#define copy_memory vm_copy
+#endif
+
 static int report(const char *name, int passed) {
-    printf("vm-copy-%s: %s\n", name, passed ? "PASS" : "FAIL");
+    printf(VM_OPERATION_NAME "-%s: %s\n", name, passed ? "PASS" : "FAIL");
     return passed;
 }
 
@@ -63,7 +85,7 @@ static int test_cross_page_unaligned(vm_size_t pageSize) {
     memcpy(expected,
         (const void *)(uintptr_t)(source + sourceOffset), copySize);
 
-    const kern_return_t result = vm_copy(
+    const kern_return_t result = copy_memory(
         mach_task_self(), source + sourceOffset, copySize,
         destination + destinationOffset);
     const uint8_t *destinationBytes =
@@ -102,7 +124,7 @@ static int test_overlap(vm_size_t pageSize, int destinationAfterSource) {
     memcpy(expected, (const void *)(uintptr_t)region, regionSize);
     memmove(expected + destinationOffset, expected + sourceOffset, copySize);
 
-    const kern_return_t result = vm_copy(
+    const kern_return_t result = copy_memory(
         mach_task_self(), region + sourceOffset, copySize,
         region + destinationOffset);
     passed = result == KERN_SUCCESS &&
@@ -118,19 +140,31 @@ cleanup:
 static int test_zero_size_invalid_addresses(void) {
     const vm_address_t invalidLow = 1;
     const vm_address_t invalidHigh = ~(vm_address_t)0;
-    return vm_copy(mach_task_self(), invalidLow, 0, invalidHigh) ==
+    return copy_memory(mach_task_self(), invalidLow, 0, invalidHigh) ==
             KERN_SUCCESS &&
-        vm_copy(mach_task_self(), invalidHigh, 0, invalidLow) ==
+        copy_memory(mach_task_self(), invalidHigh, 0, invalidLow) ==
             KERN_SUCCESS;
 }
 
 static int test_nonself_target_rejected(void) {
     const mach_port_t host = mach_host_self();
-    const kern_return_t result = vm_copy(host, 1, 0, 1);
+    const kern_return_t result = copy_memory(host, 1, 0, 1);
     const kern_return_t cleanup = mach_port_deallocate(
         mach_task_self(), host);
     return result == KERN_INVALID_ARGUMENT &&
         cleanup == KERN_SUCCESS;
+}
+
+static int test_address_overflow_rejected(void) {
+    uint8_t bytes[16];
+    memset(bytes, 0x5a, sizeof(bytes));
+    const vm_address_t valid = (vm_address_t)(uintptr_t)bytes;
+    const vm_address_t invalid = ~(vm_address_t)0 - 3;
+    return copy_memory(mach_task_self(), invalid, 8, valid) ==
+            KERN_INVALID_ADDRESS &&
+        copy_memory(mach_task_self(), valid, 8, invalid) ==
+            KERN_INVALID_ADDRESS &&
+        bytes_equal_value(bytes, sizeof(bytes), 0x5a);
 }
 
 static int test_source_hole_is_atomic(vm_size_t pageSize) {
@@ -150,7 +184,7 @@ static int test_source_hole_is_atomic(vm_size_t pageSize) {
         mach_task_self(), source + pageSize, pageSize) == KERN_SUCCESS;
     if(!middleRemoved) goto cleanup;
 
-    const kern_return_t result = vm_copy(
+    const kern_return_t result = copy_memory(
         mach_task_self(), source, regionSize, destination);
     passed = result == KERN_INVALID_ADDRESS && bytes_equal_value(
         (const uint8_t *)(uintptr_t)destination, regionSize, 0x6d);
@@ -184,7 +218,7 @@ static int test_source_protection_is_atomic(vm_size_t pageSize) {
         pageSize, PROT_NONE) == 0;
     if(!protected) goto cleanup;
 
-    const kern_return_t result = vm_copy(
+    const kern_return_t result = copy_memory(
         mach_task_self(), source, regionSize, destination);
     passed = result == KERN_PROTECTION_FAILURE && bytes_equal_value(
         (const uint8_t *)(uintptr_t)destination, regionSize, 0x87);
@@ -218,7 +252,7 @@ static int test_destination_hole_is_atomic(vm_size_t pageSize) {
         pageSize) == KERN_SUCCESS;
     if(!middleRemoved) goto cleanup;
 
-    const kern_return_t result = vm_copy(
+    const kern_return_t result = copy_memory(
         mach_task_self(), source, regionSize, destination);
     passed = result == KERN_INVALID_ADDRESS &&
         bytes_equal_value(
@@ -257,7 +291,7 @@ static int test_destination_protection_is_atomic(vm_size_t pageSize) {
         pageSize, PROT_READ) == 0;
     if(!protected) goto cleanup;
 
-    const kern_return_t result = vm_copy(
+    const kern_return_t result = copy_memory(
         mach_task_self(), source, regionSize, destination);
     passed = result == KERN_PROTECTION_FAILURE &&
         bytes_equal_value(
@@ -292,6 +326,8 @@ int main(void) {
         test_zero_size_invalid_addresses());
     passed &= report("nonself-target-rejected",
         test_nonself_target_rejected());
+    passed &= report("address-overflow-rejected",
+        test_address_overflow_rejected());
     passed &= report("source-hole-destination-unchanged",
         test_source_hole_is_atomic(pageSize));
     passed &= report("source-protection-destination-unchanged",
@@ -302,6 +338,6 @@ int main(void) {
         test_destination_protection_is_atomic(pageSize));
     passed &= report("cleanup", cleanupPassed);
 
-    printf("vm-copy-regression: %s\n", passed ? "PASS" : "FAIL");
+    printf(VM_OPERATION_NAME "-regression: %s\n", passed ? "PASS" : "FAIL");
     return !passed;
 }

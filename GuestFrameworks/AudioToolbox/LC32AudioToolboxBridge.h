@@ -72,6 +72,10 @@ typedef enum : uint32_t {
     LC32AudioToolboxOpRemoteIOOutputStart = 41,
     LC32AudioToolboxOpRemoteIOOutputSubmit = 42,
     LC32AudioToolboxOpRemoteIOOutputStop = 43,
+    LC32AudioToolboxOpAudioConverterNew = 44,
+    LC32AudioToolboxOpAudioConverterDispose = 45,
+    LC32AudioToolboxOpAudioConverterFillComplexBuffer = 46,
+    LC32AudioToolboxOpExtAudioFileWrapAudioFileID = 47,
 } LC32AudioToolboxOpcode;
 
 #endif

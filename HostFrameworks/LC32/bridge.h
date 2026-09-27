@@ -34,6 +34,8 @@ extern int __CFConstantStringClassReference[];
 - (u32)guest_selfOrNull;
 - (u32)LC32_bindGuestSelfIfAbsent:(u32)ptr;
 - (u32)guest_self;
+- (NSMethodSignature *)LC32_nativeMethodSignatureForSelector:(SEL)selector
+                                           instanceMethods:(BOOL)instanceMethods;
 @end
 
 u32 LC32HostToGuestCopyClassName(u32 guest_output, size_t length, u64 host_object);
@@ -43,6 +45,7 @@ u32 LC32CopyHostCString(u64 host_cstring, u32 guest_output, size_t capacity);
 u32 LC32CopyHostStringUTF8(u64 host_object, u32 guest_output, size_t capacity);
 u32 LC32CopyHostStringBytes(u64 host_object, u32 encoding,
                             u32 guest_output, u32 capacity);
+u32 LC32LoadNativeFramework(u32 guest_framework_name);
 u64 LC32HostStringRangeOfString(
     const LC32FoundationStringRangeRequest *request);
 u32 LC32CopyHostDataBytes(u64 host_object, u32 guest_output, u32 length,
@@ -76,6 +79,9 @@ u64 LC32InvokeHostNSStringFormat(u64 host_self,
                                  u32 options);
 void LC32SetInvokeGuestFuncPtr(u32 dlsymFunc, u32 invokeFunc);
 u64 LC32InvokeGuestC(u32 pc, bool ret64, int argc, u32 *args);
+// Current host-to-guest callback nesting, including a callback parked in a
+// native nested run loop. Used to recognize the outer UIKit startup boundary.
+u32 LC32GuestCallbackDepth(void);
 // Guest blocks use the Blocks runtime rather than NSObject retain/release.
 // Copying turns a stack block into stable guest storage; release is deferred
 // when a native block dies on a thread which is not registered with the JIT.
@@ -98,7 +104,8 @@ u32 guest_class_getSuperclass(u32 guest_cls);
 u32 guest_ivar_getName(u32 guest_ivar);
 u32 guest_ivar_getTypeEncoding(u32 guest_ivar);
 u32 guest_object_getClass(u32 guest_obj);
-u32 guest_object_setInstanceVariable(u32 guest_obj, const char *host_name, u32 newValue);
+u32 guest_object_setInstanceVariableWithStrongDefault(
+    u32 guest_obj, const char *host_name, u32 newValue);
 u32 guest_object_getInstanceVariable(u32 guest_obj, const char *host_name, u32 *outValue);
 u32 guest_protocol_getName(u32 guest_ivar);
 u32 guest_sel_registerName(const char *host_name);
@@ -106,9 +113,14 @@ u32 guest_objc_getClass(const char *name);
 Class guest_objc_getClass_retHostClass(const char *name);
 u64 guest_objc_msgSend(int argc, u32 *args);
 BOOL host_hook_getClass(const char *name, Class *outClass);
+// Shared host/guest policy: native pre-iOS-8 processes use UIKit's compositor.
+// LC32_DISABLE_UIKIT_COMPATIBILITY=1 also disables adapters on modern hosts.
+u32 LC32UIKitLegacyCompatibilityEnabled(void);
 // Lets framework bridges add native compatibility entry points after all
 // guest methods have been mirrored but before the class is registered.
 void LC32UIKitPrepareGuestClass(Class cls);
 bool LC32UIKitGetViewDuringGuestLoad(id controller, id *view);
+void LC32UIKitScheduleLegacyOverlayLayout(id object, id addedSubview);
+void LC32UIKitDidSetGuestAutoresizingMask(id object);
 
 __END_DECLS

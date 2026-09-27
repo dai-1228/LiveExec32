@@ -1,18 +1,25 @@
 #import "bridge.h"
+#include "dynarmic_internal.h"
 #include "crash_exception.h"
+#include "guest_dispatch.h"
 #include "LC32ObjCBridgeABI.h"
+#include "LC32DebugLog.h"
+#import "../UIKit/LegacyNibLoading.h"
 
 #import <dispatch/dispatch.h>
 #import <mach/mach_init.h>
 #import <mach/vm_map.h>
+#import <objc/message.h>
 
 #include <atomic>
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdarg.h>
 #include <string>
 #include <unordered_map>
@@ -138,6 +145,8 @@ static void LC32ClearGuestSelfIfEqualWhileSynchronized(
     id hostObject, u32 expectedGuestObject);
 static void LC32ClearGuestSelfIfEqual(id hostObject,
                                       u32 expectedGuestObject);
+static u32 LC32ReleaseNativeProxyOwnership(
+    u32 guestObject, u64 hostAddress, bool releaseHostOwnership);
 
 /*
  * Some native initializers consume the allocation's original +1 even when
@@ -651,6 +660,32 @@ static bool LC32HostObjectIsAutoreleasePool(id hostObject) {
     return false;
 }
 
+static bool LC32HostObjectIsSharedURLPlaceholder(id hostObject) {
+    Class urlClass = objc_getClass("NSURL");
+    if(!urlClass || object_getClass(hostObject) != urlClass) return false;
+
+    /* NSURL's native allocation placeholder rejects weak references, even
+     * though +alloc returns a shared process-lifetime object. Verify that
+     * identity instead of exempting arbitrary weak-incompatible NSURLs.
+     * Keep one allocation's ownership for the lifetime of the process. A
+     * platform with ordinary per-allocation NSURL objects gets no exemption.
+     * This runs while publishing a known-live object, outside registry locks.
+     */
+    static id placeholder = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        id first = [urlClass alloc];
+        id second = [urlClass alloc];
+        if(first && first == second) {
+            placeholder = first;
+        } else {
+            objc_release(first);
+        }
+        objc_release(second);
+    });
+    return hostObject == placeholder;
+}
+
 struct LC32HostWeakMappingEntry {
     u32 guestObject;
     u64 generation;
@@ -662,6 +697,9 @@ struct LC32HostWeakMappingEntry {
     LC32NativeWeakSlot weakHostObject;
     bool weakCompatible;
     bool invocationRetainCompatible;
+    /* Only ordinary/logical guest decrements acquire this private gate.
+     * Native weak RR and guest weak-retain callbacks never take it. */
+    std::mutex nativeProxyReleaseMutex;
 
     LC32HostWeakMappingEntry(id hostObject, u32 guest, u64 serial,
                              LC32HostMappingLifetime mappingLifetime)
@@ -676,9 +714,12 @@ struct LC32HostWeakMappingEntry {
         /* NSAutoreleasePool uses its object as a one-shot pool token. A
          * balanced retain/release around -init or -drain can pop that token
          * early on modern Foundation, so its guest owner remains the call
-         * lifetime instead of adding an invocation-only native reference. */
+         * lifetime instead of adding an invocation-only native reference.
+         * The verified shared URL placeholder likewise needs no invocation
+         * lease: our cached allocation keeps its exact address alive. */
         invocationRetainCompatible =
-            !LC32HostObjectIsAutoreleasePool(hostObject);
+            !LC32HostObjectIsAutoreleasePool(hostObject) &&
+            !LC32HostObjectIsSharedURLPlaceholder(hostObject);
         /* Weak-host-incompatible objects become a live entry containing nil;
          * a guest weak load then fails safely instead of raising here. */
 #if __has_feature(objc_arc)
@@ -705,6 +746,11 @@ struct LC32HostWeakRegistry {
      * than one guest allocation, so the reverse index is intentionally not a
      * one-to-one map. The guest-keyed entries above remain authoritative. */
     std::unordered_multimap<u64, u32> guestObjectsByHostAddress;
+    /* Guest root -dealloc detaches a dead peer before freeing its allocation.
+     * Keep native addresses noncallable until lifetime-pin cleanup, without
+     * reserving ARM32 addresses which can already be reused. */
+    std::unordered_map<u64,
+        std::shared_ptr<LC32HostWeakMappingEntry>> retiringEntries;
     bool hostAddressIndexUsable = true;
     std::atomic<u64> nextGeneration{1};
     dispatch_queue_t deferredReleaseQueue;
@@ -995,6 +1041,14 @@ LC32SnapshotHostInvocationMapping(u64 hostAddress) {
             LC32HostInvocationMappingKind::RetiringOnCurrentThread,
             std::move(retiringEntry),
         };
+    }
+    if(!foundAddress) {
+        for(const auto &retiring : registry.retiringEntries) {
+            if(retiring.second->expectedHostAddress == hostAddress) {
+                foundAddress = true;
+                break;
+            }
+        }
     }
     return {
         foundAddress ? LC32HostInvocationMappingKind::MappedDead
@@ -1514,6 +1568,29 @@ static u32 LC32FinishGuestMappingTeardown(
     return 1;
 }
 
+static bool LC32DetachDeadNativePeerGuestKey(u32 guestObject) {
+    LC32HostWeakRegistry &registry = LC32HostWeakMappings();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    auto iterator = registry.entries.find(guestObject);
+    if(iterator == registry.entries.end() ||
+       iterator->second->state != LC32HostWeakMappingState::Retiring ||
+       iterator->second->retirementProvenance !=
+            LC32HostMappingRetirementProvenance::NativePeerDeallocating) {
+        return true;
+    }
+    try {
+        registry.retiringEntries.emplace(
+            iterator->second->generation, iterator->second);
+    } catch(const std::bad_alloc &) {
+        /* The guest must not free its allocation while its old registry key
+         * remains visible. Report failure before root -dealloc disposes it. */
+        return false;
+    }
+    LC32UnindexHostMappingLocked(registry, iterator->second);
+    registry.entries.erase(iterator);
+    return true;
+}
+
 extern "C" u32 LC32UpdateHostMapping(
         u32 guestObject, LC32HostMappingOperation operation,
         u64 hostObject) {
@@ -1539,6 +1616,14 @@ extern "C" u32 LC32UpdateHostMapping(
         case LC32HostMappingFinishGuestTeardownAndReleaseHost:
             return LC32FinishGuestMappingTeardown(
                 guestObject, static_cast<u32>(hostObject), true);
+        case LC32HostMappingGuestRootDealloc:
+            return LC32DetachDeadNativePeerGuestKey(guestObject);
+        case LC32HostMappingReleaseNativeProxy:
+            return LC32ReleaseNativeProxyOwnership(
+                guestObject, hostObject, true);
+        case LC32HostMappingReleaseNativeProxyLogicalOwnership:
+            return LC32ReleaseNativeProxyOwnership(
+                guestObject, hostObject, false);
     }
     return 0;
 }
@@ -1603,13 +1688,18 @@ static void LC32FinalizeHostWeakMappingRetirement(
         LC32HostWeakRegistry &registry = LC32HostWeakMappings();
         std::lock_guard<std::mutex> lock(registry.mutex);
         auto iterator = registry.entries.find(guestObject);
-        if(iterator == registry.entries.end() ||
-           iterator->second->generation != generation) {
-            return;
+        if(iterator != registry.entries.end() &&
+           iterator->second->generation == generation) {
+            LC32UnindexHostMappingLocked(registry, iterator->second);
+            retired = std::move(iterator->second);
+            registry.entries.erase(iterator);
+        } else {
+            auto detached = registry.retiringEntries.find(generation);
+            if(detached == registry.retiringEntries.end() ||
+                    detached->second->guestObject != guestObject) return;
+            retired = std::move(detached->second);
+            registry.retiringEntries.erase(detached);
         }
-        LC32UnindexHostMappingLocked(registry, iterator->second);
-        retired = std::move(iterator->second);
-        registry.entries.erase(iterator);
     }
     /* Destroying the native weak slot may acquire its SideTable stripe.  The
      * shared_ptr deliberately leaves the registry lock first and is then
@@ -1620,6 +1710,9 @@ static void LC32FinalizeHostWeakMappingRetirement(
 static void LC32DeferHostWeakMappingRetirementFinalization(
         u32 guestObject, u64 generation) {
     if(!guestObject || !generation) return;
+    /* Guest root -dealloc has already detached its ARM32 key before freeing
+     * the allocation. Only the native-address tombstone and weak slot remain;
+     * their destruction must stay outside the native deallocation stack. */
     dispatch_async(LC32HostWeakMappings().deferredReleaseQueue, ^{
         LC32FinalizeHostWeakMappingRetirement(guestObject, generation);
     });
@@ -1800,8 +1893,8 @@ static int LC32UniqueSelectorArgumentIndexNamed(SEL selector,
 
 template<typename T>
 static bool LC32ReadGuestInvocationValue(u32 guestStorage, T &value) {
-    return guestStorage && Dynarmic_mem_1read(
-        guestStorage, sizeof(value), reinterpret_cast<char *>(&value)) == 0;
+    return guestStorage && u64(guestStorage) + sizeof(value) <= (UINT64_C(1) << 32) &&
+        read_guest_memory_with_permissions(guestStorage, &value, sizeof(value), PROT_READ);
 }
 
 template<typename T>
@@ -1817,19 +1910,12 @@ static void LC32StoreHostInvocationValue(
  * into host-owned aligned storage instead of exposing a guest address or
  * letting Foundation read eight-byte pointers from four-byte guest values.
  */
-static bool LC32PrepareHostInvocationArgument(
-        NSInvocation *invocation, u32 guestStorage, int32_t argumentIndex,
+static bool LC32PrepareHostInvocationValue(const char *type, u32 guestStorage,
         std::array<u8, 16> &hostStorage) {
-    if(!invocation || !guestStorage || argumentIndex < 0) return false;
-
-    NSMethodSignature *signature = invocation.methodSignature;
-    if(!signature || (NSUInteger)argumentIndex >= signature.numberOfArguments)
-        return false;
-
-    const char *type = [signature getArgumentTypeAtIndex:
-        (NSUInteger)argumentIndex];
+    if(!guestStorage) return false;
     while(type && *type && strchr("rnNoORVA", *type)) type++;
     if(!type || !*type) return false;
+    if(type[0] == '@' && type[1] == '?') return false;
 
     NSUInteger nativeSize = 0;
     NSUInteger nativeAlignment = 0;
@@ -1907,7 +1993,9 @@ static bool LC32PrepareHostInvocationArgument(
             uint32_t guestValue = 0;
             if(!LC32ReadGuestInvocationValue(guestStorage, guestValue))
                 return false;
-            const unsigned long hostValue = guestValue;
+            // Objective-C l/L encodings remain 32-bit in native Foundation;
+            // LP64 long/NSInteger methods use q/Q instead.
+            const uint32_t hostValue = guestValue;
             LC32StoreHostInvocationValue(hostStorage, hostValue);
             return nativeSize == sizeof(hostValue);
         }
@@ -1915,7 +2003,7 @@ static bool LC32PrepareHostInvocationArgument(
             int32_t guestValue = 0;
             if(!LC32ReadGuestInvocationValue(guestStorage, guestValue))
                 return false;
-            const long hostValue = guestValue;
+            const int32_t hostValue = guestValue;
             LC32StoreHostInvocationValue(hostStorage, hostValue);
             return nativeSize == sizeof(hostValue);
         }
@@ -1950,6 +2038,77 @@ static bool LC32PrepareHostInvocationArgument(
         default:
             return false;
     }
+}
+
+static bool LC32PrepareHostInvocationArgument(
+        NSInvocation *invocation, u32 guestStorage, int32_t argumentIndex,
+        std::array<u8, 16> &hostStorage) {
+    if(!invocation || argumentIndex < 0) return false;
+    NSMethodSignature *signature = invocation.methodSignature;
+    return signature &&
+        (NSUInteger)argumentIndex < signature.numberOfArguments &&
+        LC32PrepareHostInvocationValue([signature getArgumentTypeAtIndex:
+            (NSUInteger)argumentIndex], guestStorage, hostStorage);
+}
+
+// NSInvocation's buffers use native ABI sizes even when the original method
+// signature came from guest metadata. Only scalar/object/selector values are
+// supported here; never copy a native pointer or aggregate into ARM32 storage.
+static bool LC32CopyHostInvocationValueToGuest(const char *type,
+        const std::array<u8, 16> &hostStorage, u32 guestStorage) {
+    while(type && *type && strchr("rnNoORVA", *type)) type++;
+    if(!type || !*type) return false;
+    u64 bits = 0;
+    memcpy(&bits, hostStorage.data(), sizeof(bits));
+    size_t guestSize;
+    switch(*type) {
+        case 'v': return true;
+        case '@':
+        case '#':
+            bits = LC32GuestObjectForBorrowedHostResult((id)(uintptr_t)bits);
+            guestSize = 4;
+            break;
+        case ':':
+            bits = bits ? guest_sel_registerName(sel_getName((SEL)bits)) : 0;
+            guestSize = 4;
+            break;
+        case 'B': case 'c': case 'C': guestSize = 1; break;
+        case 's': case 'S': guestSize = 2; break;
+        case 'i': case 'I': case 'l': case 'L': case 'f':
+            guestSize = 4; break;
+        case 'q': case 'Q': case 'd': guestSize = 8; break;
+        default: return false;
+    }
+    return guestStorage && u64(guestStorage) + guestSize <= (UINT64_C(1) << 32) &&
+        write_guest_memory_with_permissions(guestStorage, &bits, guestSize, PROT_WRITE);
+}
+
+static bool LC32TransferHostInvocationValue(NSInvocation *invocation,
+        SEL selector, u32 guestStorage, int32_t argumentIndex) {
+    const bool argument = selector == @selector(getArgument:atIndex:);
+    NSMethodSignature *signature = invocation.methodSignature;
+    if(!signature || (argument && (argumentIndex < 0 ||
+            (NSUInteger)argumentIndex >= signature.numberOfArguments))) return false;
+    const char *type = argument ? [signature getArgumentTypeAtIndex:argumentIndex]
+        : signature.methodReturnType;
+    const char *unqualified = type;
+    while(unqualified && *unqualified && strchr("rnNoORVA", *unqualified)) unqualified++;
+    if(!argument && unqualified && *unqualified == 'v') return true;
+    if(!unqualified || !*unqualified || !strchr("@#:BcCsSiIlLqQfd", *unqualified))
+        return false;
+    if(unqualified[0] == '@' && unqualified[1] == '?') return false;
+    NSUInteger size = 0;
+    NSGetSizeAndAlignment(type, &size, nullptr);
+    alignas(16) std::array<u8, 16> storage = {};
+    if(!size || size > storage.size()) return false;
+    if(selector == @selector(setReturnValue:)) {
+        if(!LC32PrepareHostInvocationValue(type, guestStorage, storage)) return false;
+        [invocation setReturnValue:storage.data()];
+        return true;
+    }
+    if(argument) [invocation getArgument:storage.data() atIndex:argumentIndex];
+    else [invocation getReturnValue:storage.data()];
+    return LC32CopyHostInvocationValueToGuest(type, storage, guestStorage);
 }
 
 #pragma mark Guest -> Host functions
@@ -2042,15 +2201,41 @@ u32 LC32CopyHostStringUTF8(u64 host_object, u32 guest_output,
     return (u32)byteCount;
 }
 
+static size_t LC32HostStringTerminatorSize(NSStringEncoding encoding) {
+    switch(encoding) {
+        case NSUTF16StringEncoding:
+        case NSUTF16BigEndianStringEncoding:
+        case NSUTF16LittleEndianStringEncoding:
+            return sizeof(uint16_t);
+        case NSUTF32StringEncoding:
+        case NSUTF32BigEndianStringEncoding:
+        case NSUTF32LittleEndianStringEncoding:
+            return sizeof(uint32_t);
+        default:
+            return sizeof(char);
+    }
+}
+
 u32 LC32CopyHostStringBytes(u64 host_object, u32 encoding,
                             u32 guest_output, u32 capacity) {
     NSString *string = (NSString *)(id)host_object;
     const NSStringEncoding nativeEncoding = (NSStringEncoding)encoding;
     const NSUInteger payloadCount =
         [string lengthOfBytesUsingEncoding:nativeEncoding];
-    if(payloadCount >= UINT32_MAX) return 0;
+    const size_t terminatorSize =
+        LC32HostStringTerminatorSize(nativeEncoding);
+    /* Some legacy clients pass UTF-16 C strings to a four-byte wchar_t
+     * scanner. Keep the requested UTF-16 payload, but pad through the next
+     * aligned wide NUL so single-character input and deletion do not scan
+     * stale guest-buffer bytes. This tolerates that historical misuse; it
+     * does not reinterpret multi-character UTF-16 strings as UTF-32. */
+    const size_t widePadding = terminatorSize == sizeof(uint16_t)
+        ? sizeof(uint32_t) +
+            (sizeof(uint32_t) - payloadCount % sizeof(uint32_t)) % sizeof(uint32_t)
+        : terminatorSize;
+    if(payloadCount > UINT32_MAX - widePadding) return 0;
 
-    const u32 byteCount = (u32)payloadCount + 1;
+    const u32 byteCount = (u32)(payloadCount + widePadding);
     char *bytes = (char *)malloc(byteCount);
     if(!bytes) return 0;
     if(![string getCString:bytes maxLength:byteCount
@@ -2058,6 +2243,10 @@ u32 LC32CopyHostStringBytes(u64 host_object, u32 encoding,
         free(bytes);
         return 0;
     }
+    /* Foundation terminates -getCString: with one zero byte even for its
+     * fixed-width UTF-16/UTF-32 encodings.  C callers consume a complete
+     * encoded NUL code unit, so make the remaining bytes deterministic. */
+    memset(bytes + payloadCount, 0, widePadding);
 
     if(guest_output && capacity >= byteCount &&
             Dynarmic_mem_1write(guest_output, byteCount, bytes) != 0) {
@@ -2165,13 +2354,164 @@ u32 LC32CopyHostDataBytes(u64 host_object, u32 guest_output, u32 length,
     return length;
 }
 
+static id LC32CoreDataMergePolicyForSymbol(const char *symbolName) {
+    struct MergePolicySymbol {
+        const char *symbol;
+        const char *getter;
+    };
+    static constexpr MergePolicySymbol symbols[] = {
+        { "NSErrorMergePolicy", "errorMergePolicy" },
+        { "NSMergeByPropertyStoreTrumpMergePolicy",
+          "mergeByPropertyStoreTrumpMergePolicy" },
+        { "NSMergeByPropertyObjectTrumpMergePolicy",
+          "mergeByPropertyObjectTrumpMergePolicy" },
+        { "NSOverwriteMergePolicy", "overwriteMergePolicy" },
+        { "NSRollbackMergePolicy", "rollbackMergePolicy" },
+    };
+
+    const char *getter = nullptr;
+    for(const MergePolicySymbol &candidate : symbols) {
+        if(!strcmp(symbolName, candidate.symbol)) {
+            getter = candidate.getter;
+            break;
+        }
+    }
+    if(!getter) return nil;
+
+    /*
+     * On current Core Data, dlopen exposes the legacy data symbols but leaves
+     * them nil until +[NSMergePolicy initialize]. Some releases may omit the
+     * exports entirely. The replacement class properties preserve the same
+     * immortal singleton identities in either case, without asking the host
+     * object to enter guest code while guest dyld is running constructors.
+     */
+    Class mergePolicyClass = objc_getClass("NSMergePolicy");
+    SEL selector = sel_registerName(getter);
+    if(!mergePolicyClass ||
+       !class_respondsToSelector(object_getClass(mergePolicyClass), selector)) {
+        return nil;
+    }
+    using Getter = id (*)(id, SEL);
+    return reinterpret_cast<Getter>(objc_msgSend)(mergePolicyClass, selector);
+}
+
 u64 LC32Dlsym(u32 guest_name, bool isFunction) {
     DynarmicHostString host_name(guest_name);
-    
+
     u64 r = (u64)dlsym(RTLD_DEFAULT, host_name.hostPtr);
     if(r && !isFunction) r = *(u64*)r;
-    printf("LC32: dlsym %s = 0x%llx\n", host_name.hostPtr, r);
+    if(!r && !isFunction) {
+        r = (u64)LC32CoreDataMergePolicyForSymbol(host_name.hostPtr);
+    }
+    if(!r) {
+        printf("LC32: dlsym %s = 0x%llx\n", host_name.hostPtr, r);
+    } else {
+        LC32_DEBUG_PRINTF("LC32: dlsym %s = 0x%llx\n", host_name.hostPtr, r);
+    }
     return r;
+}
+
+extern "C" u32 LC32LoadNativeFramework(u32 guestFrameworkName) {
+    DynarmicHostString frameworkName(guestFrameworkName);
+    if(!frameworkName.hostPtr || !frameworkName.hostPtr[0]) {
+        fprintf(stderr, "LC32: refusing an empty native framework name\n");
+        return 0;
+    }
+
+    const char *cursor = frameworkName.hostPtr;
+    size_t length = 0;
+    for(; *cursor; cursor++, length++) {
+        const unsigned char character = (unsigned char)*cursor;
+        const bool valid =
+            (character >= 'a' && character <= 'z') ||
+            (character >= 'A' && character <= 'Z') ||
+            (character >= '0' && character <= '9') ||
+            character == '_' || character == '-';
+        if(!valid || length >= 127) {
+            fprintf(stderr,
+                "LC32: refusing invalid native framework name: %s\n",
+                frameworkName.hostPtr);
+            return 0;
+        }
+    }
+
+    static std::mutex cacheMutex;
+    static std::unordered_map<std::string, void *> cache;
+    const std::string name(frameworkName.hostPtr, length);
+    {
+        const std::lock_guard<std::mutex> lock(cacheMutex);
+        const auto cached = cache.find(name);
+        if(cached != cache.end()) return cached->second != nullptr;
+    }
+
+    /*
+     * LiveExec32's Catalyst build is produced by rewriting the iOS build
+     * version, so TARGET_OS_MACCATALYST cannot distinguish it here.  Prefer
+     * the iOSSupport image at runtime and fall back to the ordinary iOS path;
+     * the first lookup simply fails on a real iOS device.
+     */
+    const std::string catalystPath =
+        "/System/iOSSupport/System/Library/Frameworks/" + name +
+        ".framework/" + name;
+    void *handle = dlopen(catalystPath.c_str(), RTLD_NOW | RTLD_GLOBAL);
+    std::string catalystError;
+    if(!handle) {
+        const char *error = dlerror();
+        if(error) catalystError = error;
+
+        const std::string systemPath = "/System/Library/Frameworks/" + name +
+            ".framework/" + name;
+        handle = dlopen(systemPath.c_str(), RTLD_NOW | RTLD_GLOBAL);
+    }
+
+    {
+        /*
+         * Do not hold cacheMutex while dlopen runs framework initializers:
+         * one of them may synchronously enter another guest framework shim.
+         * Concurrent loads are harmless because native image handles remain
+         * open for the process lifetime.
+         */
+        const std::lock_guard<std::mutex> lock(cacheMutex);
+        const auto inserted = cache.emplace(name, handle);
+        if(!inserted.second) {
+            /* If two first-time loads raced, retain a successful result. */
+            if(!inserted.first->second && handle) {
+                inserted.first->second = handle;
+            }
+            handle = inserted.first->second;
+        }
+    }
+    if(!handle) {
+        const char *systemError = dlerror();
+        fprintf(stderr,
+            "LC32: failed to load native framework %s: %s%s%s\n",
+            name.c_str(),
+            catalystError.empty() ? "unknown iOSSupport error" :
+                catalystError.c_str(),
+            systemError ? "; system fallback: " : "",
+            systemError ? systemError : "");
+        return 0;
+    }
+
+    return 1;
+}
+
+/*
+ * Metal's public creation function returns a native Objective-C object at
+ * +1.  An ARM32 caller cannot consume that 64-bit pointer directly, so keep
+ * the ABI-specific ownership conversion beside the generic bridge.  The
+ * guest half loads Metal before resolving this thunk; do not cache a failed
+ * dlsym lookup in case an older host loads the framework lazily.
+ */
+extern "C" u32 LC32_Metal_MTLCreateSystemDefaultDevice(void) {
+    using CreateDefaultDevice = id (*)(void);
+    CreateDefaultDevice createDefaultDevice =
+        reinterpret_cast<CreateDefaultDevice>(
+            dlsym(RTLD_DEFAULT, "MTLCreateSystemDefaultDevice"));
+    if(!createDefaultDevice) return 0;
+
+    id device = createDefaultDevice();
+    return device ? LC32GuestObjectForOwnedHostObject((CFTypeRef)device) : 0;
 }
 
 inline id LC32GetHostConstString(u32 guest_self) {
@@ -2180,7 +2520,15 @@ inline id LC32GetHostConstString(u32 guest_self) {
     constStr[0] = (u64)__CFConstantStringClassReference;
     constStr[1] = (u64)Dynarmic_current_user_callbacks()->MemoryRead32(guest_self + sizeof(u32[1]));
     u64 length = (u64)Dynarmic_current_user_callbacks()->MemoryRead32(guest_self + sizeof(u32[3]));
-    DynarmicHostString host_str(Dynarmic_current_user_callbacks()->MemoryRead32(guest_self + sizeof(u32[2])), length);
+    /* CFString's 0x10 flag denotes UTF-16 storage. Its length still counts
+     * code units, whereas the guest memory wrapper takes bytes. Copying only
+     * `length` bytes truncates multi-page Unicode literals and lets native
+     * Foundation read beyond the detached allocation. */
+    constexpr u32 CFStringUnicodeFlag = 0x10;
+    const u64 byteLength = length *
+        ((constStr[1] & CFStringUnicodeFlag) ? sizeof(UniChar) : 1);
+    if(byteLength > UINT32_MAX) abort();
+    DynarmicHostString host_str(Dynarmic_current_user_callbacks()->MemoryRead32(guest_self + sizeof(u32[2])), (u32)byteLength);
     /*
      * A cross-page copy is detached for this immortal native constant.  The
      * bit-63 ownership marker is meaningful only while returning the pointer
@@ -2280,9 +2628,17 @@ u64 LC32GetHostObject(u32 guest_self, u32 guest_className, bool returnClass) {
     return (u64)obj;
 }
 
+namespace {
+void LC32RegisterGuestSelectorMapping(
+    SEL hostSelector, u32 guestSelector);
+u32 LC32LookupGuestSelectorMapping(SEL hostSelector);
+}
+
 u64 LC32GetHostSelector(u32 guest_selector) {
     DynarmicHostString host_selector(guest_selector);
-    return (u64)sel_registerName(host_selector.hostPtr);
+    SEL selector = sel_registerName(host_selector.hostPtr);
+    LC32RegisterGuestSelectorMapping(selector, guest_selector);
+    return (u64)selector;
 }
 
 static bool LC32NativeNSRangeType(const char *type) {
@@ -2302,6 +2658,8 @@ static bool LC32NativeNSDecimalType(const char *type) {
     return type &&
         strcmp(type, "{?=b8b4b1b1b18[8S]}") == 0;
 }
+
+static SEL LC32NotificationCallbackSelector(id observer, SEL selector);
 
 static bool LC32SelectorUsesHostStackVarargs(SEL selector) {
     if(!selector) return false;
@@ -2434,6 +2792,31 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
      * tracing before the dispatch path has rejected it.
     */
     LC32OperationTraceRawSelector(receiver, selector, args[0]);
+    if(selector == @selector(selector) &&
+            [receiver isKindOfClass:NSInvocation.class]) {
+        SEL invocationSelector = [(NSInvocation *)receiver selector];
+        return invocationSelector ? guest_sel_registerName(sel_getName(invocationSelector)) : 0;
+    }
+    if((selector == @selector(getReturnValue:) ||
+            selector == @selector(setReturnValue:) ||
+            selector == @selector(getArgument:atIndex:)) &&
+            [receiver isKindOfClass:NSInvocation.class]) {
+        LC32GuestHostCallQuiescence quiescence;
+        const bool tagged = (args[0] & LC32_GUEST_ARGUMENT_TAG_MASK) ==
+            LC32_GUEST_INVOCATION_ARGUMENT_TAG;
+        if((!tagged && args[0] != 0) || !LC32TransferHostInvocationValue(
+                (NSInvocation *)receiver, selector, (u32)args[0], (int32_t)args[1])) {
+            [NSException raise:NSInvalidArgumentException
+                format:@"LC32: unsupported type or invalid guest buffer for NSInvocation %s",
+                    sel_getName(selector)];
+        }
+        return 0;
+    }
+    if(selector == @selector(addObserver:selector:name:object:) &&
+            [receiver isKindOfClass:NSNotificationCenter.class]) {
+        args[1] = (u64)LC32NotificationCallbackSelector(
+            (id)args[0], (SEL)args[1]);
+    }
     if(returnGuestObject && selector == @selector(view)) {
         id loadedView = nil;
         if(LC32UIKitGetViewDuringGuestLoad(receiver, &loadedView)) {
@@ -2443,6 +2826,16 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
             return loadedView
                 ? LC32GuestObjectForBorrowedHostResult(loadedView) : 0;
         }
+    }
+    if(returnGuestObject &&
+       selector == sel_registerName("loadNibNamed:owner:options:") &&
+       [receiver isKindOfClass:NSBundle.class] &&
+       ![(id)object_getClass(receiver) isGuestClass]) {
+        LC32GuestHostCallQuiescence quiescence;
+        NSArray *objects = LC32LoadGuestNib((NSBundle *)receiver,
+            (NSString *)args[0], (id)args[1], (NSDictionary *)args[2]);
+        quiescence.finish();
+        return objects ? LC32GuestObjectForBorrowedHostResult(objects) : 0;
     }
     Class dispatchClass = object_getClass(receiver);
     const bool invokeSuper = [(id)dispatchClass isGuestClass];
@@ -2523,12 +2916,47 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
                receiver ? class_getName(object_getClass(receiver)) : "<nil>");
         return 0;
     }
-    if(method) {
+    /* A native object may implement a selector through Objective-C message
+     * forwarding without installing a concrete Method. GameKit uses this
+     * for achievement properties, including double-valued accessors. Their
+     * forwarding signature is still authoritative for the native ABI; an
+     * integer-only fallback would read x0 instead of the returned d0.
+     *
+     * Keep ordinary Method lookups on their existing fast path. Only query
+     * native receivers after the missing guest-super case above has exited:
+     * a mirror's signature can describe ARM32 guest code or reenter it.
+     * Hold the returned signature for this invocation, not in a global cache,
+     * since forwarding can depend on the individual receiver's current state. */
+    LC32HostInvocationReceiverGuard forwardingSignatureGuard;
+    NSMethodSignature *forwardingSignature = nil;
+    if(!method && receiver) {
+        LC32GuestHostCallQuiescence quiescence;
+        forwardingSignature = [receiver methodSignatureForSelector:selector];
+        forwardingSignatureGuard.acquireUnmapped(forwardingSignature);
+    }
+    const NSUInteger methodArgumentCount = method
+        ? method_getNumberOfArguments(method)
+        : [forwardingSignature numberOfArguments];
+    const bool hasMethodSignature =
+        (method || forwardingSignature) && methodArgumentCount >= 2;
+    auto copyArgumentType = [&](NSUInteger index) -> char * {
+        if(method) return method_copyArgumentType(method, (unsigned int)index);
+        if(!forwardingSignature || index >= methodArgumentCount) return nullptr;
+        const char *type =
+            [forwardingSignature getArgumentTypeAtIndex:index];
+        return type ? strdup(type) : nullptr;
+    };
+    auto copyReturnType = [&]() -> char * {
+        if(method) return method_copyReturnType(method);
+        const char *type = [forwardingSignature methodReturnType];
+        return type ? strdup(type) : nullptr;
+    };
+
+    if(hasMethodSignature) {
         const unsigned int argumentCount =
-            MIN(method_getNumberOfArguments(method) - 2, 9u);
+            (unsigned int)MIN(methodArgumentCount - 2, (NSUInteger)9);
         for(unsigned int index = 0; index < argumentCount; index++) {
-            char *argumentType =
-                method_copyArgumentType(method, index + 2);
+            char *argumentType = copyArgumentType(index + 2);
             if(!argumentType) continue;
             const char *unqualifiedType = argumentType;
             while(*unqualifiedType &&
@@ -2694,8 +3122,8 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
                     return 0;
                 }
 
-                char *countType = method_copyArgumentType(
-                    method, descriptor.countArgumentIndex + 2);
+                char *countType = copyArgumentType(
+                    descriptor.countArgumentIndex + 2);
                 const char *unqualifiedCountType = countType;
                 while(unqualifiedCountType && *unqualifiedCountType &&
                         strchr("rnNoORVA", *unqualifiedCountType)) {
@@ -2876,6 +3304,20 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
     }
 
     auto finishIndirectArguments = [&](u64 result) -> u64 {
+        /* Legacy controller overlays can apply portrait-window geometry in
+         * several consecutive setters. Let UIKit reconcile it after the
+         * complete guest operation, not between transform/bounds/center. */
+        if(selector == @selector(setTransform:) ||
+                selector == @selector(setBounds:) ||
+                selector == @selector(setCenter:) ||
+                selector == @selector(setFrame:)) {
+            LC32UIKitScheduleLegacyOverlayLayout(receiver, nil);
+        } else if(selector == @selector(addSubview:)) {
+            LC32UIKitScheduleLegacyOverlayLayout(
+                receiver, (id)(uintptr_t)args[0]);
+        } else if(selector == @selector(setAutoresizingMask:)) {
+            LC32UIKitDidSetGuestAutoresizingMask(receiver);
+        }
         for(size_t index = 0; index < 9; index++) {
             if(sizedIndirectGuestStorage[index]) {
                 (void)Dynarmic_mem_1write(
@@ -2930,18 +3372,16 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
      */
     u64 integerArguments[9] = {};
     u64 floatingArguments[8] = {};
-    bool useTypedScalarArguments = method != nullptr;
-    if(method) {
-        const unsigned int argumentCount =
-            method_getNumberOfArguments(method) - 2;
+    bool useTypedScalarArguments = hasMethodSignature;
+    if(hasMethodSignature) {
+        const NSUInteger argumentCount = methodArgumentCount - 2;
         size_t integerArgumentCount = 0;
         size_t floatingArgumentCount = 0;
         if(argumentCount > 9) useTypedScalarArguments = false;
 
         for(unsigned int index = 0;
                 useTypedScalarArguments && index < argumentCount; index++) {
-            char *argumentType =
-                method_copyArgumentType(method, index + 2);
+            char *argumentType = copyArgumentType(index + 2);
             const char *unqualifiedType = argumentType;
             while(unqualifiedType && *unqualifiedType &&
                     strchr("rnNoORVA", *unqualifiedType)) {
@@ -3090,8 +3530,8 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
     } returnKind = HostReturnKind::Integer;
     bool returnsBlock = false;
     bool returnsNSRange = false;
-    if(method) {
-        char *returnType = method_copyReturnType(method);
+    if(hasMethodSignature) {
+        char *returnType = copyReturnType();
         if(returnType) {
             const char *unqualifiedType = returnType;
             while(*unqualifiedType &&
@@ -3286,6 +3726,7 @@ u64 LC32InvokeHostSelector(u64 host_self, u64 host_cmd, u64 va_args) {
 void LC32SetInvokeGuestFuncPtr(u32 dlsymFunc, u32 invokeFunc) {
     sharedHandle.guest_dlsym = dlsymFunc;
     sharedHandle.guest_LC32InvokeGuestC = invokeFunc;
+    LC32InstallGuestMainQueueSource();
 }
 
 #pragma mark Host -> Guest functions
@@ -3314,6 +3755,12 @@ static u32 LC32CachedGuestSelector(std::atomic<u32> &cache,
     return value;
 }
 
+static thread_local u32 LC32GuestCallbackNesting = 0;
+
+u32 LC32GuestCallbackDepth(void) {
+    return LC32GuestCallbackNesting;
+}
+
 u64 LC32InvokeGuestC(u32 pc, bool ret64, int argc, u32 *args) {
     if(threadHandle.jit == nullptr || threadHandle.cb == nullptr) {
         fprintf(stderr,
@@ -3321,6 +3768,10 @@ u64 LC32InvokeGuestC(u32 pc, bool ret64, int argc, u32 *args) {
             "(pc=0x%x)\n", pc);
         return 0;
     }
+    struct CallbackScope {
+        CallbackScope() { ++LC32GuestCallbackNesting; }
+        ~CallbackScope() { --LC32GuestCallbackNesting; }
+    } callbackScope;
     std::array<std::uint32_t, 16> &regs = threadHandle.jit->Regs();
     struct context32 ctx;
     Dynarmic_context_1save(&ctx);
@@ -3442,10 +3893,15 @@ u32 LC32HostToGuestArgument(char *type, u64 value) {
     while(*type && strchr("rnNoORVA", *type)) type++;
     switch(*type) {
         case 'B': // bool
+        case 'C':
+        case 'S':
         case 'I':
+        case 'L':
         case 'Q':
         case 'c':
+        case 's':
         case 'i':
+        case 'l':
         case 'q':
             return (u32)value;
         case 'd':
@@ -3522,6 +3978,8 @@ u64 LC32GuestToHostReturnType(char *type, u64 value) {
             return value;
         case 'v':
             return 0;
+        case ':':
+            return value ? LC32GetHostSelector((u32)value) : 0;
         case 'f': {
             const double hostValue = LC32GuestFloatReturn(value);
             u64 result;
@@ -3565,6 +4023,57 @@ static u64 LC32InvokeGuestSelectorWordsRaw(id self, SEL _cmd,
     return guest_objc_msgSend((int)guest_argc, guest_args);
 }
 
+static void LC32InvokeGuestSelectorFloatingArgumentBits(
+        id self, SEL selector, u64 bits, bool guestDouble) {
+    LC32TraceGuestMethodCallback(self, selector);
+    if(Dynarmic_guest_thread_is_registered()) {
+        // self/_cmd occupy r0/r1, so either a float in r2 or an aligned
+        // double in r2/r3 can be passed directly in ARM32 argument words.
+        const u32 words[] = {(u32)bits, (u32)(bits >> 32)};
+        (void)LC32InvokeGuestSelectorWordsRaw(
+            self, selector, words, guestDouble ? 2 : 1);
+        return;
+    }
+
+    // Native download/KVC callbacks can arrive on a thread with no guest
+    // register owner. Preserve the scalar's bits in the existing synchronous
+    // selector executor rather than trying to enter the emulator here.
+    LC32GuestBlockCallbackDescriptor callback = {};
+    callback.kind = LC32GuestBlockCallbackKindSelector;
+    callback.guestBlock = [self guest_selfOrNull];
+    callback.guestInvoke = LC32LookupGuestSelectorMapping(selector);
+    callback.resultKind = LC32GuestBlockValueVoid;
+    callback.argumentCount = 1;
+    callback.arguments[0].kind = guestDouble
+        ? LC32GuestBlockValueUnsigned64 : LC32GuestBlockValueUnsigned32;
+    callback.arguments[0].value = bits;
+
+    id retainedReceiver = objc_retain(self);
+    const bool submitted =
+        Dynarmic_submit_guest_selector_callback(&callback);
+    objc_release(retainedReceiver);
+    if(!submitted) {
+        fprintf(stderr,
+            "LC32: cannot relay foreign-thread floating guest callback "
+            "%c[%s %s]\n", object_isClass(self) ? '+' : '-',
+            self ? class_getName(object_getClass(self)) : "(null)",
+            selector ? sel_getName(selector) : "(null)");
+    }
+}
+
+// The native scalar arrives in s0/d0, independently of x2-x7. Typed IMPs
+// capture it before constructing the guest's soft-float argument words.
+// CGFloat overrides may also need narrowing/widening between the two ABIs.
+template<typename GuestFloat, typename HostFloat>
+static void LC32InvokeGuestSelectorFloatingArgument(
+        id self, SEL selector, HostFloat value) {
+    const GuestFloat guestValue = static_cast<GuestFloat>(value);
+    u64 bits = 0;
+    memcpy(&bits, &guestValue, sizeof(guestValue));
+    LC32InvokeGuestSelectorFloatingArgumentBits(
+        self, selector, bits, sizeof(GuestFloat) == sizeof(double));
+}
+
 static u64 LC32InvokeGuestSelectorWords(id self, SEL _cmd,
                                         const u32 *argumentWords,
                                         size_t argumentWordCount) {
@@ -3586,6 +4095,108 @@ static u32 LC32GuestMalloc(u32 size) {
     u32 args[] = {size};
     return (u32)LC32InvokeGuestC(
         guestMalloc, false, sizeof(args) / sizeof(*args), args);
+}
+
+static bool LC32InputStreamReadSignatureMatches(
+        const char *types, bool hostABI) {
+    if(!types) return false;
+    NSMethodSignature *signature =
+        [NSMethodSignature signatureWithObjCTypes:types];
+    if(!signature || signature.numberOfArguments != 4) return false;
+    auto unqualified = [](const char *type) {
+        while(type && *type && strchr("rnNoORVA", *type)) type++;
+        return type;
+    };
+    const char *result = unqualified(signature.methodReturnType);
+    const char *buffer = unqualified(
+        [signature getArgumentTypeAtIndex:2]);
+    const char *length = unqualified(
+        [signature getArgumentTypeAtIndex:3]);
+    const bool integerTypes = hostABI
+        ? result && !strcmp(result, "q") && length && !strcmp(length, "Q")
+        : result && (!strcmp(result, "i") || !strcmp(result, "l")) &&
+            length && (!strcmp(length, "I") || !strcmp(length, "L"));
+    // Older stream subclasses declare char * instead of uint8_t *. Both
+    // are binary output buffers here, never NUL-terminated input strings.
+    return integerTypes && buffer &&
+        (!strcmp(buffer, "*") || !strcmp(buffer, "^c") ||
+         !strcmp(buffer, "^C"));
+}
+
+static NSInteger LC32InvokeGuestSelectorInputStreamRead(
+        id self, SEL selector, uint8_t *hostBuffer, NSUInteger maxLength) {
+    LC32TraceGuestMethodCallback(self, selector);
+    constexpr NSUInteger maximumBridgeBytes = 64u * 1024u * 1024u;
+    if(maxLength > maximumBridgeBytes || maxLength > INT32_MAX ||
+            (maxLength && !hostBuffer)) {
+        errno = maxLength > maximumBridgeBytes || maxLength > INT32_MAX
+            ? EOVERFLOW : EINVAL;
+        return -1;
+    }
+    if(!Dynarmic_guest_thread_is_registered()) {
+        // The existing selector executor only supports void results. Do not
+        // fabricate EOF or expose this native output pointer to guest code.
+        fprintf(stderr,
+            "LC32: foreign-thread stream read callback is unsupported "
+            "(-[%s %s])\n", class_getName(object_getClass(self)),
+            sel_getName(selector));
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    // Retain non-null pointer identity even for a zero-length request.
+    const u32 allocationBytes = maxLength ? (u32)maxLength :
+        (hostBuffer ? 1u : 0u);
+    std::vector<char> staging;
+    try {
+        staging.resize(allocationBytes, 0);
+    } catch(const std::bad_alloc &) {
+        errno = ENOMEM;
+        return -1;
+    }
+    const u32 guestBuffer = allocationBytes
+        ? LC32GuestMalloc(allocationBytes) : 0;
+    if(allocationBytes && !guestBuffer) {
+        errno = ENOMEM;
+        return -1;
+    }
+    struct GuestBufferCleanup {
+        u32 address;
+        ~GuestBufferCleanup() {
+            if(address) {
+                const int savedError = errno;
+                guest_free(address);
+                errno = savedError;
+            }
+        }
+    } cleanup{guestBuffer};
+    const auto finish = [&](NSInteger result, int error) {
+        if(error) errno = error;
+        return result;
+    };
+    if(allocationBytes && Dynarmic_mem_1write(
+            guestBuffer, allocationBytes, staging.data()) != 0) {
+        return finish(-1, EFAULT);
+    }
+
+    const u32 words[] = {guestBuffer, (u32)maxLength};
+    const int32_t result = (int32_t)(u32)LC32InvokeGuestSelectorWordsRaw(
+        self, selector, words, sizeof(words) / sizeof(*words));
+    if(result < -1 || (result >= 0 && (u32)result > maxLength)) {
+        fprintf(stderr,
+            "LC32: guest stream read returned invalid byte count %d "
+            "for capacity %llu\n", result, (unsigned long long)maxLength);
+        return finish(-1, EIO);
+    }
+    if(result > 0) {
+        if(Dynarmic_mem_1read(guestBuffer, (u32)result,
+                staging.data()) != 0) return finish(-1, EFAULT);
+        memcpy(hostBuffer, staging.data(), (size_t)result);
+    }
+    // NSInteger is signed 64-bit on the host, signed 32-bit in the guest.
+    // Copy only successfully returned bytes; preserve the caller's tail and
+    // leave its entire buffer untouched for EOF or the -1 error result.
+    return finish((NSInteger)result, 0);
 }
 
 /*
@@ -4308,9 +4919,49 @@ static u64 LC32InvokeGuestSelectorRaw(id self, SEL _cmd,
                                      va_list *hostStackArguments,
                                      Method *resolvedMethod) {
     LC32TraceGuestMethodCallback(self, _cmd);
-    // FIXME: fast path to get guest selector? cache to hash map?
-    u32 guest_cmd = guest_sel_registerName(sel_getName(_cmd));
     Method method = object_isClass(self) ? class_getClassMethod(self, _cmd) : class_getInstanceMethod((Class)[self class], _cmd);
+    if(resolvedMethod) *resolvedMethod = method;
+    if(!method) {
+        fprintf(stderr,
+            "LC32: cannot find guest method metadata for %c[%s %s]\n",
+            object_isClass(self) ? '+' : '-',
+            self ? class_getName(object_getClass(self)) : "(null)",
+            _cmd ? sel_getName(_cmd) : "(null)");
+        return 0;
+    }
+
+    const bool registered = Dynarmic_guest_thread_is_registered();
+    const u32 guestCommand = registered
+        ? guest_sel_registerName(sel_getName(_cmd))
+        : LC32LookupGuestSelectorMapping(_cmd);
+    const u32 guestSelf = registered
+        ? (u32)(u64)[self guest_self]
+        : [self guest_selfOrNull];
+
+    LC32GuestBlockCallbackDescriptor callback = {};
+    std::vector<id> callbackObjects;
+    const char *callbackFailure = nullptr;
+    if(!registered) {
+        callback.kind = LC32GuestBlockCallbackKindSelector;
+        callback.guestBlock = guestSelf;
+        callback.guestInvoke = guestCommand;
+        callback.resultKind = LC32GuestBlockValueVoid;
+
+        char *returnType = method_copyReturnType(method);
+        const char *unqualifiedReturnType = returnType;
+        while(*unqualifiedReturnType &&
+                strchr("rnNoORVA", *unqualifiedReturnType)) {
+            unqualifiedReturnType++;
+        }
+        if(*unqualifiedReturnType != 'v') {
+            callbackFailure = "non-void result";
+        } else if(!guestSelf) {
+            callbackFailure = "missing guest receiver mapping";
+        } else if(!guestCommand) {
+            callbackFailure = "missing guest selector mapping";
+        }
+        free(returnType);
+    }
 
     // Objective-C method metadata describes logical arguments, but an arm64
     // NSRange occupies two general-purpose argument slots. Keep an independent
@@ -4331,15 +4982,24 @@ static u64 LC32InvokeGuestSelectorRaw(id self, SEL _cmd,
 
     size_t guest_argc = 0;
     u32 guest_args[20];
-    guest_args[guest_argc++] = (u32)(u64)[self guest_self];
-    guest_args[guest_argc++] = guest_cmd;
+    if(registered) {
+        guest_args[guest_argc++] = guestSelf;
+        guest_args[guest_argc++] = guestCommand;
+    }
 
     int nargs = method_getNumberOfArguments(method);
     // The generic trampoline has six logical host argument positions. Structs
     // may expand those into extra raw GPR slots (and at most one supported
     // stack argument); broader stack/FP signatures need typed trampolines.
-    assert(nargs <= 8);
+    if(registered) {
+        assert(nargs <= 8);
+    } else if(nargs > 8 || nargs - 2 >
+                  LC32_GUEST_BLOCK_CALLBACK_MAX_ARGUMENTS) {
+        callbackFailure = "too many arguments for the callback executor";
+    }
+    callback.argumentCount = (uint32_t)(nargs - 2);
     for(int i = 2; i < nargs; i++) {
+        if(!registered && callbackFailure) break;
         char *argType = method_copyArgumentType(method, i);
         const char *unqualifiedType = argType;
         while(*unqualifiedType && strchr("rnNoORVA", *unqualifiedType)) {
@@ -4361,12 +5021,21 @@ static u64 LC32InvokeGuestSelectorRaw(id self, SEL _cmd,
                     hostRegisterArgumentCount - hostArgumentSlot < 2) {
                 hostArgumentSlot = hostRegisterArgumentCount;
             }
-            assert(guest_argc + 2 <=
-                   sizeof(guest_args) / sizeof(*guest_args));
-            guest_args[guest_argc++] = (u32)nextHostArgument();
-            guest_args[guest_argc++] = (u32)nextHostArgument();
+            const u64 location = nextHostArgument();
+            const u64 length = nextHostArgument();
+            if(registered) {
+                assert(guest_argc + 2 <=
+                       sizeof(guest_args) / sizeof(*guest_args));
+                guest_args[guest_argc++] = (u32)location;
+                guest_args[guest_argc++] = (u32)length;
+            } else if(!callbackFailure) {
+                LC32GuestBlockCallbackArgument &argument =
+                    callback.arguments[i - 2];
+                argument.kind = LC32GuestBlockValueRange;
+                argument.value = location;
+                argument.value2 = length;
+            }
         } else {
-            assert(guest_argc < sizeof(guest_args) / sizeof(*guest_args));
             const u64 hostArgument = nextHostArgument();
             if(unqualifiedType[0] == '@' &&
                unqualifiedType[1] != '?') {
@@ -4374,27 +5043,135 @@ static u64 LC32InvokeGuestSelectorRaw(id self, SEL _cmd,
                     "host->guest", _cmd, (unsigned int)(i - 2),
                     (id)hostArgument);
             }
-            const char *selectorName = sel_getName(_cmd);
-            if(unqualifiedType[0] == '^' &&
-                    !(unqualifiedType[1] == 'v' &&
-                      hostArgument == (u64)(u32)hostArgument) &&
-                    strncmp(unqualifiedType, "^{_NSZone=",
-                            sizeof("^{_NSZone=") - 1) &&
-                    strncmp(unqualifiedType, "^{NSZone=",
-                            sizeof("^{NSZone=") - 1)) {
-                fprintf(stderr,
-                    "LC32: cannot marshal host pointer argument %d "
-                    "(%s) for selector %s (value=0x%llx)\n",
-                    i - 2, unqualifiedType,
-                    selectorName ? selectorName : "<null>",
-                    (unsigned long long)hostArgument);
+            if(registered) {
+                assert(guest_argc <
+                       sizeof(guest_args) / sizeof(*guest_args));
+                const char *selectorName = sel_getName(_cmd);
+                if(unqualifiedType[0] == '^' &&
+                        !(unqualifiedType[1] == 'v' &&
+                          hostArgument == (u64)(u32)hostArgument) &&
+                        strncmp(unqualifiedType, "^{_NSZone=",
+                                sizeof("^{_NSZone=") - 1) &&
+                        strncmp(unqualifiedType, "^{NSZone=",
+                                sizeof("^{NSZone=") - 1)) {
+                    fprintf(stderr,
+                        "LC32: cannot marshal host pointer argument %d "
+                        "(%s) for selector %s (value=0x%llx)\n",
+                        i - 2, unqualifiedType,
+                        selectorName ? selectorName : "<null>",
+                        (unsigned long long)hostArgument);
+                }
+                guest_args[guest_argc++] = LC32HostToGuestArgument(
+                    argType, hostArgument);
+            } else if(!callbackFailure) {
+                LC32GuestBlockCallbackArgument &argument =
+                    callback.arguments[i - 2];
+                switch(unqualifiedType[0]) {
+                    case '@':
+                        /* A native block is not an ordinary mirrored object:
+                         * it needs the block bridge's invoke/signature
+                         * metadata before guest code can call it.  Diagnose
+                         * that unsupported callback ABI instead of creating
+                         * an unusable NSObject proxy for the block. */
+                        if(unqualifiedType[1] == '?') {
+                            callbackFailure =
+                                "unsupported block argument";
+                            break;
+                        }
+                        [[fallthrough]];
+                    case '#': {
+                        argument.kind = LC32GuestBlockValueObject;
+                        id object = reinterpret_cast<id>(
+                            static_cast<uintptr_t>(hostArgument));
+                        argument.value = reinterpret_cast<u64>(
+                            objc_retain(object));
+                        if(object) callbackObjects.push_back(object);
+                        break;
+                    }
+                    case 'B':
+                    case 'c':
+                        argument.kind = LC32GuestBlockValueSignedChar;
+                        argument.value = hostArgument;
+                        break;
+                    case 'i':
+                    case 'l':
+                    case 's':
+                        argument.kind = LC32GuestBlockValueSigned32;
+                        argument.value = hostArgument;
+                        break;
+                    case 'C':
+                    case 'I':
+                    case 'L':
+                    case 'S':
+                        argument.kind = LC32GuestBlockValueUnsigned32;
+                        argument.value = hostArgument;
+                        break;
+                    case 'q':
+                        argument.kind = LC32GuestBlockValueSigned64;
+                        argument.value = hostArgument;
+                        break;
+                    case 'Q':
+                        argument.kind = LC32GuestBlockValueUnsigned64;
+                        argument.value = hostArgument;
+                        break;
+                    case ':': {
+                        argument.kind = LC32GuestBlockValueUnsigned32;
+                        SEL selector = reinterpret_cast<SEL>(
+                            static_cast<uintptr_t>(hostArgument));
+                        argument.value = selector
+                            ? LC32LookupGuestSelectorMapping(selector)
+                            : 0;
+                        if(selector && !argument.value) {
+                            callbackFailure =
+                                "unmapped selector argument";
+                        }
+                        break;
+                    }
+                    case '^':
+                        argument.kind = LC32GuestBlockValueUnsigned32;
+                        if(unqualifiedType[1] == 'v' &&
+                                hostArgument == (u64)(u32)hostArgument) {
+                            argument.value = hostArgument;
+                        } else if(!strncmp(unqualifiedType, "^{_NSZone=",
+                                      sizeof("^{_NSZone=") - 1) ||
+                                  !strncmp(unqualifiedType, "^{NSZone=",
+                                      sizeof("^{NSZone=") - 1)) {
+                            argument.value = 0;
+                        } else {
+                            callbackFailure =
+                                "unsupported pointer argument";
+                        }
+                        break;
+                    default:
+                        callbackFailure = "unsupported argument type";
+                        break;
+                }
             }
-            guest_args[guest_argc++] = LC32HostToGuestArgument(
-                argType, hostArgument);
         }
         free(argType);
     }
-    if(resolvedMethod) *resolvedMethod = method;
+
+    if(!registered) {
+        bool submitted = false;
+        if(!callbackFailure) {
+            id retainedReceiver = objc_retain(self);
+            submitted =
+                Dynarmic_submit_guest_selector_callback(&callback);
+            objc_release(retainedReceiver);
+            if(!submitted) callbackFailure = "callback executor rejected it";
+        }
+        for(id object : callbackObjects) objc_release(object);
+        if(callbackFailure) {
+            fprintf(stderr,
+                "LC32: cannot relay foreign-thread guest callback "
+                "%c[%s %s]: %s\n",
+                object_isClass(self) ? '+' : '-',
+                self ? class_getName(object_getClass(self)) : "(null)",
+                _cmd ? sel_getName(_cmd) : "(null)",
+                callbackFailure);
+        }
+        return 0;
+    }
     return guest_objc_msgSend((int)guest_argc, guest_args);
 }
 
@@ -4407,11 +5184,94 @@ u64 LC32InvokeGuestSelector(id self, SEL _cmd, u64 arg2, u64 arg3,
         self, _cmd, arg2, arg3, arg4, arg5, arg6, arg7,
         &hostStackArguments, &method);
     va_end(hostStackArguments);
+    if(!method) return 0;
 
     char *returnType = method_copyReturnType(method);
     u64 host_result = LC32GuestToHostReturnType(returnType, guest_result);
     free(returnType);
     return host_result;
+}
+
+static void LC32InvokeGuestNotificationSelector(
+        id observer, SEL selector, NSNotification *notification) {
+    LC32TraceGuestMethodCallback(observer, selector);
+    if(Dynarmic_guest_thread_is_registered()) {
+        const u32 words[] = {notification ? [notification guest_self] : 0};
+        (void)LC32InvokeGuestSelectorWordsRaw(observer, selector, words, 1);
+        return;
+    }
+
+    // A native notification poster may have no guest JIT in TLS. Keep both
+    // native objects alive until the existing synchronous executor returns.
+    LC32GuestBlockCallbackDescriptor callback = {};
+    callback.kind = LC32GuestBlockCallbackKindSelector;
+    callback.guestBlock = [observer guest_selfOrNull];
+    callback.guestInvoke = LC32LookupGuestSelectorMapping(selector);
+    callback.resultKind = LC32GuestBlockValueVoid;
+    callback.argumentCount = 1;
+    callback.arguments[0].kind = LC32GuestBlockValueObject;
+    callback.arguments[0].value = (u64)objc_retain(notification);
+    id retainedObserver = objc_retain(observer);
+    const bool submitted = Dynarmic_submit_guest_selector_callback(&callback);
+    objc_release(retainedObserver);
+    objc_release(notification);
+    if(!submitted) {
+        fprintf(stderr, "LC32: cannot relay notification callback %s\n",
+            sel_getName(selector));
+    }
+}
+
+static SEL LC32NotificationCallbackSelector(id observer, SEL selector) {
+    if(!observer || !selector) return selector;
+    Class cls = object_getClass(observer);
+    Method method = class_getInstanceMethod(cls, selector);
+    if(!method || method_getImplementation(method) != (IMP)&LC32InvokeGuestSelector ||
+            method_getNumberOfArguments(method) != 3) return selector;
+
+    char *argument = method_copyArgumentType(method, 2);
+    char *result = method_copyReturnType(method);
+    const char *argumentType = argument, *resultType = result;
+    while(*argumentType && strchr("rnNoORVA", *argumentType)) ++argumentType;
+    while(*resultType && strchr("rnNoORVA", *resultType)) ++resultType;
+    const bool needsAdapter = *resultType == 'v' &&
+        !(argumentType[0] == '@' && argumentType[1] != '?');
+    free(argument);
+    free(result);
+    if(!needsAdapter) return selector;
+
+    /* NotificationCenter always sends one NSNotification object, regardless
+     * of a callback's declared argument type. Some legacy libraries declared
+     * an unused int* instead. Install a private, correctly typed selector for
+     * this registration rather than changing that method or interpreting
+     * arbitrary pointers as objects in the general callback trampoline.
+     *
+     * Keep the original observer, center, name and sender: native weak
+     * storage, duplicate registrations and removeObserver: filters continue
+     * to work. The process-lifetime IMP captures only the original selector,
+     * never the observer or center, and passes the original _cmd to the guest.
+     */
+    static std::mutex mutex;
+    static std::unordered_map<Class, std::unordered_map<SEL, SEL>> aliases;
+    static uint64_t nextAlias = 0;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto &classAliases = aliases[cls];
+    auto existing = classAliases.find(selector);
+    if(existing != classAliases.end()) return existing->second;
+
+    IMP implementation = imp_implementationWithBlock(
+        ^(id target, NSNotification *notification) {
+            LC32InvokeGuestNotificationSelector(target, selector, notification);
+        });
+    if(!implementation) abort();
+    SEL alias;
+    do {
+        char name[64];
+        snprintf(name, sizeof(name), "__lc32_notification_%llu:",
+            (unsigned long long)++nextAlias);
+        alias = sel_registerName(name);
+    } while(!class_addMethod(cls, alias, implementation, "v24@0:8@16"));
+    classAliases.emplace(selector, alias);
+    return alias;
 }
 
 static float LC32InvokeGuestSelectorGuestFloatHostFloat(
@@ -4460,6 +5320,271 @@ static double LC32InvokeGuestSelectorGuestDoubleHostDouble(
         &hostStackArguments, nullptr);
     va_end(hostStackArguments);
     return LC32GuestDoubleReturn(guestResult);
+}
+
+// Only scalar signatures with at most six explicit arguments use this entry
+// point. Both native argument banks therefore fit in registers; aggregate,
+// pointer, and native-stack layouts keep their existing typed implementations.
+struct LC32ScalarCallbackFrame {
+    u64 integers[8];
+    u64 floating[8];
+};
+static_assert(offsetof(LC32ScalarCallbackFrame, floating) == 64);
+static_assert(sizeof(LC32ScalarCallbackFrame) == 128);
+extern "C" void LC32InvokeGuestSelectorScalars(void);
+
+struct LC32ScalarCallbackSignature {
+    unsigned count = 0;
+    char guestReturn = 0, hostReturn = 0;
+    char guestArguments[6] = {}, hostArguments[6] = {};
+};
+
+struct LC32ScalarCallbackRegistry {
+    std::mutex mutex;
+    std::unordered_map<Class,
+        std::unordered_map<SEL, LC32ScalarCallbackSignature>> classes;
+};
+
+static LC32ScalarCallbackRegistry &LC32ScalarCallbacks() {
+    static auto *registry = new LC32ScalarCallbackRegistry;
+    return *registry;
+}
+
+static bool LC32ScanScalarCallbackTypes(const char *types, char &returnKind,
+        char (&arguments)[6], unsigned &argumentCount) {
+    if(!types) return false;
+    constexpr size_t maxEncodingLength = 4096;
+    const size_t length = strnlen(types, maxEncodingLength);
+    if(!length || length == maxEncodingLength) return false;
+    const char *cursor = types;
+    const char *end = types + length;
+    auto nextKind = [&](bool result) -> char {
+        while(cursor < end && strchr("rnNoORVA", *cursor)) ++cursor;
+        if(cursor == end) return 0;
+        const char kind = *cursor++;
+        if(!strchr("BcCsSiIlLqQfd@#:", kind) && !(result && kind == 'v'))
+            return 0;
+        if(kind == '@') {
+            if(cursor < end && *cursor == '?') return 0;
+            if(cursor < end && *cursor == '"') {
+                ++cursor;
+                while(cursor < end && *cursor != '"') {
+                    if(*cursor++ == '\\') {
+                        if(cursor == end) return 0;
+                        ++cursor;
+                    }
+                }
+                if(cursor == end) return 0;
+                ++cursor;
+            }
+        }
+        // Optional frame/argument offsets describe the source ABI; only the
+        // logical scalar kinds are needed to pair the two architectures.
+        if(cursor < end && (*cursor == '+' || *cursor == '-')) {
+            ++cursor;
+            if(cursor == end || *cursor < '0' || *cursor > '9') return 0;
+        }
+        while(cursor < end && *cursor >= '0' && *cursor <= '9') ++cursor;
+        return kind;
+    };
+    returnKind = nextKind(true);
+    if(!returnKind) return false;
+    const char selfKind = nextKind(false);
+    if((selfKind != '@' && selfKind != '#') || nextKind(false) != ':') return false;
+    argumentCount = 0;
+    while(cursor < end) {
+        if(argumentCount == 6) return false;
+        const char kind = nextKind(false);
+        if(!kind) return false;
+        arguments[argumentCount++] = kind;
+    }
+    return argumentCount != 0;
+}
+
+static bool LC32ScalarKindsMatch(char guest, char host) {
+    if(!guest || !host) return false;
+    if(guest == host) return true;
+    if(strchr("fd", guest) && strchr("fd", host)) return true;
+    return strchr("BcCsSiIlLqQ", guest) && strchr("BcCsSiIlLqQ", host);
+}
+
+static bool LC32ParseScalarCallbackSignature(const char *guestTypes,
+        const char *hostTypes, LC32ScalarCallbackSignature &output) {
+    /* This gate sees every guest method, including C++ aggregates which
+     * Foundation's type parser can throw on. Reject non-scalar syntax here
+     * without constructing an NSMethodSignature or parsing aggregate fields. */
+    LC32ScalarCallbackSignature signature;
+    unsigned hostCount = 0;
+    if(!LC32ScanScalarCallbackTypes(guestTypes, signature.guestReturn,
+            signature.guestArguments, signature.count) ||
+       !LC32ScanScalarCallbackTypes(hostTypes, signature.hostReturn,
+            signature.hostArguments, hostCount) || hostCount != signature.count)
+        return false;
+    if(!LC32ScalarKindsMatch(signature.guestReturn, signature.hostReturn)) return false;
+    bool needsScalarCapture = strchr("fd", signature.guestReturn) != nullptr;
+    for(unsigned index = 0; index < signature.count; ++index) {
+        const char guestKind = signature.guestArguments[index];
+        const char hostKind = signature.hostArguments[index];
+        if(!LC32ScalarKindsMatch(guestKind, hostKind)) return false;
+        needsScalarCapture |= strchr("fdqQ", guestKind) != nullptr ||
+            strchr("fdqQ", hostKind) != nullptr;
+    }
+    if(!needsScalarCapture) return false;
+    output = signature;
+    return true;
+}
+
+static bool LC32RegisterScalarCallback(Class cls, SEL selector,
+        const LC32ScalarCallbackSignature &signature) {
+    auto &registry = LC32ScalarCallbacks();
+    const std::lock_guard<std::mutex> lock(registry.mutex);
+    try {
+        registry.classes[cls].emplace(selector, signature);
+        return true;
+    } catch(const std::bad_alloc &) {
+        return false;
+    }
+}
+
+static bool LC32FindScalarCallback(Class cls, SEL selector,
+        LC32ScalarCallbackSignature &signature) {
+    auto &registry = LC32ScalarCallbacks();
+    const std::lock_guard<std::mutex> lock(registry.mutex);
+    for(; cls; cls = class_getSuperclass(cls)) {
+        const auto owner = registry.classes.find(cls);
+        if(owner == registry.classes.end()) continue;
+        const auto method = owner->second.find(selector);
+        if(method == owner->second.end()) continue;
+        signature = method->second;
+        return true;
+    }
+    return false;
+}
+
+static u64 LC32ScalarIntegerBits(char kind, u64 bits) {
+    switch(kind) {
+        case 'B': return (uint8_t)bits != 0;
+        case 'c': return (u64)(int64_t)(int8_t)bits;
+        case 's': return (u64)(int64_t)(int16_t)bits;
+        case 'i': case 'l': return (u64)(int64_t)(int32_t)bits;
+        case 'C': return (uint8_t)bits;
+        case 'S': return (uint16_t)bits;
+        case 'I': case 'L': return (u32)bits;
+        default: return bits;
+    }
+}
+
+static u64 LC32ScalarFloatingBits(char from, char to, u64 bits) {
+    if(from == to) return to == 'f' ? (u32)bits : bits;
+    u64 result = 0;
+    if(to == 'f') {
+        const float value = (float)LC32GuestDoubleReturn(bits);
+        memcpy(&result, &value, sizeof(value));
+    } else {
+        const double value = (double)LC32GuestFloatReturn(bits);
+        memcpy(&result, &value, sizeof(value));
+    }
+    return result;
+}
+
+extern "C" u64 LC32InvokeGuestSelectorScalarFrame(
+        const LC32ScalarCallbackFrame *frame) {
+    id self = (id)frame->integers[0];
+    SEL selector = (SEL)frame->integers[1];
+    LC32ScalarCallbackSignature signature;
+    if(!LC32FindScalarCallback(object_getClass(self), selector, signature)) {
+        [NSException raise:NSInternalInconsistencyException
+            format:@"LC32: missing scalar callback metadata for %s", sel_getName(selector)];
+    }
+    LC32TraceGuestMethodCallback(self, selector);
+    const bool registered = Dynarmic_guest_thread_is_registered();
+    if(!registered && signature.guestReturn != 'v') {
+        fprintf(stderr, "LC32: cannot relay non-void scalar callback %s on a foreign thread\n",
+            sel_getName(selector));
+        return 0;
+    }
+    if(!registered && signature.count > LC32_GUEST_BLOCK_CALLBACK_MAX_ARGUMENTS) {
+        fprintf(stderr, "LC32: too many arguments for foreign scalar callback %s\n",
+            sel_getName(selector));
+        return 0;
+    }
+    const u32 guestSelf = registered ? [self guest_self] : [self guest_selfOrNull];
+    const u32 guestSelector = registered
+        ? guest_sel_registerName(sel_getName(selector))
+        : LC32LookupGuestSelectorMapping(selector);
+    if(!guestSelf || !guestSelector) {
+        [NSException raise:NSInternalInconsistencyException
+            format:@"LC32: missing guest scalar callback target for %s", sel_getName(selector)];
+    }
+
+    u32 words[14] = {guestSelf, guestSelector};
+    size_t wordCount = 2, integerSlot = 2, floatingSlot = 0;
+    LC32GuestBlockCallbackDescriptor callback = {};
+    callback.kind = LC32GuestBlockCallbackKindSelector;
+    callback.guestBlock = guestSelf;
+    callback.guestInvoke = guestSelector;
+    callback.resultKind = LC32GuestBlockValueVoid;
+    callback.argumentCount = signature.count;
+    std::array<LC32HostInvocationReceiverGuard, 7> leases;
+    for(unsigned index = 0; index < signature.count; ++index) {
+        const char guestKind = signature.guestArguments[index];
+        const char hostKind = signature.hostArguments[index];
+        const bool floating = hostKind == 'f' || hostKind == 'd';
+        const u64 input = floating ? frame->floating[floatingSlot++]
+            : frame->integers[integerSlot++];
+        u64 bits = input;
+        uint32_t valueKind = (guestKind == 'q' || guestKind == 'Q' || guestKind == 'd')
+            ? LC32GuestBlockValueUnsigned64 : LC32GuestBlockValueUnsigned32;
+        if(floating) {
+            bits = LC32ScalarFloatingBits(hostKind, guestKind, input);
+        } else if(guestKind == '@' || guestKind == '#') {
+            if(registered) {
+                bits = input ? [(id)input guest_self] : 0;
+            } else {
+                leases[index].adoptRetained(objc_retain((id)input));
+                valueKind = LC32GuestBlockValueObject;
+            }
+        } else if(guestKind == ':') {
+            bits = !input ? 0 : registered
+                ? guest_sel_registerName(sel_getName((SEL)input))
+                : LC32LookupGuestSelectorMapping((SEL)input);
+            if(input && !bits) {
+                fprintf(stderr, "LC32: unmapped selector argument in scalar callback %s\n",
+                    sel_getName(selector));
+                return 0;
+            }
+        } else {
+            bits = LC32ScalarIntegerBits(guestKind,
+                LC32ScalarIntegerBits(hostKind, input));
+        }
+        if(registered) {
+            words[wordCount++] = (u32)bits;
+            if(valueKind == LC32GuestBlockValueUnsigned64)
+                words[wordCount++] = (u32)(bits >> 32);
+        } else {
+            callback.arguments[index].kind = valueKind;
+            callback.arguments[index].value = bits;
+        }
+    }
+    if(!registered) {
+        leases[6].adoptRetained(objc_retain(self));
+        if(!Dynarmic_submit_guest_selector_callback(&callback)) {
+            fprintf(stderr, "LC32: cannot relay scalar callback %s on a foreign thread\n",
+                sel_getName(selector));
+        }
+        return 0;
+    }
+    const u64 result = guest_objc_msgSend((int)wordCount, words);
+    if(signature.guestReturn == 'v') return 0;
+    if(signature.guestReturn == 'f' || signature.guestReturn == 'd')
+        return LC32ScalarFloatingBits(signature.guestReturn, signature.hostReturn, result);
+    if(signature.guestReturn == ':') return result ? LC32GetHostSelector((u32)result) : 0;
+    if(signature.guestReturn == '@' || signature.guestReturn == '#') {
+        char type[] = {signature.guestReturn, 0};
+        return LC32GuestToHostReturnType(type, result);
+    }
+    return LC32ScalarIntegerBits(signature.hostReturn,
+        LC32ScalarIntegerBits(signature.guestReturn, result));
 }
 
 /*
@@ -4557,8 +5682,8 @@ void LC32SetGuestScalarIvar(id self, SEL _cmd, u64 value) {
 void LC32SetGuestNSObjectIvar(id self, SEL _cmd, id value) {
     LC32GuestIvarBinding binding;
     if(!LC32GuestIvarBindingForReceiver(self, _cmd, &binding)) return;
-    guest_object_setInstanceVariable([self guest_self], binding.name.c_str(),
-                                     (u32)(u64)[value guest_self]);
+    guest_object_setInstanceVariableWithStrongDefault(
+        [self guest_self], binding.name.c_str(), (u32)(u64)[value guest_self]);
 }
 
 id LC32GetGuestNSObjectIvar(id self, SEL _cmd) {
@@ -4681,10 +5806,15 @@ u32 guest_object_getClass(u32 guest_obj) {
     return Dynarmic_current_user_callbacks()->MemoryRead32(guest_obj);
 }
 
-u32 guest_object_setInstanceVariable(u32 guest_obj, const char *host_name, u32 newValue) {
+u32 guest_object_setInstanceVariableWithStrongDefault(
+        u32 guest_obj, const char *host_name, u32 newValue) {
     static std::atomic<u32> cache{0};
+    // Synthetic accessors stand in for KVC's direct-ivar assignment. Bare
+    // MRC outlets own their value; ordinary object_setInstanceVariable does
+    // not retain them. The strong-default variant also respects ARC layouts
+    // (including weak and unsafe-unretained ivars) and balances replacement.
     const u32 guestPtr = LC32CachedGuestSymbol(
-        cache, "object_setInstanceVariable");
+        cache, "object_setInstanceVariableWithStrongDefault");
     DynarmicGuestStackString guest_name(host_name);
     u32 args[] = {guest_obj, guest_name.guestPtr, newValue};
     return LC32InvokeGuestC(guestPtr, false, sizeof(args)/sizeof(*args), args);
@@ -4737,6 +5867,33 @@ static LC32GuestSelectorRegistry& LC32GuestSelectorRegistryInstance() {
     return *registry;
 }
 
+void LC32RegisterGuestSelectorMapping(
+        SEL hostSelector, u32 guestSelector) {
+    if(!hostSelector || !guestSelector) return;
+    LC32GuestSelectorRegistry &registry =
+        LC32GuestSelectorRegistryInstance();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    const auto result = registry.selectors.emplace(
+        hostSelector, guestSelector);
+    if(!result.second && result.first->second != guestSelector) {
+        fprintf(stderr,
+            "LC32: conflicting guest selectors for %s: 0x%x and 0x%x\n",
+            sel_getName(hostSelector), result.first->second,
+            guestSelector);
+    }
+}
+
+u32 LC32LookupGuestSelectorMapping(SEL hostSelector) {
+    if(!hostSelector) return 0;
+    LC32GuestSelectorRegistry &registry =
+        LC32GuestSelectorRegistryInstance();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    const auto iterator = registry.selectors.find(hostSelector);
+    return iterator != registry.selectors.end()
+        ? iterator->second
+        : 0;
+}
+
 static LC32GuestClassRegistry& LC32GuestClassRegistryInstance() {
     /* Objective-C class objects, like selectors, are never deallocated. */
     static auto *registry = new LC32GuestClassRegistry;
@@ -4746,16 +5903,12 @@ static LC32GuestClassRegistry& LC32GuestClassRegistryInstance() {
 }  // namespace
 
 u32 guest_sel_registerName(const char *host_name) {
-    if(!host_name || !Dynarmic_guest_thread_is_registered()) return 0;
+    if(!host_name) return 0;
 
     const SEL hostSelector = sel_registerName(host_name);
-    LC32GuestSelectorRegistry &registry =
-        LC32GuestSelectorRegistryInstance();
-    {
-        std::lock_guard<std::mutex> lock(registry.mutex);
-        const auto iterator = registry.selectors.find(hostSelector);
-        if(iterator != registry.selectors.end()) return iterator->second;
-    }
+    const u32 existing = LC32LookupGuestSelectorMapping(hostSelector);
+    if(existing) return existing;
+    if(!Dynarmic_guest_thread_is_registered()) return 0;
 
     static std::atomic<u32> cache{0};
     const u32 guestPtr = LC32CachedGuestSymbol(cache, "sel_registerName");
@@ -4769,10 +5922,8 @@ u32 guest_sel_registerName(const char *host_name) {
     /* Never hold the registry across guest execution: registering a selector
      * can synchronously re-enter the bridge.  Concurrent registration of the
      * same name is harmless and must resolve to the same permanent selector. */
-    std::lock_guard<std::mutex> lock(registry.mutex);
-    const auto result = registry.selectors.emplace(
-        hostSelector, guestSelector);
-    return result.first->second;
+    LC32RegisterGuestSelectorMapping(hostSelector, guestSelector);
+    return LC32LookupGuestSelectorMapping(hostSelector);
 }
 
 //if(!guestPtr) guestPtr = guest_dlsym("LC32TestHostToGuestCall");
@@ -4842,8 +5993,8 @@ Class guest_objc_getClass_retHostClass(const char *name) {
     return outClass;
 }
 
-u64 guest_objc_msgSend(int argc, u32 *args) {
-    LC32DrainDeferredGuestPinReleases();
+static u64 LC32GuestObjCMsgSendWithoutDeferredReleases(
+        int argc, u32 *args) {
 #ifdef LC32_TRACE_GUEST_OBJC_MSGSEND
     if(argc >= 2 && args != nullptr) {
         bool trace = args[1] == 0;
@@ -4864,6 +6015,11 @@ u64 guest_objc_msgSend(int argc, u32 *args) {
     static std::atomic<u32> cache{0};
     const u32 guestPtr = LC32CachedGuestSymbol(cache, "objc_msgSend");
     return LC32InvokeGuestC(guestPtr, true, argc, args);
+}
+
+u64 guest_objc_msgSend(int argc, u32 *args) {
+    LC32DrainDeferredGuestPinReleases();
+    return LC32GuestObjCMsgSendWithoutDeferredReleases(argc, args);
 }
 
 /*
@@ -4942,7 +6098,14 @@ static bool LC32AdjustGuestReferenceNow(
             releaseSelector, "LC32_release");
     }
     u32 args[] = {guestObject, selector};
-    guest_objc_msgSend(sizeof(args) / sizeof(*args), args);
+    /* A lifetime-pin retain can run while the guest holds its publication
+     * writer gate. Draining unrelated deferred releases here may destroy an
+     * object whose guest allocation hashes to that same gate stripe and
+     * deadlock on the interrupted writer. Internal ownership bookkeeping
+     * must not introduce unrelated teardown; public callback entries retain
+     * their normal deferred-release drain. */
+    LC32GuestObjCMsgSendWithoutDeferredReleases(
+        sizeof(args) / sizeof(*args), args);
     return true;
 }
 
@@ -4982,10 +6145,9 @@ static void LC32ReleaseGuestReference(
             LC32AdjustGuestReferenceNow(guestObject, false, kind);
         if(kind == LC32GuestReleaseKind::LifetimePin &&
            lifetimePinWasFinal) {
-            /* This call commonly runs from an associated lifetime pin's
-             * -dealloc while its native owner is still tearing down. Keep the
-             * noncallable tombstone indexed until that native dealloc frame has
-             * returned, then remove only the exact generation. */
+            /* Guest root -dealloc removed the guest key before freeing its
+             * allocation. Native -dealloc may still be unwinding, so defer
+             * final destruction of the detached native-address tombstone. */
             LC32DeferHostWeakMappingRetirementFinalization(
                 guestObject, weakRegistryGeneration);
         }
@@ -5322,6 +6484,109 @@ static u8 *LC32GuestMirrorRetiringState(id hostObject) {
         object_getClass(hostObject), LC32GuestMirrorRetiringIvarName);
     if(!ivar) return nullptr;
     return reinterpret_cast<u8 *>(hostObject) + ivar_getOffset(ivar);
+}
+
+static u32 LC32ReleaseNativeProxyOwnership(
+        u32 guestObject, u64 hostAddress, bool releaseHostOwnership) {
+    std::shared_ptr<LC32HostWeakMappingEntry> entry;
+    {
+        LC32HostWeakRegistry &registry = LC32HostWeakMappings();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        auto iterator = registry.entries.find(guestObject);
+        if(iterator == registry.entries.end() ||
+           iterator->second->expectedHostAddress != hostAddress ||
+           iterator->second->state != LC32HostWeakMappingState::Live ||
+           iterator->second->lifetime != LC32HostMappingLifetime::Pinned ||
+           !iterator->second->weakCompatible ||
+           !iterator->second->invocationRetainCompatible) {
+            return LC32NativeProxyReleaseNotApplicable;
+        }
+        entry = iterator->second;
+    }
+
+    const auto reject = [&]() -> u32 {
+        fprintf(stderr,
+            "LC32: cannot release native proxy guest=0x%x host=0x%llx "
+            "generation=%llu without a live matching lifetime pin\n",
+            guestObject, (unsigned long long)hostAddress,
+            (unsigned long long)entry->generation);
+        return LC32NativeProxyReleaseRejected;
+    };
+
+    /* Never inspect a raw native address before an atomic weak promotion.
+     * The lease also keeps native deallocation from consuming the guest pin
+     * while we decide which part of the guest root count may be released. */
+    id __unsafe_unretained hostObject = LC32LoadWeakRetainedHostObject(
+        &entry->weakHostObject, (id)(uintptr_t)hostAddress);
+    if(!hostObject) return reject();
+    LC32HostInvocationReceiverGuard nativeGuard;
+    (void)nativeGuard.adoptRetained(hostObject);
+
+    /* Synthesized guest classes retain their existing coordinated teardown
+     * contract. This path is only for ordinary native framework objects. */
+    if(LC32GuestMirrorRetiringState(hostObject)) {
+        return LC32NativeProxyReleaseNotApplicable;
+    }
+
+    static std::atomic<u32> releasePrimitive{0};
+    const u32 guestRelease = LC32CachedGuestSymbol(
+        releasePrimitive, "LC32ReleaseGuestNativeProxyOwnership");
+    if(!guestRelease) return reject();
+
+    const auto mappingIsCurrent = [&]() {
+        LC32HostWeakRegistry &registry = LC32HostWeakMappings();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        auto iterator = registry.entries.find(guestObject);
+        return iterator != registry.entries.end() &&
+            iterator->second.get() == entry.get() &&
+            iterator->second->generation == entry->generation &&
+            entry->expectedHostAddress == hostAddress &&
+            entry->state == LC32HostWeakMappingState::Live &&
+            entry->lifetime == LC32HostMappingLifetime::Pinned &&
+            entry->retirementProvenance ==
+                LC32HostMappingRetirementProvenance::None;
+    };
+
+    /* Use the public peer monitor only to acquire the matching pin. Taking
+     * a guest SideTable lock while holding that monitor could deadlock with
+     * a guest weak load whose native -retainWeakReference uses the monitor.
+     * The pin lease also delays its -dealloc if an association is detached
+     * while this release is in flight. Neither lease is destroyed in a lock. */
+    LC32HostInvocationReceiverGuard pinGuard;
+    LC32GuestLifetimePin *__unsafe_unretained pin = nil;
+    @synchronized(hostObject) {
+        if(!mappingIsCurrent()) return reject();
+        pin = objc_getAssociatedObject(
+            hostObject, LC32GuestLifetimePinKey);
+        if(!pin || pin->guestObject != guestObject ||
+           pin->weakRegistryGeneration != entry->generation) return reject();
+        (void)pinGuard.adoptRetained(LC32RetainOwnedHostObject(pin));
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(entry->nativeProxyReleaseMutex);
+        if(!mappingIsCurrent() || pin->guestObject != guestObject ||
+           pin->weakRegistryGeneration != entry->generation) return reject();
+        /* Serialize only the tiny root-counter primitive. Unlike public
+         * guest_objc_msgSend, LC32InvokeGuestC does not opportunistically drain
+         * unrelated releases, whose callbacks could reenter this private gate.
+         * No peer monitor or registry lock spans this bounded guest call. */
+        u32 args[] = {guestObject};
+        if(!LC32InvokeGuestC(guestRelease, false, 1, args)) return reject();
+    }
+
+    /* A +0 native result can have owners invisible to the guest root count.
+     * An old caller's excess guest release must still reach native reference
+     * counting; it must not destroy the proxy while those owners remain.
+     * This does not make native over-release safe: the caller still needs a
+     * real native +1 to consume. Neither native release nor final lease
+     * destruction may run under the private gate above. */
+    if(releaseHostOwnership) {
+        LC32GuestHostCallQuiescence quiescence;
+        LC32ReleaseOwnedHostObject(hostObject);
+        quiescence.finish();
+    }
+    return LC32NativeProxyReleaseHandled;
 }
 
 static bool LC32GuestMirrorIsRetiring(id hostObject) {
@@ -5664,12 +6929,44 @@ BOOL host_hook_getClass(const char *name, Class *outClass) {
         return false;
     }
 
-    printf("host_hook_getClass: %s\n", name);
+    LC32_DEBUG_PRINTF("host_hook_getClass: %s\n", name);
     *outClass = guest_objc_getClass_retHostClass(name);
     return *outClass != nil;
 }
 
+static Class LC32NativeNSProxyClass;
+
+static Class LC32NativeProxyPhysicalClass(id object) {
+    Class physicalClass = object_isClass(object)
+        ? (Class)object : object_getClass(object);
+    for(Class cls = physicalClass; cls; cls = class_getSuperclass(cls)) {
+        if(cls == LC32NativeNSProxyClass) return physicalClass;
+    }
+    return Nil;
+}
+
 @implementation NSObject(LC32)
+- (NSMethodSignature *)LC32_nativeMethodSignatureForSelector:(SEL)selector
+                                           instanceMethods:(BOOL)instanceMethods {
+    if(!selector || (instanceMethods && !object_isClass(self))) return nil;
+
+    /* Metadata lookup must not ask the receiver for its signature again:
+     * its guest override may be the forwarding proxy which led us here.
+     * Likewise, synthesized guest methods describe the guest ABI, not a
+     * native-only implementation. Start at the first native superclass,
+     * just like normal guest-to-host super dispatch. Class receivers use
+     * their metaclass unless +instanceMethodSignatureForSelector: asked for
+     * the ordinary class's instance methods. */
+    Class lookupClass = instanceMethods ? (Class)self : object_getClass(self);
+    while(lookupClass && [(id)lookupClass isGuestClass]) {
+        lookupClass = class_getSuperclass(lookupClass);
+    }
+    const Method method = lookupClass
+        ? class_getInstanceMethod(lookupClass, selector) : nullptr;
+    const char *types = method ? method_getTypeEncoding(method) : nullptr;
+    return types ? [NSMethodSignature signatureWithObjCTypes:types] : nil;
+}
+
 - (void)setGuestClass:(BOOL)value {
     return objc_setAssociatedObject(self, kGuestClass, @(value), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
@@ -5744,7 +7041,10 @@ BOOL host_hook_getClass(const char *name, Class *outClass) {
     }
     if(LC32GuestMirrorIsRetiring(self)) return 0;
 
-    Class hostClass = self.class;
+    /* NSProxy may forward -class to its target. Bridge bookkeeping must pair
+     * the proxy itself, without invoking its application forwarding path. */
+    Class proxyClass = LC32NativeProxyPhysicalClass(self);
+    Class hostClass = proxyClass ?: self.class;
     const char *className = class_getName(hostClass);
     Class matchedHostClass = hostClass;
     if(LC32HostObjectIsDispatchData(self)) {
@@ -5769,10 +7069,15 @@ BOOL host_hook_getClass(const char *name, Class *outClass) {
         return 0;
     }
     if(matchedHostClass != hostClass) {
-        printf("LC32: mapping host class %s through guest superclass %s\n",
+        LC32_DEBUG_PRINTF("LC32: mapping host class %s through guest superclass %s\n",
             className, class_getName(matchedHostClass));
     }
-    if(object_isClass(self)) return self.guest_self = ptr;
+    if(object_isClass(self)) {
+        if(proxyClass && class_isMetaClass(proxyClass)) {
+            ptr = guest_object_getClass(ptr);
+        }
+        return self.guest_self = ptr;
+    }
 
     static std::atomic<u32> guestSetHostSelfCache{0};
     const u32 guest_setHost_self = LC32CachedGuestSelector(
@@ -5861,6 +7166,29 @@ extern "C" u32 LC32GuestObjectForOwnedHostObjectAddress(u64 object) {
 static const char *LC32UnqualifiedType(const char *type) {
     while(type && *type && strchr("rnNoORVA", *type)) type++;
     return type;
+}
+
+static char LC32VoidSingleFloatingArgumentType(const char *types) {
+    if(!types) return '\0';
+    auto skipOffset = [&]() {
+        while(*types >= '0' && *types <= '9') types++;
+    };
+    auto consume = [&](char expected) {
+        types = LC32UnqualifiedType(types);
+        if(*types != expected) return false;
+        types++;
+        skipOffset();
+        return true;
+    };
+    // Match only void(self, _cmd, float/double), not a floating field inside
+    // an aggregate or a mixed signature needing additional register capture.
+    if(!consume('v') || !consume('@') || !consume(':')) return '\0';
+    types = LC32UnqualifiedType(types);
+    const char argumentType = *types;
+    if(argumentType != 'f' && argumentType != 'd') return '\0';
+    types++;
+    skipOffset();
+    return *types == '\0' ? argumentType : '\0';
 }
 
 static const char *LC32ProtocolMethodTypes(Protocol *protocol, SEL selector,
@@ -6100,7 +7428,7 @@ static const char *LC32ExpectedHostMethodTypes(Class cls, SEL selector) {
     // for getter booleans, we have to register total 3 variants: name, hasName and isName, since we don't want to run a LLM here to predict which is best ¯\_(ツ)_/¯
 }
 
-+ (void)addGuestMethod:(u32)guest_method selector:(SEL)sel toClass:(Class)cls {
++ (BOOL)addGuestMethod:(u32)guest_method selector:(SEL)sel toClass:(Class)cls {
     objc_method_32 host_method_32;
     Dynarmic_mem_1read(guest_method, sizeof(host_method_32), (char *)&host_method_32);
     DynarmicHostString host_method_types(host_method_32.method_types);
@@ -6108,6 +7436,8 @@ static const char *LC32ExpectedHostMethodTypes(Class cls, SEL selector) {
         DynarmicHostString host_sel(host_method_32.method_name);
         sel = sel_registerName(host_sel.hostPtr);
     }
+    LC32RegisterGuestSelectorMapping(
+        sel, host_method_32.method_name);
 
     // The Objective-C runtime calls these lifecycle hooks as id (*)(id) and
     // void (*)(id), without a selector argument. Installing the generic
@@ -6118,7 +7448,7 @@ static const char *LC32ExpectedHostMethodTypes(Class cls, SEL selector) {
     if(!strcmp(selectorName, ".cxx_construct") ||
             !strcmp(selectorName, ".cxx_destruct") ||
             !strcmp(selectorName, "dealloc")) {
-        return;
+        return NO;
     }
 
     const char *guestMethodTypes = host_method_types.hostPtr;
@@ -6159,6 +7489,38 @@ static const char *LC32ExpectedHostMethodTypes(Class cls, SEL selector) {
         : (IMP)&LC32InvokeGuestSelector;
     const char *expectedHostTypes =
         LC32ExpectedHostMethodTypes(cls, sel);
+    LC32ScalarCallbackSignature scalarSignature;
+    const char *scalarHostTypes = installedMethodTypes;
+    if(expectedHostTypes && LC32ParseScalarCallbackSignature(
+            guestMethodTypes, expectedHostTypes, scalarSignature)) {
+        scalarHostTypes = expectedHostTypes;
+    }
+    if(LC32ParseScalarCallbackSignature(
+            guestMethodTypes, scalarHostTypes, scalarSignature)) {
+        if(!LC32RegisterScalarCallback(cls, sel, scalarSignature)) return NO;
+        implementation = (IMP)&LC32InvokeGuestSelectorScalars;
+        installedMethodTypes = scalarHostTypes;
+    }
+    const char guestFloatingArgument =
+        LC32VoidSingleFloatingArgumentType(guestMethodTypes);
+    if(guestFloatingArgument) {
+        const char expectedFloatingArgument =
+            LC32VoidSingleFloatingArgumentType(expectedHostTypes);
+        const char hostFloatingArgument = expectedFloatingArgument
+            ? expectedFloatingArgument : guestFloatingArgument;
+        if(guestFloatingArgument == 'f') {
+            implementation = hostFloatingArgument == 'd'
+                ? (IMP)&LC32InvokeGuestSelectorFloatingArgument<float, double>
+                : (IMP)&LC32InvokeGuestSelectorFloatingArgument<float, float>;
+        } else {
+            implementation = hostFloatingArgument == 'f'
+                ? (IMP)&LC32InvokeGuestSelectorFloatingArgument<double, float>
+                : (IMP)&LC32InvokeGuestSelectorFloatingArgument<double, double>;
+        }
+        // Do not publish ARM32 argument offsets to native NSInvocation/KVC.
+        installedMethodTypes = expectedFloatingArgument ? expectedHostTypes :
+            (hostFloatingArgument == 'f' ? "v@:f" : "v@:d");
+    }
     if(LC32CGSizeToCGSizeSignatureMatches(guestMethodTypes, 'f') &&
        LC32CGSizeToCGSizeSignatureMatches(expectedHostTypes, 'd')) {
         implementation =
@@ -6177,6 +7539,24 @@ static const char *LC32ExpectedHostMethodTypes(Class cls, SEL selector) {
             implementation =
                 (IMP)&LC32InvokeGuestSelectorUniCharRange;
             installedMethodTypes = expectedHostTypes;
+        }
+    }
+    if(!strcmp(selectorName, "read:maxLength:") &&
+       LC32InputStreamReadSignatureMatches(guestMethodTypes, false)) {
+        const char *readHostTypes = expectedHostTypes;
+        if(!readHostTypes) {
+            // Legacy stream adapters may duck-type NSInputStream directly
+            // from NSObject. The exact selector and verified ARM32 signature
+            // still identify a binary read primitive; publish the canonical
+            // native declaration instead of the guest's 32-bit offsets.
+            Method nativeRead = class_getInstanceMethod(
+                objc_getClass("NSInputStream"), sel);
+            readHostTypes = nativeRead ? method_getTypeEncoding(nativeRead) :
+                "q@:^CQ";
+        }
+        if(LC32InputStreamReadSignatureMatches(readHostTypes, true)) {
+            implementation = (IMP)&LC32InvokeGuestSelectorInputStreamRead;
+            installedMethodTypes = readHostTypes;
         }
     }
     if(!strcmp(selectorName, "getObjects:range:") &&
@@ -6235,7 +7615,8 @@ static const char *LC32ExpectedHostMethodTypes(Class cls, SEL selector) {
             (IMP)&LC32InvokeGuestSelectorCGRectToCGRect;
         installedMethodTypes = expectedHostTypes;
     }
-    class_addMethod(cls, sel, implementation, installedMethodTypes);
+    return class_addMethod(cls, sel, implementation, installedMethodTypes) ||
+        class_getInstanceMethod(cls, sel) != nullptr;
 }
 
 
@@ -6258,7 +7639,10 @@ static const char *LC32ExpectedHostMethodTypes(Class cls, SEL selector) {
                              (id)clsObject, OBJC_ASSOCIATION_ASSIGN);
     [self addMethod:class_getClassMethod(self, @selector(resolveClassMethod:)) toClass:cls];
     [self addMethod:class_getClassMethod(self, @selector(resolveInstanceMethod:)) toClass:cls];
-    [cls resolveInstanceMethod:@selector(init)];
+    /* Do not message the metaclass object to pre-resolve -init. That bypasses
+     * the resolver just installed above and depends on NSObject's root
+     * fallback, which the independent NSProxy hierarchy does not inherit.
+     * Declared methods are installed eagerly below before class publication. */
     [cls setGuestClass:YES];
 
     // FIXME: can't call free on copied lists
@@ -6295,7 +7679,7 @@ static const char *LC32ExpectedHostMethodTypes(Class cls, SEL selector) {
 
 // FIXME: currently using class_get*Method which may return superclass's method, but I guess this shouldn't affect anything
 + (BOOL)resolveClassMethod:(SEL)sel {
-    printf("resolveClassMethod %s\n", sel_getName(sel));
+    LC32_DEBUG_PRINTF("resolveClassMethod %s\n", sel_getName(sel));
     /*
      * Native frameworks may ask about an optional selector from one of their
      * own queues.  Such a thread has no ARM32 JIT or guest stack.  All methods
@@ -6309,25 +7693,70 @@ static const char *LC32ExpectedHostMethodTypes(Class cls, SEL selector) {
     u32 guest_sel = guest_sel_registerName(sel_getName(sel));
     u32 guest_method = guest_class_getClassMethod(self.guest_self, guest_sel);
     if(guest_method) {
-        [LC32ObjCMethodResolver addGuestMethod:guest_method selector:sel toClass:self.class];
+        // +class returns the class object, not the metaclass which owns +methods.
+        return [LC32ObjCMethodResolver addGuestMethod:guest_method selector:sel
+            toClass:object_getClass((id)self)];
     }
     return [super resolveClassMethod:sel];
 }
 
 + (BOOL)resolveInstanceMethod:(SEL)sel {
-    printf("resolveInstanceMethod %s\n", sel_getName(sel));
+    LC32_DEBUG_PRINTF("resolveInstanceMethod %s\n", sel_getName(sel));
     if(!Dynarmic_guest_thread_is_registered()) {
         return [super resolveInstanceMethod:sel];
     }
     u32 guest_sel = guest_sel_registerName(sel_getName(sel));
     u32 guest_method = guest_class_getInstanceMethod(self.guest_self, guest_sel);
     if(guest_method) {
-        [LC32ObjCMethodResolver addGuestMethod:guest_method selector:sel toClass:self];
+        return [LC32ObjCMethodResolver addGuestMethod:guest_method selector:sel toClass:self];
     }
     return [super resolveInstanceMethod:sel];
 }
 @end
 
+static void LC32InstallNativeNSProxyBridge() {
+    Class objectClass = objc_getClass("NSObject");
+    LC32NativeNSProxyClass = objc_getClass("NSProxy");
+    if(!objectClass || !LC32NativeNSProxyClass) {
+        fprintf(stderr, "LC32: native Foundation root classes are unavailable\n");
+        abort();
+    }
+
+    /* Categories on NSObject are not inherited by NSProxy, another root
+     * class. Reuse only the private bridge entry points, on both the
+     * class and metaclass so instance, class, and metaclass receivers work.
+     * Keep native NSProxy allocation, ownership, dealloc, and forwarding
+     * untouched; synthesized subclasses receive the usual mirror RR hooks. */
+    static const char *const selectors[] = {
+        "setGuestClass:", "isGuestClass", "setGuest_self:",
+        "LC32_nativeMethodSignatureForSelector:instanceMethods:",
+        "guest_selfOrNull", "LC32_bindGuestSelfIfAbsent:",
+        "LC32_clearGuestSelfIfEqual:", "guest_self",
+    };
+    Class destinations[] = {
+        LC32NativeNSProxyClass, object_getClass(LC32NativeNSProxyClass),
+    };
+    for(const char *name : selectors) {
+        SEL selector = sel_registerName(name);
+        Method source = class_getInstanceMethod(objectClass, selector);
+        if(!source) {
+            fprintf(stderr, "LC32: missing NSObject bridge method %s for NSProxy\n", name);
+            abort();
+        }
+        for(Class destination : destinations) {
+            if(class_addMethod(destination, selector, method_getImplementation(source),
+                    method_getTypeEncoding(source))) continue;
+            Method existing = class_getInstanceMethod(destination, selector);
+            if(!existing || method_getImplementation(existing) != method_getImplementation(source) ||
+                    strcmp(method_getTypeEncoding(existing), method_getTypeEncoding(source))) {
+                fprintf(stderr, "LC32: conflicting native NSProxy bridge method %s\n", name);
+                abort();
+            }
+        }
+    }
+}
+
 __attribute__((constructor)) void LC32InstallGetClassHook() {
+    LC32InstallNativeNSProxyBridge();
     objc_setHook_getClass(host_hook_getClass, &host_getClass);
 }

@@ -39,7 +39,9 @@
 #include <mach/mach_time.h>
 #include <mach/mig_errors.h>
 #include <mach/task_info.h>
+#include <mach/task_policy.h>
 #include <mach/thread_act.h>
+#include <mach/thread_policy.h>
 #include <mach/vm_map.h>
 #include <mach/vm_page_size.h>
 #include <mach/vm_region.h>
@@ -71,6 +73,7 @@
 #include "dynarmic.h"
 #include "debugger_server.h"
 #include "32bit.h"
+#include "LC32DebugLog.h"
 
 #define IGNORE_BAD_MEM_ACCESS 0
 #define TRACE_RW 0
@@ -329,8 +332,12 @@ gdb_thread_id_t ActiveMainDebuggerThread();
 bool NativeDebuggerMainContextMayRun();
 bool NativeThreadStatePauseHostWaitIfNeeded();
 bool NativeThreadStatePauseRequestedForCurrent();
-void NativeGuestHostCallEnter();
-void NativeGuestHostCallExit();
+struct NativeGuestHostCallState {
+    NativeThreadStateSlot *slot = nullptr;
+    size_t quiescenceDepth = 0;
+};
+NativeGuestHostCallState NativeGuestHostCallEnter();
+void NativeGuestHostCallExit(const NativeGuestHostCallState &state);
 void NativeGuestCallbackRegisterAccessBegin();
 void NativeGuestCallbackRegisterAccessEnd();
 bool ConsumeNativeThreadStateHalt(Dynarmic::HaltReason &reason);
@@ -355,20 +362,28 @@ kern_return_t CopyGuestThreadState(
     mach_port_t target, thread_state_flavor_t flavor,
     mach_msg_type_number_t capacity, u32 *state,
     mach_msg_type_number_t *count);
+kern_return_t ChangeGuestThreadSuspendCount(mach_port_t target, bool suspend);
 kern_return_t CopyGuestThreadInfo(
     mach_port_t target, thread_flavor_t flavor,
     mach_msg_type_number_t capacity, integer_t *info,
     mach_msg_type_number_t *count);
+kern_return_t SetGuestThreadPolicy(
+    mach_port_t target, thread_policy_flavor_t flavor,
+    const integer_t *info, mach_msg_type_number_t count);
+kern_return_t CopyGuestThreadPolicy(
+    mach_port_t target, thread_policy_flavor_t flavor,
+    mach_msg_type_number_t capacity, integer_t *info,
+    mach_msg_type_number_t *count, boolean_t *getDefault);
 
 template <typename Function>
 auto InvokeNativeGuestHostCall(Function &&function)
         -> decltype(function()) {
-    NativeGuestHostCallEnter();
     struct ExitScope {
+        NativeGuestHostCallState state;
         ~ExitScope() {
-            NativeGuestHostCallExit();
+            NativeGuestHostCallExit(state);
         }
-    } exitScope;
+    } exitScope{NativeGuestHostCallEnter()};
     return function();
 }
 
@@ -644,7 +659,8 @@ u32 GuestPsynchMutexDrop(
     u32 mutex, u32 mgen, u32 ugen, u32 flags);
 u32 GuestPsynchConditionWait(
     u32 condition, u32 conditionSequence,
-    u32 conditionSSequence, u32 mutex,
+    u32 conditionSSequence, u32 mutex, u32 mutexMgen,
+    u32 mutexUgen, u32 flags,
     int64_t timeoutSeconds, u32 timeoutNanoseconds);
 u32 GuestPsynchConditionSignal(
     u32 condition, u32 conditionSequence,
@@ -725,6 +741,9 @@ struct NativeThreadStateSlot {
     context32 snapshot = {};
     bool snapshotValid = false;
     bool ownerExited = false;
+    // Mutations hold mutex; atomic reads avoid it on normal host-call entry.
+    std::atomic<uint32_t> suspendCount{0};
+    bool suspendAcknowledged = false;
     size_t hostCallDepth = 0;
     size_t hostCallQuiescenceDepth = 0;
     size_t guestCallbackDepth = 0;
@@ -749,12 +768,26 @@ struct NativeGuestJit {
     bool hostThreadCreated = false;
     bool exited = false;
     bool workqueue = false;
+    bool workqueueEventManager = false;
     std::atomic<bool> workqueueHostBlocked{false};
     std::atomic<bool> workqueueCompensationPending{false};
     u32 workqueuePriority = 0;
     size_t threadStateUsers = 0;
     NativeThreadStateSlot threadState;
     mach_port_t joinSemaphore = MACH_PORT_NULL;
+};
+
+/* Logical scheduling requests never change the host UI/emulator pthread's
+ * scheduling mode. Access these values under the owning registry mutex. */
+struct GuestThreadPolicyState {
+    boolean_t timeshare = TRUE;
+    bool realtimeActive = false;
+    thread_time_constraint_policy_data_t realtime = {};
+    integer_t importance = 0;
+    integer_t affinityTag = THREAD_AFFINITY_TAG_NULL;
+    integer_t backgroundPriority = 0;
+    integer_t latencyQos = LATENCY_QOS_TIER_UNSPECIFIED;
+    integer_t throughputQos = THROUGHPUT_QOS_TIER_UNSPECIFIED;
 };
 
 struct GuestThreadContext {
@@ -784,6 +817,7 @@ struct GuestThreadContext {
     bool runnable = false;
     bool workqueue = false;
     NativeGuestJit *nativeJit = nullptr;
+    GuestThreadPolicyState policy;
 };
 
 enum class NativeDebuggerRunState : uint8_t {
@@ -886,6 +920,8 @@ struct GuestWorkqueueJob {
     bool hasDelivery = false;
 };
 
+// The singleton event manager has a reserved additional slot, so ordinary
+// workers blocked on timer delivery cannot exhaust its scheduling capacity.
 inline constexpr size_t MaxNativeGuestWorkqueueWorkers = 4;
 
 struct GuestWorkqueuePendingUpcall {
@@ -1016,6 +1052,7 @@ bool ConsumeGuestConditionPrepost(
 bool EnsureGuestWorkqueueWorker();
 bool PrepareGuestWorkqueueUpcall(
     const GuestWorkqueueDelivery *delivery, u32 priority);
-bool NextGuestWorkqueueEvent(GuestWorkqueueDelivery &delivery);
+bool NextGuestWorkqueueEvent(GuestWorkqueueDelivery &delivery,
+    bool allowEventManager = true, bool allowOrdinary = true);
 
 #pragma GCC visibility pop

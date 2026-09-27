@@ -20,6 +20,9 @@
 
 #define LC32_TEST_SLICE_CAPACITY 4096u
 #define LC32_TEST_TIMEOUT_SECONDS 60u
+#ifndef LC32_PRESERVE_GUEST_SDK
+#define LC32_PRESERVE_GUEST_SDK 1
+#endif
 #define LC32_TEST_CODE_SIGNATURE_OFFSET 0x400u
 #define LC32_TEST_LARGE_CODE_SIGNATURE_OFFSET \
     ((256u * 1024u) + LC32_TEST_CODE_SIGNATURE_OFFSET)
@@ -38,6 +41,7 @@
 #define LC32_TEST_SHA256_TYPE 2u
 #define LC32_TEST_EXECSEG_MAIN_BINARY UINT64_C(0x1)
 #define LC32_TEST_IOS_8_VERSION (8u << 16)
+#define LC32_TEST_IOS_7_VERSION (7u << 16)
 #define LC32_TEST_IOS_10_3_VERSION ((10u << 16) | (3u << 8))
 #define LC32_TEST_IOS_11_VERSION (11u << 16)
 #define LC32_TEST_IOS_14_4_VERSION ((14u << 16) | (4u << 8))
@@ -52,6 +56,15 @@
 #define LC32_TEST_CODE_IDENTIFIER "legacy.target.signature.identifier"
 #define LC32_TEST_FALLBACK_CODE_IDENTIFIER \
     LC32_TEST_DEFAULT_TEAM_IDENTIFIER "." LC32_TEST_BUNDLE_IDENTIFIER
+
+static uint32_t ExpectedShimSDK(uint32_t originalSDK) {
+#if LC32_PRESERVE_GUEST_SDK
+    return originalSDK;
+#else
+    return originalSDK < LC32_TEST_IOS_11_VERSION ?
+        LC32_TEST_IOS_11_VERSION : originalSDK;
+#endif
+}
 
 typedef struct {
     uint32_t magic;
@@ -239,12 +252,13 @@ static size_t MakeThinExecutable(
     return headerSize + commandSize + 16;
 }
 
-static size_t MakeSignedThinExecutableWithVersionMin(
+static size_t MakeSignedThinExecutableWithSDKCommand(
         uint8_t bytes[LC32_TEST_SLICE_CAPACITY],
         cpu_type_t cpuType, cpu_subtype_t cpuSubtype,
         uint8_t payloadByte, const char *identifier,
         const char *entitlementsXML,
-        uint32_t versionMinVersion, uint32_t versionMinSDK) {
+        uint32_t versionMinVersion, uint32_t versionMinSDK,
+        bool useBuildVersion) {
     const bool is64Bit = cpuType == CPU_TYPE_ARM64;
     const bool hasVersionMin = !is64Bit &&
         (versionMinVersion != 0 || versionMinSDK != 0);
@@ -252,7 +266,7 @@ static size_t MakeSignedThinExecutableWithVersionMin(
         sizeof(struct mach_header_64) : sizeof(struct mach_header);
     const size_t segmentSize = is64Bit ?
         sizeof(struct segment_command_64) : sizeof(struct segment_command);
-    const size_t versionCommandSize = is64Bit ?
+    const size_t versionCommandSize = is64Bit || useBuildVersion ?
         sizeof(struct build_version_command) :
         (hasVersionMin ? sizeof(struct version_min_command) : 0);
     const size_t commandBytes = 2 * segmentSize +
@@ -324,7 +338,7 @@ static size_t MakeSignedThinExecutableWithVersionMin(
             .cputype = cpuType,
             .cpusubtype = cpuSubtype,
             .filetype = MH_EXECUTE,
-            .ncmds = hasVersionMin ? 5 : 4,
+            .ncmds = hasVersionMin || useBuildVersion ? 5 : 4,
             .sizeofcmds = (uint32_t)commandBytes,
         };
         struct segment_command text = {
@@ -374,13 +388,13 @@ static size_t MakeSignedThinExecutableWithVersionMin(
         &signatureCommand, sizeof(signatureCommand));
     const size_t versionCommandOffset = headerSize + 2 * segmentSize +
         sizeof(entryPointCommand) + sizeof(signatureCommand);
-    if(is64Bit) {
+    if(is64Bit || useBuildVersion) {
         const struct build_version_command buildVersion = {
             .cmd = LC_BUILD_VERSION,
             .cmdsize = sizeof(buildVersion),
             .platform = PLATFORM_IOS,
-            .minos = LC32_TEST_SHIM_MINOS,
-            .sdk = LC32_TEST_SHIM_SDK,
+            .minos = is64Bit ? LC32_TEST_SHIM_MINOS : versionMinVersion,
+            .sdk = is64Bit ? LC32_TEST_SHIM_SDK : versionMinSDK,
         };
         memcpy(bytes + versionCommandOffset,
             &buildVersion, sizeof(buildVersion));
@@ -461,6 +475,17 @@ static size_t MakeSignedThinExecutableWithVersionMin(
     memcpy(codeDirectoryBytes + codeDirectoryHashOffset,
         digest, sizeof(digest));
     return fileSize;
+}
+
+static size_t MakeSignedThinExecutableWithVersionMin(
+        uint8_t bytes[LC32_TEST_SLICE_CAPACITY],
+        cpu_type_t cpuType, cpu_subtype_t cpuSubtype,
+        uint8_t payloadByte, const char *identifier,
+        const char *entitlementsXML,
+        uint32_t versionMinVersion, uint32_t versionMinSDK) {
+    return MakeSignedThinExecutableWithSDKCommand(
+        bytes, cpuType, cpuSubtype, payloadByte, identifier,
+        entitlementsXML, versionMinVersion, versionMinSDK, false);
 }
 
 static size_t MakeSignedThinExecutable(
@@ -2014,9 +2039,155 @@ static int TestFatInjection(const char *directory) {
             CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL, &injectedShim) &&
         InjectedSignatureIsValid(
             injectedShim, LC32_TEST_CODE_IDENTIFIER, true,
-            LC32_TEST_IOS_11_VERSION);
+            ExpectedShimSDK(LC32_TEST_IOS_10_3_VERSION));
     free(injected);
     return valid ? 0 : Fail("fat injection did not preserve all slices");
+}
+
+static int TestSDKSelection(const char *directory) {
+    char targetPath[1024];
+    char shimPath[1024];
+    if(!FormatTestPath(targetPath, sizeof(targetPath), directory, "sdk-target") ||
+            !FormatTestPath(shimPath, sizeof(shimPath), directory, "sdk-shim")) {
+        return Fail("could not format SDK test paths");
+    }
+    uint8_t shim[LC32_TEST_SLICE_CAPACITY];
+    const size_t shimSize = MakeSignedThinExecutable(
+        shim, CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL, 0x64,
+        "com.kdt.LiveExec32", LC32TestShimEntitlements);
+    if(!shimSize || !WriteFile(shimPath, shim, shimSize, 0755)) {
+        return Fail("could not create SDK test shim");
+    }
+    static const struct {
+        const char *name;
+        uint32_t minOS;
+        uint32_t sdk;
+        bool buildVersion;
+    } cases[] = {
+        {"missing", 0, 0, false},
+        {"zero", LC32_TEST_IOS_7_VERSION, 0, false},
+        {"pre-iOS8", LC32_TEST_IOS_7_VERSION, LC32_TEST_IOS_7_VERSION, false},
+        {"iOS10.3", LC32_TEST_IOS_7_VERSION, LC32_TEST_IOS_10_3_VERSION, false},
+        {"modern", LC32_TEST_IOS_8_VERSION, LC32_TEST_IOS_14_4_VERSION, false},
+        {"build-zero", LC32_TEST_IOS_7_VERSION, 0, true},
+        {"build-legacy", LC32_TEST_IOS_7_VERSION, LC32_TEST_IOS_7_VERSION, true},
+        {"build-modern", LC32_TEST_IOS_8_VERSION, LC32_TEST_IOS_14_4_VERSION, true},
+    };
+    for(size_t index = 0; index < sizeof(cases) / sizeof(cases[0]); ++index) {
+        uint8_t target[LC32_TEST_SLICE_CAPACITY];
+        const size_t targetSize = MakeSignedThinExecutableWithSDKCommand(
+            target, CPU_TYPE_ARM, CPU_SUBTYPE_ARM_V7, 0x72,
+            LC32_TEST_CODE_IDENTIFIER, LC32TestTargetEntitlements,
+            cases[index].minOS, cases[index].sdk, cases[index].buildVersion);
+        if(!targetSize || !WriteFile(targetPath, target, targetSize, 0755)) {
+            return Fail("could not create SDK test target");
+        }
+        char error[512] = {0};
+        const LC32MachOInjectionResult injectionResult =
+            LC32InjectArm64ExecutableSlice(targetPath, shimPath,
+                LC32_TEST_BUNDLE_IDENTIFIER, error, sizeof(error));
+        size_t resultSize = 0;
+        uint8_t *result = ReadFile(targetPath, &resultSize);
+        LC32TestSliceView injectedShim = {0};
+        const bool valid = injectionResult == LC32MachOInjectionSucceeded &&
+            result != NULL && FatContainsExactSlice(result, resultSize,
+                CPU_TYPE_ARM, CPU_SUBTYPE_ARM_V7, target, targetSize) &&
+            FindFatSlice(result, resultSize, CPU_TYPE_ARM64,
+                CPU_SUBTYPE_ARM64_ALL, &injectedShim) &&
+            InjectedSignatureIsValid(injectedShim, LC32_TEST_CODE_IDENTIFIER,
+                true, ExpectedShimSDK(cases[index].sdk));
+        free(result);
+        if(!valid) {
+            fprintf(stderr, "FatMachOTests: SDK case %s failed: %s\n",
+                cases[index].name, error);
+            return 1;
+        }
+    }
+    printf("FatMachOTests: 8 SDK selection cases passed (preserve=%d)\n",
+        LC32_PRESERVE_GUEST_SDK);
+    return 0;
+}
+
+static int TestFatSDKAgreement(const char *directory) {
+    char targetPath[1024];
+    char shimPath[1024];
+    if(!FormatTestPath(targetPath, sizeof(targetPath), directory, "sdk-fat-target") ||
+            !FormatTestPath(shimPath, sizeof(shimPath), directory, "sdk-fat-shim")) {
+        return Fail("could not format fat SDK test paths");
+    }
+    uint8_t shim[LC32_TEST_SLICE_CAPACITY];
+    const size_t shimSize = MakeSignedThinExecutable(
+        shim, CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL, 0x64,
+        "com.kdt.LiveExec32", LC32TestShimEntitlements);
+    if(!shimSize || !WriteFile(shimPath, shim, shimSize, 0755)) {
+        return Fail("could not create fat SDK test shim");
+    }
+    static const struct {
+        uint32_t firstSDK;
+        uint32_t secondSDK;
+        bool secondUsesBuildVersion;
+    } cases[] = {
+        {0, 0, false},
+        {LC32_TEST_IOS_7_VERSION, LC32_TEST_IOS_7_VERSION, false},
+        {LC32_TEST_IOS_7_VERSION, LC32_TEST_IOS_10_3_VERSION, false},
+        {0, LC32_TEST_IOS_7_VERSION, false},
+        {LC32_TEST_IOS_10_3_VERSION, LC32_TEST_IOS_14_4_VERSION, false},
+        {LC32_TEST_IOS_7_VERSION, LC32_TEST_IOS_7_VERSION, true},
+        {LC32_TEST_IOS_14_4_VERSION, LC32_TEST_IOS_14_4_VERSION, true},
+    };
+    for(size_t index = 0; index < sizeof(cases) / sizeof(cases[0]); ++index) {
+        uint8_t first[LC32_TEST_SLICE_CAPACITY];
+        uint8_t second[LC32_TEST_SLICE_CAPACITY];
+        const size_t firstSize = MakeSignedThinExecutableWithVersionMin(
+            first, CPU_TYPE_ARM, CPU_SUBTYPE_ARM_V7, 0x71,
+            LC32_TEST_CODE_IDENTIFIER, LC32TestTargetEntitlements,
+            cases[index].firstSDK ? LC32_TEST_IOS_7_VERSION : 0,
+            cases[index].firstSDK);
+        const size_t secondSize = MakeSignedThinExecutableWithSDKCommand(
+            second, CPU_TYPE_ARM, CPU_SUBTYPE_ARM_V7S, 0x73,
+            LC32_TEST_CODE_IDENTIFIER, LC32TestTargetEntitlements,
+            cases[index].secondSDK ? LC32_TEST_IOS_7_VERSION : 0,
+            cases[index].secondSDK, cases[index].secondUsesBuildVersion);
+        if(!firstSize || !secondSize || !MakeFatARMTarget(
+                targetPath, first, firstSize, second, secondSize)) {
+            return Fail("could not create fat SDK test target");
+        }
+        size_t originalSize = 0;
+        uint8_t *original = ReadFile(targetPath, &originalSize);
+        if(!original) return Fail("could not read fat SDK test target");
+        char error[512] = {0};
+        const LC32MachOInjectionResult injectionResult =
+            LC32InjectArm64ExecutableSlice(targetPath, shimPath,
+                LC32_TEST_BUNDLE_IDENTIFIER, error, sizeof(error));
+        size_t resultSize = 0;
+        uint8_t *result = ReadFile(targetPath, &resultSize);
+        const uint32_t firstSDK = ExpectedShimSDK(cases[index].firstSDK);
+        const bool conflict = firstSDK != ExpectedShimSDK(cases[index].secondSDK);
+        LC32TestSliceView injectedShim = {0};
+        const bool valid = conflict
+            ? injectionResult == LC32MachOInjectionFailed &&
+                strcmp(error, "ARM32 slices use conflicting iOS SDK versions") == 0 &&
+                result != NULL && resultSize == originalSize &&
+                memcmp(result, original, originalSize) == 0
+            : injectionResult == LC32MachOInjectionSucceeded && result != NULL &&
+                FatContainsExactSlice(result, resultSize, CPU_TYPE_ARM,
+                    CPU_SUBTYPE_ARM_V7, first, firstSize) &&
+                FatContainsExactSlice(result, resultSize, CPU_TYPE_ARM,
+                    CPU_SUBTYPE_ARM_V7S, second, secondSize) &&
+                FindFatSlice(result, resultSize, CPU_TYPE_ARM64,
+                    CPU_SUBTYPE_ARM64_ALL, &injectedShim) &&
+                InjectedSignatureIsValid(injectedShim,
+                    LC32_TEST_CODE_IDENTIFIER, true, firstSDK);
+        free(result);
+        free(original);
+        if(!valid) {
+            fprintf(stderr, "FatMachOTests: fat SDK case %zu failed: %s\n", index, error);
+            return 1;
+        }
+    }
+    printf("FatMachOTests: 7 fat SDK agreement cases passed (preserve=%d)\n",
+        LC32_PRESERVE_GUEST_SDK);
+    return 0;
 }
 
 static int TestMalformedTargetIsUnchanged(const char *directory) {
@@ -2232,7 +2403,7 @@ static int TestUnsignedTargetUsesFallbackIdentifier(const char *directory) {
             CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL, &injectedShim) &&
         InjectedSignatureIsValid(injectedShim,
             LC32_TEST_FALLBACK_CODE_IDENTIFIER, false,
-            LC32_TEST_IOS_11_VERSION);
+            ExpectedShimSDK(0));
     free(result);
     return valid ? 0 :
         Fail("unsigned target did not use the fallback signing metadata");
@@ -2285,7 +2456,7 @@ static int TestApplicationIdentifierDerivesTeamIdentifier(
             LC32_TEST_CODE_IDENTIFIER, true,
             LC32_TEST_DERIVED_TEAM_IDENTIFIER,
             LC32_TEST_APPLICATION_IDENTIFIER,
-            LC32_TEST_IOS_11_VERSION);
+            ExpectedShimSDK(0));
     free(result);
     return valid ? 0 :
         Fail("application-identifier did not provide the signing team");
@@ -2338,7 +2509,7 @@ static int TestExplicitTeamIdentifierOverridesOtherSources(
             LC32_TEST_CODE_IDENTIFIER, true,
             LC32_TEST_EXPLICIT_TEAM_IDENTIFIER,
             LC32_TEST_APPLICATION_IDENTIFIER,
-            LC32_TEST_IOS_11_VERSION);
+            ExpectedShimSDK(0));
     free(result);
     return valid ? 0 :
         Fail("explicit target Team ID did not override other sources");
@@ -2434,7 +2605,7 @@ static int TestEncryptedTargetSignatureIsModernized(
             LC32_TEST_CODE_IDENTIFIER, true,
             LC32_TEST_DERIVED_TEAM_IDENTIFIER,
             LC32_TEST_APPLICATION_IDENTIFIER,
-            LC32_TEST_IOS_11_VERSION) &&
+            ExpectedShimSDK(LC32_TEST_IOS_10_3_VERSION)) &&
         EncryptedSignatureUsesShimDonorsAndPreservesCodeHashes(
             originalTarget, injectedTarget, injectedShim,
             LC32_TEST_CODE_IDENTIFIER,
@@ -2912,6 +3083,7 @@ static int TestFiveSliceTargetIsUnchanged(const char *directory) {
 static void CleanupTestDirectory(const char *directory) {
     static const char *const names[] = {
         "thin-target", "shim", "fat-target",
+        "sdk-target", "sdk-shim", "sdk-fat-target", "sdk-fat-shim",
         "fat-shim", "bad-target", "bad-shim",
         "bad-signature-target", "bad-signature-shim",
         "versioned-codedirectory-target", "versioned-codedirectory-shim",
@@ -2949,8 +3121,12 @@ int main(void) {
     const int thinResult = TestThinInjection(temporaryDirectory);
     const int fatResult = thinResult == 0 ?
         TestFatInjection(temporaryDirectory) : thinResult;
-    const int malformedResult = fatResult == 0 ?
-        TestMalformedTargetIsUnchanged(temporaryDirectory) : fatResult;
+    const int sdkResult = fatResult == 0 ?
+        TestSDKSelection(temporaryDirectory) : fatResult;
+    const int fatSDKResult = sdkResult == 0 ?
+        TestFatSDKAgreement(temporaryDirectory) : sdkResult;
+    const int malformedResult = fatSDKResult == 0 ?
+        TestMalformedTargetIsUnchanged(temporaryDirectory) : fatSDKResult;
     const int malformedSignatureResult = malformedResult == 0 ?
         TestMalformedCodeSignatureIsUnchanged(temporaryDirectory) :
             malformedResult;

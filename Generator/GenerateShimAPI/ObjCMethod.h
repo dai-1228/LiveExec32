@@ -32,4 +32,11 @@ NS_ASSUME_NONNULL_BEGIN
 /// Converts one Objective-C type encoding into a source-level type name.
 FOUNDATION_EXPORT NSString *LC32ReadableTypeForEncoding(const char *encoding);
 
+/// Runtime metadata spells these Objective-C-compatible CF references as
+/// pointers to their opaque structures. Preserve only these known typedefs.
+FOUNDATION_EXPORT BOOL LC32EncodingRepresentsCGColorRef(
+    const char *encoding);
+FOUNDATION_EXPORT BOOL LC32EncodingRepresentsCGImageRef(
+    const char *encoding);
+
 NS_ASSUME_NONNULL_END

@@ -44,7 +44,8 @@
 #define LC32_HOST_OBJECT_ARRAY_MAGIC UINT32_C(0x4f413332) /* "OA32" */
 #define LC32_HOST_OBJECT_ARRAY_MAX_COUNT UINT32_C(1048576)
 #define LC32_HOST_SIZED_INDIRECT_MAGIC UINT32_C(0x53493332) /* "SI32" */
-#define LC32_HOST_SIZED_INDIRECT_MAX_SIZE UINT32_C(64)
+/* CATransform3D contains sixteen native CGFloats (128 bytes on ARM64). */
+#define LC32_HOST_SIZED_INDIRECT_MAX_SIZE UINT32_C(128)
 
 /*
  * Result of SVC 1019. Values above the sentinels are opaque pending-retain
@@ -77,7 +78,24 @@ typedef enum LC32HostMappingOperation {
      * ownership in the same host operation. This avoids exposing a raw host
      * address after its registry entry has been removed. */
     LC32HostMappingFinishGuestTeardownAndReleaseHost = 5,
+    /* Called by guest NSObject's root -dealloc, before its allocation can be
+     * reused. Detach a dead native peer's guest key but keep its host-address
+     * tombstone for deferred native lifetime-pin cleanup. */
+    LC32HostMappingGuestRootDealloc = 6,
+    /* Native-created proxies have a guest lifetime pin, but may also have
+     * native-only owners. Release their ordinary guest ownership under a
+     * private per-mapping gate without ever consuming that pin. The ordinary
+     * variant also consumes the native +1; the logical variant leaves that
+     * release to its native autorelease token. Returns the result enum below. */
+    LC32HostMappingReleaseNativeProxy = 7,
+    LC32HostMappingReleaseNativeProxyLogicalOwnership = 8,
 } LC32HostMappingOperation;
+
+enum {
+    LC32NativeProxyReleaseNotApplicable = 0,
+    LC32NativeProxyReleaseHandled = 1,
+    LC32NativeProxyReleaseRejected = 2,
+};
 
 typedef struct LC32HostObjectArrayDescriptor {
     uint32_t count;

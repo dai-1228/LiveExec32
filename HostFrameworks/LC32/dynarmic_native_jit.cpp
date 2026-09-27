@@ -526,7 +526,7 @@ static void *RunNativeGuestThread(void *opaque) {
     runtime->hostMachThread =
         pthread_mach_thread_np(pthread_self());
 
-    fprintf(stderr,
+    LC32_DEBUG_FPRINTF(stderr,
         "LC32: native guest-thread=%llu running on "
         "host-thread=0x%x processor=%zu\n",
         start->debuggerId, runtime->hostMachThread,
@@ -954,6 +954,7 @@ bool StartNativeGuestWorkqueueWorker(
     }
     runtime->debuggerId = debuggerId;
     runtime->workqueue = true;
+    runtime->workqueueEventManager = job.hasDelivery && job.delivery.eventManager;
     runtime->workqueuePriority = priority;
 
     GuestThreadContext thread = {};
@@ -1011,7 +1012,7 @@ bool StartNativeGuestWorkqueueWorker(
         runtime->startAllowed = true;
     }
     runtime->startCondition.notify_one();
-    fprintf(stderr,
+    LC32_DEBUG_FPRINTF(stderr,
         "LC32: native workqueue guest-thread=%llu pthread=0x%x "
         "port=0x%x pc=0x%x sp=0x%x flags=0x%x\n",
         debuggerId, pthreadAddress, threadPort,
@@ -1183,7 +1184,7 @@ u32 GuestBsdthreadCreate(
     thread.saved.regs[Reg::PC] =
         guest_bsdthread_thread_start & ~1u;
 
-    fprintf(stderr,
+    LC32_DEBUG_FPRINTF(stderr,
         "LC32: bsdthread_create guest-thread=%llu self=0x%llx "
         "pthread=0x%x port=0x%x pc=0x%x sp=0x%x flags=0x%x\n",
         thread.debuggerId, thread.threadSelfId,
@@ -1346,7 +1347,7 @@ u32 GuestBsdthreadTerminate(
             mach_task_self(), currentPort);
     }
 
-    fprintf(stderr,
+    LC32_DEBUG_FPRINTF(stderr,
         "LC32: bsdthread_terminate guest-thread=%llu "
         "free=0x%x+0x%x\n",
         debuggerId, freeAddress, freeSize);

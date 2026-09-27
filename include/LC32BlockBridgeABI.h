@@ -16,6 +16,14 @@ typedef enum LC32GuestBlockCallbackKind {
      * without borrowing a JIT from their host thread.
      */
     LC32GuestBlockCallbackKindFunction = 3,
+    /*
+     * Invoke a method on a mirrored guest object. guestBlock is the guest
+     * receiver and guestInvoke is the guest selector.  This lets native
+     * frameworks deliver void delegate/observer callbacks from threads which
+     * do not own a guest JIT while preserving the native registration's
+     * observer identity and lifetime rules.
+     */
+    LC32GuestBlockCallbackKindSelector = 4,
 } LC32GuestBlockCallbackKind;
 
 typedef enum LC32GuestBlockCallbackWaitResult {

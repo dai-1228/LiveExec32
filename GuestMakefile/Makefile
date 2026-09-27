@@ -7,6 +7,8 @@ STRIP = 0
 OPTFLAG = -O2
 .DEFAULT_GOAL := all
 GO_EASY_ON_ME = 1
+# High-volume Objective-C send tracing is compiled out unless explicitly enabled.
+LC32_OBJC_TRACE ?= 0
 
 # Theos normally serializes product targets and only parallelizes source files
 # within one framework.  Let the top-level guest build fan independent
@@ -24,7 +26,7 @@ GENERATED_FRAMEWORKS_STAMP := $(GENERATED_FRAMEWORKS_ROOT)/.complete
 
 ifeq ($(strip $(MAKECMDGOALS)),)
 LC32_REQUIRE_GENERATED_FRAMEWORKS := 1
-else ifneq ($(strip $(filter-out clean generate-shims sdk,$(MAKECMDGOALS))),)
+else ifneq ($(strip $(filter-out clean generate-shims sdk libiconv,$(MAKECMDGOALS))),)
 LC32_REQUIRE_GENERATED_FRAMEWORKS := 1
 endif
 
@@ -37,12 +39,28 @@ endif
 include ../module-cache.mk
 
 ADDITIONAL_CFLAGS = \
+  -DLC32_OBJC_TRACE=$(LC32_OBJC_TRACE) \
   -I$(abspath ../include) \
   -I$(MANUAL_FRAMEWORKS_ROOT) \
   -Wno-deprecated-module-dot-map \
   -F$(ISYSROOT)/System/Library/Frameworks/AVFoundation.framework/Frameworks
-ADDITIONAL_LDFLAGS = -fno-autolink -F$(THEOS_OBJ_DIR)
+ADDITIONAL_LDFLAGS = -fno-autolink -F$(THEOS_OBJ_DIR) $(LC32_GUEST_LINKER_FLAGS)
 include $(THEOS)/makefiles/common.mk
+
+LC32_LIBICONV_COMMIT := 6bcfda8c4720659e855c04ce72a8335fb4a67b0b
+LC32_LIBICONV_ARCHIVE ?= \
+  $(LC32_GUEST_SDK_REPO_ROOT)/tmp/libiconv-$(LC32_LIBICONV_COMMIT).tar.gz
+LC32_LIBICONV_URL ?= \
+  https://github.com/apple-oss-distributions/libiconv/archive/$(LC32_LIBICONV_COMMIT).tar.gz
+LC32_LIBICONV_SHA256 ?= \
+  22adfd2a93219669384a0cf603a6a738118015bf2e8d7fb09796ff8eafb192e6
+LC32_LIBICONV_OUTPUT := \
+  $(THEOS_OBJ_DIR)/$(if $(THEOS_CURRENT_ARCH),,$(firstword $(ARCHS))/)libiconv.2.dylib
+LC32_LIBICONV_CHARSET_ALIAS := $(dir $(LC32_LIBICONV_OUTPUT))charset.alias
+LC32_LIBICONV_LICENSE := $(dir $(LC32_LIBICONV_OUTPUT))libiconv.LICENSE
+LC32_LIBICONV_PRODUCTS := $(LC32_LIBICONV_OUTPUT) \
+  $(LC32_LIBICONV_CHARSET_ALIAS) $(LC32_LIBICONV_LICENSE)
+LC32_LIBICONV_CONFIG := $(dir $(LC32_LIBICONV_OUTPUT)).libiconv-config
 
 # THEOS_INSTANCE_NAME is not referenced by the SDK modules. Excluding it from
 # their context hash lets every guest framework share the same MRC/ARC PCMs.
@@ -81,6 +99,10 @@ FileProvider_INSTALL_PATH = /System/Library/PrivateFrameworks
 
 LC32_LIBRARIES = objc.A
 
+Accelerate_LDFLAGS = \
+  -compatibility_version 1.0.0 \
+  -current_version 4.0.0
+
 AVFoundation_LDFLAGS = \
   -compatibility_version 1.0.0 \
   -current_version 2.0.0 \
@@ -117,10 +139,20 @@ CoreGraphics_LDFLAGS = \
   -compatibility_version 359.4.0 \
   -current_version 359.4.0
 
+ImageIO_FRAMEWORKS = LC32 CoreFoundation
+ImageIO_LDFLAGS = \
+  -compatibility_version 1.0.0 \
+  -current_version 0
+
 CoreText_FRAMEWORKS = LC32
 CoreText_LDFLAGS = \
   -compatibility_version 359.4.0 \
   -current_version 359.4.0
+
+CoreVideo_FRAMEWORKS = LC32 CoreFoundation
+CoreVideo_LDFLAGS = \
+  -compatibility_version 1.2.0 \
+  -current_version 1.5.0
 
 OpenGLES_FRAMEWORKS = LC32
 OpenGLES_LDFLAGS = \
@@ -159,12 +191,46 @@ AdSupport_FILES = $(filter-out \
 generate-shims:
 	./generate-shims.sh
 
+.PHONY: libiconv lc32-libiconv-config-force
+libiconv: $(LC32_LIBICONV_PRODUCTS)
+
+$(LC32_LIBICONV_CONFIG): lc32-libiconv-config-force
+	@set -e; \
+	mkdir -p "$(@D)"; \
+	tmp="$@.$$$$"; \
+	{ \
+		printf '%s\n' "commit=$(LC32_LIBICONV_COMMIT)"; \
+		printf '%s\n' "archive=$(LC32_LIBICONV_ARCHIVE)"; \
+		printf '%s\n' "url=$(LC32_LIBICONV_URL)"; \
+		printf '%s\n' "sha256=$(LC32_LIBICONV_SHA256)"; \
+		printf '%s\n' "sdk=$(abspath $(ISYSROOT))"; \
+		printf '%s\n' "linker=$(LC32_GUEST_LINKER)"; \
+	} > "$$tmp"; \
+	if [ -f "$@" ] && cmp -s "$$tmp" "$@"; then \
+		rm -f "$$tmp"; \
+	else \
+		mv -f "$$tmp" "$@"; \
+	fi
+
+$(LC32_LIBICONV_PRODUCTS) &: build-libiconv.sh guest-sdk.mk \
+  $(LC32_GUEST_SDK_DEPENDENCY) $(LC32_LIBICONV_CONFIG)
+	@LC32_GUEST_SDK="$(ISYSROOT)" \
+	LC32_GUEST_LINKER="$(LC32_GUEST_LINKER)" \
+	LC32_LIBICONV_COMMIT="$(LC32_LIBICONV_COMMIT)" \
+	LC32_LIBICONV_ARCHIVE="$(LC32_LIBICONV_ARCHIVE)" \
+	LC32_LIBICONV_URL="$(LC32_LIBICONV_URL)" \
+	LC32_LIBICONV_SHA256="$(LC32_LIBICONV_SHA256)" \
+	LC32_LIBICONV_OUTPUT="$(LC32_LIBICONV_OUTPUT)" \
+	"$(CURDIR)/build-libiconv.sh"
+
 include $(THEOS_MAKE_PATH)/framework.mk
+include guest-build-config.mk
 
 # Theos can fan framework builds out from internal-all, and its convenience
 # targets bypass before-all. Gate both paths so no compiler observes a partial
 # or missing SDK, including when parallel building is explicitly enabled.
 GUEST_FRAMEWORK_BUILD_TARGETS := $(FRAMEWORK_NAME:=.all.framework.variables)
+before-all:: $(LC32_LIBICONV_PRODUCTS)
 $(FRAMEWORK_NAME) $(GUEST_FRAMEWORK_BUILD_TARGETS): | $(_THEOS_BUILD_SESSION_FILE)
 ifneq ($(strip $(LC32_GUEST_SDK_DEPENDENCY)),)
 before-all:: $(LC32_GUEST_SDK_DEPENDENCY)
@@ -173,7 +239,7 @@ endif
 
 # Preserve Theos's before/internal/after ordering at the top level while the
 # framework prerequisites of internal-all run concurrently.  Every guest
-# framework links LC32, and the two re-export relationships below consume
+# framework links LC32, and the additional guest-framework links below consume
 # binaries produced by this same build, so encode those ordering constraints.
 ifeq ($(THEOS_CURRENT_INSTANCE),)
 .NOTPARALLEL: all clean clean-packages stage package install uninstall do commands
@@ -185,6 +251,10 @@ Foundation.all.framework.variables: | \
   CoreFoundation.all.framework.variables CFNetwork.all.framework.variables
 AVFoundation: | AVFAudio
 AVFoundation.all.framework.variables: | AVFAudio.all.framework.variables
+CoreVideo: | CoreFoundation
+CoreVideo.all.framework.variables: | CoreFoundation.all.framework.variables
+ImageIO: | CoreFoundation
+ImageIO.all.framework.variables: | CoreFoundation.all.framework.variables
 endif
 
 # Exclude linking against CoreFoundation and Foundation for themselves
@@ -193,26 +263,4 @@ ifeq ($(_THEOS_CURRENT_OPERATION), compile)
   _THEOS_INTERNAL_LDFLAGS := $(subst -framework Foundation -framework CoreFoundation,,$(_THEOS_INTERNAL_LDFLAGS))
   _THEOS_INTERNAL_LDFLAGS := $(subst -lobjc,,$(_THEOS_INTERNAL_LDFLAGS))
 endif
-endif
-
-# Guest C libraries live outside the framework fan-out (they install as bare
-# dylibs, not bundles). Build them from the top-level invocation so
-# pack-ramdisk.sh can install the products into the guest /usr/lib.
-GUEST_LIBRARY_PROJECTS := $(abspath ../GuestLibraries/libiconv)
-
-.PHONY: lc32-guest-libraries lc32-guest-libraries-clean
-lc32-guest-libraries:
-	@set -e; \
-	for project in $(GUEST_LIBRARY_PROJECTS); do \
-		THEOS_PROJECT_DIR= $(MAKE) --no-print-directory -C "$$project" all; \
-	done
-lc32-guest-libraries-clean:
-	@set -e; \
-	for project in $(GUEST_LIBRARY_PROJECTS); do \
-		THEOS_PROJECT_DIR= $(MAKE) --no-print-directory -C "$$project" clean; \
-	done
-
-ifeq ($(THEOS_CURRENT_INSTANCE),)
-before-all:: lc32-guest-libraries
-internal-clean:: lc32-guest-libraries-clean
 endif

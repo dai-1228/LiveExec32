@@ -10,9 +10,121 @@ typedef struct {
     volatile uint32_t callbackCount;
     volatile uint32_t callbackValid;
     volatile uint32_t lastFrameCount;
+    volatile uint32_t renderErrorsRemaining;
+    volatile uint32_t lastRenderWasError;
     volatile uint32_t reentrantStopAttempted;
     volatile OSStatus reentrantStopStatus;
+    volatile uint32_t notifyExpected;
+    volatile uint32_t notifyValid;
+    volatile uint32_t notifyPreCount;
+    volatile uint32_t notifyPostCount;
+    volatile uint32_t notifyPostErrorCount;
+    volatile uint32_t selfNotifyValid;
+    volatile uint32_t selfNotifyPreCount;
+    volatile uint32_t selfNotifyPostCount;
+    volatile uint32_t selfNotifyRemoveAttempted;
+    volatile OSStatus selfNotifyRemoveStatus;
 } OutputState;
+
+static int notify_arguments_valid(OutputState *state,
+                                  AudioUnitRenderActionFlags *actionFlags,
+                                  const AudioTimeStamp *timeStamp,
+                                  UInt32 bus,
+                                  UInt32 frameCount,
+                                  AudioBufferList *buffers) {
+    return state && actionFlags && timeStamp &&
+        (timeStamp->mFlags & kAudioTimeStampSampleTimeValid) != 0 &&
+        bus == 0 && frameCount > 0 && frameCount <= 4096 && buffers &&
+        buffers->mNumberBuffers == 1;
+}
+
+static OSStatus render_notify_callback(
+        void *refCon, AudioUnitRenderActionFlags *actionFlags,
+        const AudioTimeStamp *timeStamp, UInt32 bus, UInt32 frameCount,
+        AudioBufferList *buffers) {
+    OutputState *state = (OutputState *)refCon;
+    if(!notify_arguments_valid(state, actionFlags, timeStamp, bus,
+                               frameCount, buffers)) {
+        if(state) state->notifyValid = 0;
+        return kAudio_ParamError;
+    }
+
+    const int pre =
+        (*actionFlags & kAudioUnitRenderAction_PreRender) != 0;
+    const int post =
+        (*actionFlags & kAudioUnitRenderAction_PostRender) != 0;
+    if(pre == post) {
+        state->notifyValid = 0;
+        return kAudio_ParamError;
+    }
+
+    if(pre) {
+        if((*actionFlags & kAudioUnitRenderAction_PostRenderError) != 0 ||
+           state->notifyPreCount != state->notifyPostCount ||
+           state->callbackCount != state->notifyPostCount) {
+            state->notifyValid = 0;
+        }
+        ++state->notifyPreCount;
+        return noErr;
+    }
+
+    const int postHasError =
+        (*actionFlags & kAudioUnitRenderAction_PostRenderError) != 0;
+    if(state->notifyPreCount != state->notifyPostCount + 1 ||
+       state->callbackCount != state->notifyPreCount ||
+       postHasError != (state->lastRenderWasError != 0)) {
+        state->notifyValid = 0;
+    }
+    if(postHasError) {
+        ++state->notifyPostErrorCount;
+    } else {
+        const UInt32 requiredBytes = frameCount * 4u;
+        if(buffers->mBuffers[0].mNumberChannels != 2 ||
+           !buffers->mBuffers[0].mData ||
+           buffers->mBuffers[0].mDataByteSize != requiredBytes) {
+            state->notifyValid = 0;
+        }
+    }
+    ++state->notifyPostCount;
+    return noErr;
+}
+
+static OSStatus self_removing_notify_callback(
+        void *refCon, AudioUnitRenderActionFlags *actionFlags,
+        const AudioTimeStamp *timeStamp, UInt32 bus, UInt32 frameCount,
+        AudioBufferList *buffers) {
+    OutputState *state = (OutputState *)refCon;
+    if(!notify_arguments_valid(state, actionFlags, timeStamp, bus,
+                               frameCount, buffers)) {
+        if(state) state->selfNotifyValid = 0;
+        return kAudio_ParamError;
+    }
+
+    const int pre =
+        (*actionFlags & kAudioUnitRenderAction_PreRender) != 0;
+    const int post =
+        (*actionFlags & kAudioUnitRenderAction_PostRender) != 0;
+    if(pre == post) {
+        state->selfNotifyValid = 0;
+        return kAudio_ParamError;
+    }
+
+    if(pre) {
+        if(state->selfNotifyPreCount != state->selfNotifyPostCount ||
+           state->selfNotifyRemoveAttempted) {
+            state->selfNotifyValid = 0;
+        }
+        ++state->selfNotifyPreCount;
+        state->selfNotifyRemoveAttempted = 1;
+        state->selfNotifyRemoveStatus = AudioUnitRemoveRenderNotify(
+            state->unit, self_removing_notify_callback, state);
+    } else {
+        if(state->selfNotifyPreCount != state->selfNotifyPostCount + 1)
+            state->selfNotifyValid = 0;
+        ++state->selfNotifyPostCount;
+    }
+    return noErr;
+}
 
 static OSStatus render_callback(void *refCon,
                                 AudioUnitRenderActionFlags *actionFlags,
@@ -27,7 +139,10 @@ static OSStatus render_callback(void *refCon,
         buffers->mNumberBuffers == 1 &&
         buffers->mBuffers[0].mNumberChannels == 2 &&
         buffers->mBuffers[0].mData &&
-        buffers->mBuffers[0].mDataByteSize == requiredBytes;
+        buffers->mBuffers[0].mDataByteSize == requiredBytes &&
+        (!state->notifyExpected ||
+         (state->notifyPreCount == state->callbackCount + 1 &&
+          state->notifyPostCount == state->callbackCount));
     if(!valid) {
         if(state) state->callbackValid = 0;
         return kAudio_ParamError;
@@ -41,12 +156,15 @@ static OSStatus render_callback(void *refCon,
     }
     buffers->mBuffers[0].mDataByteSize = requiredBytes;
     state->lastFrameCount = frameCount;
+    const int returnError = state->renderErrorsRemaining != 0;
+    if(returnError) --state->renderErrorsRemaining;
+    state->lastRenderWasError = returnError;
     ++state->callbackCount;
     if(!state->reentrantStopAttempted && state->unit) {
         state->reentrantStopAttempted = 1;
         state->reentrantStopStatus = AudioOutputUnitStop(state->unit);
     }
-    return noErr;
+    return returnError ? kAudio_ParamError : noErr;
 }
 
 static int report_status(const char *name, OSStatus status) {
@@ -100,6 +218,10 @@ int main(void) {
     OutputState state = {
         .unit = unit,
         .callbackValid = 1,
+        .renderErrorsRemaining = 1,
+        .notifyExpected = 1,
+        .notifyValid = 1,
+        .selfNotifyValid = 1,
     };
     AURenderCallbackStruct callback = {
         .inputProc = render_callback,
@@ -108,6 +230,11 @@ int main(void) {
     passed &= report_status("audio-unit-output-callback",
         AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback,
             kAudioUnitScope_Global, 0, &callback, sizeof(callback)));
+    passed &= report_status("audio-unit-output-add-render-notify",
+        AudioUnitAddRenderNotify(unit, render_notify_callback, &state));
+    passed &= report_status("audio-unit-output-add-self-removing-notify",
+        AudioUnitAddRenderNotify(unit, self_removing_notify_callback,
+            &state));
 
     UInt32 maximumFrames = 0;
     UInt32 maximumFramesSize = sizeof(maximumFrames);
@@ -136,6 +263,29 @@ int main(void) {
         firstRunValid ? "PASS" : "FAIL", (unsigned)firstCount,
         (unsigned)state.lastFrameCount);
 
+    const int notifyValid = state.notifyValid &&
+        state.notifyPreCount == firstCount &&
+        state.notifyPostCount == firstCount &&
+        state.notifyPostErrorCount == 1;
+    passed &= notifyValid;
+    printf("audio-unit-output-render-notify: %s (pre=%u post=%u "
+        "errors=%u)\n", notifyValid ? "PASS" : "FAIL",
+        (unsigned)state.notifyPreCount,
+        (unsigned)state.notifyPostCount,
+        (unsigned)state.notifyPostErrorCount);
+
+    const int selfNotifyValid = state.selfNotifyValid &&
+        state.selfNotifyPreCount == 1 &&
+        state.selfNotifyPostCount == 1 &&
+        state.selfNotifyRemoveAttempted &&
+        state.selfNotifyRemoveStatus == noErr;
+    passed &= selfNotifyValid;
+    printf("audio-unit-output-self-remove-notify: %s (pre=%u post=%u "
+        "status=%d)\n", selfNotifyValid ? "PASS" : "FAIL",
+        (unsigned)state.selfNotifyPreCount,
+        (unsigned)state.selfNotifyPostCount,
+        (int)state.selfNotifyRemoveStatus);
+
     const int reentrantStopSafe = state.reentrantStopAttempted &&
         state.reentrantStopStatus ==
             kAudioUnitErr_CannotDoInCurrentContext;
@@ -151,6 +301,12 @@ int main(void) {
     printf("audio-unit-output-stop-quiescent: %s\n",
         stoppedIsQuiescent ? "PASS" : "FAIL");
 
+    passed &= report_status("audio-unit-output-remove-render-notify",
+        AudioUnitRemoveRenderNotify(unit, render_notify_callback, &state));
+    state.notifyExpected = 0;
+    const uint32_t removedNotifyPreCount = state.notifyPreCount;
+    const uint32_t removedNotifyPostCount = state.notifyPostCount;
+
     passed &= report_status("audio-unit-output-restart",
         AudioOutputUnitStart(unit));
     usleep(200000);
@@ -161,6 +317,13 @@ int main(void) {
     passed &= restartRendered;
     printf("audio-unit-output-restart-rendered: %s (callbacks=%u)\n",
         restartRendered ? "PASS" : "FAIL", (unsigned)secondCount);
+
+    const int removedNotifyQuiescent =
+        state.notifyPreCount == removedNotifyPreCount &&
+        state.notifyPostCount == removedNotifyPostCount;
+    passed &= removedNotifyQuiescent;
+    printf("audio-unit-output-removed-notify-quiescent: %s\n",
+        removedNotifyQuiescent ? "PASS" : "FAIL");
 
     passed &= report_status("audio-unit-output-uninitialize",
         AudioUnitUninitialize(unit));

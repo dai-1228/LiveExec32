@@ -157,7 +157,11 @@ BOOL LC32TestRetainedFamilyReturnExclusion(void) {
 
     NSMutableString *source =
         [[NSMutableString alloc] initWithCapacity:8];
-    [source appendString:@"source"];
+    /* A short immutable copy can be an immortal native tagged string, whose
+     * associated probe cannot observe deallocation. Keep this ownership test
+     * on a heap-backed string rather than testing that representation detail. */
+    [source appendString:
+        @"LC32 retained-family ownership probe with a heap-backed string copy"];
 
     NSString *copied = [source copy];
     LC32AttachReturnProxyProbe(copied);

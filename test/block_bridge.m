@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <Block.h>
 #import <objc/runtime.h>
 #include <dispatch/dispatch.h>
 #include <pthread.h>
@@ -10,6 +11,85 @@ extern uint32_t LC32InvokeHostCRet32(uint64_t hostPointer, ...);
 
 static NSUInteger operationProxyDeallocCount;
 static char operationProxyProbeKey;
+
+/*
+ * LLVM GCC 4.2 notification callbacks can advertise the 2010 block ABI while
+ * leaving the descriptor's signature slot null.  Preserve that exact
+ * 24-byte stack-block shape instead of clearing the signature flag on a
+ * modern compiler-generated descriptor.
+ */
+struct LC32LegacyNotificationBlockDescriptor {
+    uintptr_t reserved;
+    uintptr_t size;
+    const char *signature;
+    const char *layout;
+};
+
+struct LC32LegacyNotificationProbe {
+    BOOL invoked;
+    NSString *expectedName;
+};
+
+struct LC32LegacyNotificationBlockLiteral {
+    void *isa;
+    uint32_t flags;
+    uint32_t reserved;
+    void (*invoke)(struct LC32LegacyNotificationBlockLiteral *,
+                   NSNotification *);
+    struct LC32LegacyNotificationBlockDescriptor *descriptor;
+    struct LC32LegacyNotificationProbe *probe;
+};
+
+_Static_assert(sizeof(struct LC32LegacyNotificationBlockDescriptor) == 16,
+               "legacy ARM32 block descriptor layout changed");
+_Static_assert(sizeof(struct LC32LegacyNotificationBlockLiteral) == 24,
+               "legacy ARM32 stack block layout changed");
+
+static void LC32InvokeLegacyNotificationBlock(
+        struct LC32LegacyNotificationBlockLiteral *block,
+        NSNotification *notification) {
+    block->probe->invoked =
+        [notification.name isEqualToString:block->probe->expectedName];
+}
+
+static void LC32IgnoreLegacyNotificationBlock(
+        struct LC32LegacyNotificationBlockLiteral *block,
+        NSNotification *notification) {
+    (void)block;
+    (void)notification;
+}
+
+static struct LC32LegacyNotificationBlockDescriptor
+    LC32LegacyNotificationDescriptor = {
+        0,
+        sizeof(struct LC32LegacyNotificationBlockLiteral),
+        NULL,
+        NULL,
+    };
+
+__attribute__((noinline))
+static id LC32AddLegacyNotificationObserver(
+        NSNotificationCenter *center, NSString *name,
+        struct LC32LegacyNotificationProbe *probe) {
+    struct LC32LegacyNotificationBlockLiteral literal = {
+        .isa = _NSConcreteStackBlock,
+        .flags = 1U << 30,
+        .reserved = 0,
+        .invoke = LC32InvokeLegacyNotificationBlock,
+        .descriptor = &LC32LegacyNotificationDescriptor,
+        .probe = probe,
+    };
+    void (^block)(NSNotification *) =
+        (void (^)(NSNotification *))&literal;
+    id observer = [center addObserverForName:name
+                                      object:nil
+                                       queue:nil
+                                  usingBlock:block];
+    /* A retained wrapper must own its heap copy before registration returns. */
+    ((volatile struct LC32LegacyNotificationBlockLiteral *)&literal)->invoke =
+        LC32IgnoreLegacyNotificationBlock;
+    return observer;
+}
 
 static BOOL LC32RunTypedWorkerBlockProbe(id block, uint32_t kind) {
     static uint64_t probe;
@@ -180,6 +260,37 @@ static uintptr_t LC32AppendCoalescingOperation(
 
 @end
 
+@interface LC32NotificationSelectorProbe : NSObject {
+    NSUInteger _invocationCount;
+    pthread_t _callbackThread;
+}
+
+- (void)workerNotification:(NSNotification *)notification;
+- (NSUInteger)invocationCount;
+- (pthread_t)callbackThread;
+
+@end
+
+@implementation LC32NotificationSelectorProbe
+
+- (void)workerNotification:(NSNotification *)notification {
+    _callbackThread = pthread_self();
+    if([notification.name isEqualToString:
+            @"LC32GuestSelectorWorkerNotification"]) {
+        _invocationCount++;
+    }
+}
+
+- (NSUInteger)invocationCount {
+    return _invocationCount;
+}
+
+- (pthread_t)callbackThread {
+    return _callbackThread;
+}
+
+@end
+
 /*
  * YTBaseService stores completion arrays in a native NSMutableDictionary,
  * keyed by a guest PendingRequestKey.  Foundation consequently calls the
@@ -253,6 +364,17 @@ int main(void) {
         printf("guest-block-object-argument: %s\n",
                invoked ? "PASS" : "FAIL");
 
+        struct LC32LegacyNotificationProbe legacyNotificationProbe = {
+            .invoked = NO,
+            .expectedName = name,
+        };
+        id legacyObserver = LC32AddLegacyNotificationObserver(
+            center, name, &legacyNotificationProbe);
+        [center postNotificationName:name object:nil];
+        if(legacyObserver) [center removeObserver:legacyObserver];
+        printf("guest-block-notification-null-signature: %s\n",
+               legacyNotificationProbe.invoked ? "PASS" : "FAIL");
+
         NSOperationQueue *notificationQueue =
             [NSOperationQueue new];
         notificationQueue.maxConcurrentOperationCount = 1;
@@ -275,6 +397,53 @@ int main(void) {
         printf("guest-block-queued-object-argument: %s\n",
                queuedNotificationPassed ? "PASS" : "FAIL");
         [notificationQueue release];
+
+        LC32NotificationSelectorProbe *selectorProbe =
+            [LC32NotificationSelectorProbe new];
+        NSString *selectorNotificationName =
+            @"LC32GuestSelectorWorkerNotification";
+        [center addObserver:selectorProbe
+                   selector:@selector(workerNotification:)
+                       name:selectorNotificationName
+                     object:nil];
+        const uint64_t postOnWorker = LC32Dlsym(
+            "LC32TestPostNotificationOnWorker", YES);
+        BOOL selectorWorkerStarted = postOnWorker &&
+            LC32InvokeHostCRet32(postOnWorker, 0, 0, 0);
+        [center removeObserver:selectorProbe
+                         name:selectorNotificationName
+                       object:nil];
+        const BOOL selectorWorkerPassed =
+            selectorWorkerStarted &&
+            selectorProbe.invocationCount == 1 &&
+            !pthread_equal(selectorProbe.callbackThread, mainGuestThread);
+        printf("guest-selector-notification-worker-relay: %s\n",
+               selectorWorkerPassed ? "PASS" : "FAIL");
+
+        if(postOnWorker) {
+            LC32InvokeHostCRet32(postOnWorker, 0, 0, 0);
+        }
+        const BOOL filteredRemovalPassed =
+            selectorProbe.invocationCount == 1;
+        printf("guest-selector-notification-filtered-removal: %s\n",
+               filteredRemovalPassed ? "PASS" : "FAIL");
+
+        [center addObserver:selectorProbe
+                   selector:@selector(workerNotification:)
+                       name:selectorNotificationName
+                     object:nil];
+        if(postOnWorker) {
+            LC32InvokeHostCRet32(postOnWorker, 0, 0, 0);
+        }
+        [center removeObserver:selectorProbe];
+        if(postOnWorker) {
+            LC32InvokeHostCRet32(postOnWorker, 0, 0, 0);
+        }
+        const BOOL broadRemovalPassed =
+            selectorProbe.invocationCount == 2;
+        printf("guest-selector-notification-broad-removal: %s\n",
+               broadRemovalPassed ? "PASS" : "FAIL");
+        [selectorProbe release];
 
         NSMutableArray *coalescedCallbacks = [NSMutableArray array];
         NSMutableArray *coalescedResults = [NSMutableArray array];
@@ -521,8 +690,8 @@ int main(void) {
          * thread.  Release the operations afterwards so the pending array,
          * not an operation's setup block, is the only owner of each response
          * by the time fanout occurs. */
-        [[coalescingOperations objectAtIndex:0] start];
-        [[coalescingOperations objectAtIndex:1] start];
+        [(NSOperation *)[coalescingOperations objectAtIndex:0] start];
+        [(NSOperation *)[coalescingOperations objectAtIndex:1] start];
         const BOOL operationCallbacksRanOnMainThread =
             [operationMainThreadResults isEqual:@[@YES, @YES]];
         const BOOL operationPendingStackReused =
@@ -836,7 +1005,8 @@ int main(void) {
         printf("guest-block-worker-signed-64-result: %s\n",
                workerSigned64ResultPassed ? "PASS" : "FAIL");
 
-        return invoked && queuedNotificationPassed && operationReusePassed &&
+        return invoked && legacyNotificationProbe.invoked &&
+            queuedNotificationPassed && operationReusePassed &&
             coalescedStackReused && coalescedCopiesDistinct &&
             coalescedFanoutPassed &&
             nestedOuterStackReused && nestedInnerStackReused &&

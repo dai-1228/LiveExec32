@@ -33,6 +33,19 @@ int main(void) {
         ? [[(NSURL *)sourceURL path] copy]
         : nil;
 
+    NSBundle *mainNSBundle = (NSBundle *)mainBundle;
+    NSString *emptyResourcePath = [mainNSBundle
+        pathForResource:@"" ofType:nil];
+    check("bundle-empty-resource-modern-semantics",
+        mainNSBundle && emptyResourcePath == nil);
+
+    NSArray *languageCandidates = [NSArray arrayWithObject:@"zz-ZZ"];
+    NSArray *selectedLanguages = [NSBundle
+        preferredLocalizationsFromArray:languageCandidates];
+    check("bundle-language-selection-modern-semantics",
+        [selectedLanguages count] != 0 &&
+        [[selectedLanguages objectAtIndex:0] isEqualToString:@"zz-ZZ"]);
+
     /* Use an owned bundle so the copied URL must remain valid independently
      * of both the input URL and the bundle from which it was obtained. */
     CFBundleRef recreatedBundle = sourceURL

@@ -1270,8 +1270,23 @@ BE CAREFUL WHEN MOVING SYSCALL. Checklist:
                 // NOTE: skip r7 since it's frame pointer
                 cpu->Regs()[0] = guest__kernelrpc_mach_vm_map_trap(cpu->Regs()[0], cpu->Regs()[1], cpu->Regs()[2] | ((u64)cpu->Regs()[3] << 32), cpu->Regs()[4] | ((u64)cpu->Regs()[5] << 32), cpu->Regs()[6], cpu->Regs()[8]);
                 break;
+            case -14: // _kernelrpc_mach_vm_protect_trap (ARM32: wllww)
+                cpu->Regs()[0] = guest__kernelrpc_mach_vm_protect_trap(
+                    cpu->Regs()[0], cpu->Regs()[1] | ((u64)cpu->Regs()[2] << 32),
+                    cpu->Regs()[3] | ((u64)cpu->Regs()[4] << 32),
+                    cpu->Regs()[5], cpu->Regs()[6]);
+                break;
             case -12:
                 cpu->Regs()[0] = guest__kernelrpc_mach_vm_deallocate_trap(cpu->Regs()[0], cpu->Regs()[1] | ((u64)cpu->Regs()[2] << 32), cpu->Regs()[3] | ((u64)cpu->Regs()[4] << 32));
+                break;
+            case -11: // _kernelrpc_mach_vm_purgable_control_trap
+                cpu->Regs()[0] =
+                    guest__kernelrpc_mach_vm_purgable_control_trap(
+                        cpu->Regs()[0],
+                        cpu->Regs()[1] |
+                            (static_cast<u64>(cpu->Regs()[2]) << 32),
+                        static_cast<vm_purgable_t>(cpu->Regs()[3]),
+                        cpu->Regs()[4]);
                 break;
             case -10:
                 cpu->Regs()[0] = guest__kernelrpc_mach_vm_allocate_trap(cpu->Regs()[0], cpu->Regs()[1], cpu->Regs()[2] | ((u64)cpu->Regs()[3] << 32), cpu->Regs()[4]);
@@ -1490,6 +1505,15 @@ BE CAREFUL WHEN MOVING SYSCALL. Checklist:
             case SYS_fcntl:
             case SYS_fcntl_nocancel:
                 cpu->Regs()[0] = guest_fcntl(cpu->Regs()[0], cpu->Regs()[1], cpu->Regs()[2]);
+                break;
+            case SYS_aio_return:
+                cpu->Regs()[0] = guest_aio_return(cpu->Regs()[0]);
+                break;
+            case SYS_aio_error:
+                cpu->Regs()[0] = guest_aio_error(cpu->Regs()[0]);
+                break;
+            case SYS_aio_read:
+                cpu->Regs()[0] = guest_aio_read(cpu->Regs()[0]);
                 break;
             case SYS_connect: // 98
             case SYS_connect_nocancel: // 409
@@ -1813,9 +1837,9 @@ BE CAREFUL WHEN MOVING SYSCALL. Checklist:
                     false);
                 break;
             case SYS_psynch_cvwait: {
-                /* The ARMv7 syscall veneer saves r4-r6/r8.  Relative
-                 * timeout seconds and nanoseconds are therefore at the
-                 * original arguments' stack slots, sp+32 and sp+40. */
+                /* The ARMv7 veneer saves r4-r6/r8, then loads the mutex and
+                 * both mugen words into r4-r6. Flags stay at sp+28, followed
+                 * by relative timeout seconds at sp+32 and nsec at sp+40. */
                 const u32 stack = cpu->Regs()[Reg::SP];
                 const u64 timeoutSecondsBits =
                     static_cast<u64>(MemoryRead32(
@@ -1825,6 +1849,8 @@ BE CAREFUL WHEN MOVING SYSCALL. Checklist:
                 cpu->Regs()[0] = GuestPsynchConditionWait(
                     cpu->Regs()[0], cpu->Regs()[1],
                     cpu->Regs()[2], cpu->Regs()[4],
+                    cpu->Regs()[5], cpu->Regs()[6],
+                    MemoryRead32(stack + 28, false),
                     static_cast<int64_t>(timeoutSecondsBits),
                     MemoryRead32(stack + 40, false));
                 break;
@@ -2477,7 +2503,7 @@ BE CAREFUL WHEN MOVING SYSCALL. Checklist:
     }
 
     bool handleMachineDependentSyscall(int NR) {
-        printf("handleMachineDependentSyscall(%d)\n", NR);
+        LC32_DEBUG_PRINTF("handleMachineDependentSyscall(%d)\n", NR);
         switch (NR) {
             case 0:
                 InvalidateAllGuestJits(
@@ -2488,7 +2514,7 @@ BE CAREFUL WHEN MOVING SYSCALL. Checklist:
                 //backend.reg_write(ArmConst.UC_ARM_REG_R0, sys_dcache_flush(emulator));
                 return true;
             case 2:
-                printf("TSB set to 0x%08x\n", cpu->Regs()[0]);
+                LC32_DEBUG_PRINTF("TSB set to 0x%08x\n", cpu->Regs()[0]);
                 cp15.get()->uro = cpu->Regs()[0];
                 cpu->Regs()[0] = 0;
                 return true;
