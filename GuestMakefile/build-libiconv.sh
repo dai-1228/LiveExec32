@@ -83,6 +83,9 @@ mkdir -p "$(dirname "$ARCHIVE")" "$(dirname "$OUTPUT")"
 if [ "${LC32_LIBICONV_LOCKED:-0}" != 1 ] && command -v lockf >/dev/null 2>&1; then
     LC32_LIBICONV_LOCKED=1 exec lockf -k "$LOCK_FILE" "$0"
 fi
+if [ "${LC32_LIBICONV_LOCKED:-0}" != 1 ] && command -v flock >/dev/null 2>&1; then
+    LC32_LIBICONV_LOCKED=1 exec flock "$LOCK_FILE" "$0"
+fi
 
 if [ ! -f "$SDK_ROOT/usr/lib/libSystem.tbd" ]; then
     echo "iOS 10.3 guest SDK is unavailable: $SDK_ROOT" >&2
@@ -139,10 +142,29 @@ if ! validate_source "$SOURCE_ROOT"; then
 fi
 
 mkdir -p "$BUILD_ROOT"
-CC=$(xcrun --find clang)
+# The compiler needs Apple clang's -arch/-miphoneos-version-min spelling
+# and a Mach-O armv7s backend, so vanilla host cc cannot stand in for it.
+# macOS resolves it through xcrun; other platforms supply the toolchain
+# explicitly, exactly like the classic linker below the lock above.
+CC=${LC32_GUEST_CC:-}
+if [ -z "$CC" ]; then
+    CC=$(xcrun --find clang 2>/dev/null || true)
+fi
+if [ -z "$CC" ] || [ ! -x "$CC" ]; then
+    echo "ARM32 guest compiler unavailable: xcrun --find clang failed" >&2
+    echo "Select a toolchain with a guest-capable clang or set LC32_GUEST_CC=/absolute/path/to/clang" >&2
+    exit 1
+fi
 
 compile() {
-    "$CC" -arch armv7s -isysroot "$SDK_ROOT" \
+    # -arch drives Apple-hosted clang; the explicit -target spelling carries
+    # the same triple on hosts whose clang builds without the Darwin driver
+    # and would ignore -arch, defaulting the platform to the build host.
+    guest_triple=
+    if [ "$(uname -s)" != "Darwin" ]; then
+        guest_triple="-target armv7s-apple-ios10.3"
+    fi
+    "$CC" $guest_triple -arch armv7s -isysroot "$SDK_ROOT" \
         -miphoneos-version-min=10.3 -Os -fPIC -fvisibility=default \
         -std=gnu89 -Wno-deprecated-non-prototype \
         -DHAVE_CONFIG_H -DBUILDING_LIBICONV -DBUILDING_LIBCHARSET \
@@ -177,7 +199,12 @@ EOF
 compile "$BUILD_ROOT/version.c" "$BUILD_ROOT/version.o"
 
 output_tmp=$(mktemp "$(dirname "$OUTPUT")/.libiconv.2.dylib.XXXXXX")
-"$CC" -arch armv7s -isysroot "$SDK_ROOT" -miphoneos-version-min=10.3 \
+guest_link_triple=
+if [ "$(uname -s)" != "Darwin" ]; then
+    guest_link_triple="-target armv7s-apple-ios10.3"
+fi
+"$CC" $guest_link_triple -arch armv7s -isysroot "$SDK_ROOT" \
+    -miphoneos-version-min=10.3 \
     -fuse-ld="$GUEST_LINKER" \
     -dynamiclib -Wl,-install_name,/usr/lib/libiconv.2.dylib \
     -Wl,-compatibility_version,7 -Wl,-current_version,7 -Wl,-dead_strip \
