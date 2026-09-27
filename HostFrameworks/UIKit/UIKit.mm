@@ -108,13 +108,25 @@ typedef NS_ENUM(NSUInteger, LC32LegacyIPadGeometryMode) {
 /* The declared-universal canvas class records the layer backing the
  * adopted drawable on the owning window; the measured fit below reads it
  * back.  The weak reference never extends the layer's lifetime, so a view
- * that UIKit retires simply leaves the fit without a recorded drawable. */
-@interface LC32NativeCanvasDrawableState : NSObject
-@property(nonatomic, weak) CALayer *drawableLayer;
+ * that UIKit retires simply leaves the fit without a recorded drawable.
+ * The accessors are hand-written: this file is compiled with manual
+ * reference counting, where clang refuses to synthesize weak property
+ * accessors, while the weak store/load machinery itself is available. */
+@interface LC32NativeCanvasDrawableState : NSObject {
+@private
+    __weak CALayer *_drawableLayer;
+}
+- (CALayer *)drawableLayer;
+- (void)setDrawableLayer:(CALayer *)drawable;
 @end
 
 @implementation LC32NativeCanvasDrawableState
-
+- (CALayer *)drawableLayer {
+    return _drawableLayer;
+}
+- (void)setDrawableLayer:(CALayer *)drawable {
+    _drawableLayer = drawable;
+}
 @end
 
 /*
