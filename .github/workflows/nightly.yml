@@ -84,11 +84,14 @@ jobs:
     - name: Upload generated guest shims
       # The generator introspects the host UIKit runtime and can only run on
       # macOS; publish the generated shim sources so non-macOS builders can
-      # compile the guest frameworks against this exact generation.
+      # compile the guest frameworks against this exact generation.  The
+      # generated tree is a dot-directory holding a dotfile completeness
+      # stamp, so hidden files must be included or nothing matches the path.
       uses: actions/upload-artifact@v7
       with:
         name: guest-generated-shims
         path: GuestFrameworks/.generated/
+        include-hidden-files: true
         if-no-files-found: error
 
     - name: Assemble guest root filesystem
