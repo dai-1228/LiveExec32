@@ -13,9 +13,6 @@ typedef NS_ENUM(NSInteger, UIInterfaceOrientation) {
 
 @interface UIApplication : NSObject
 - (UIInterfaceOrientation)statusBarOrientation;
-- (void)setStatusBarOrientation:(UIInterfaceOrientation)orientation;
-- (void)setStatusBarOrientation:(UIInterfaceOrientation)orientation
-                        animated:(BOOL)animated;
 - (void)setStatusBarHidden:(BOOL)hidden animated:(BOOL)animated;
 @end
 

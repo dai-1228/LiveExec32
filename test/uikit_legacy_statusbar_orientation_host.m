@@ -56,6 +56,18 @@ static uint64_t forwardedOrientation;
 static uint64_t forwardedAnimated;
 static uint64_t forwardedHidden;
 
+/* The production category (UIApplication+LC32LegacyOrientation.m) implements
+ * the deprecated setters, but its declarations live in that translation
+ * unit. Declare them on a category here so this TU's call sites type-check
+ * without listing them on the stub's primary interface, which would trip
+ * -Wincomplete-implementation and the category/primary-collision warning
+ * under -Werror. */
+@interface UIApplication (LC32LegacyOrientationTestDeclarations)
+- (void)setStatusBarOrientation:(UIInterfaceOrientation)orientation;
+- (void)setStatusBarOrientation:(UIInterfaceOrientation)orientation
+                        animated:(BOOL)animated;
+@end
+
 @implementation UIApplication
 - (UIInterfaceOrientation)statusBarOrientation {
     return nativeStatusBarOrientation;
