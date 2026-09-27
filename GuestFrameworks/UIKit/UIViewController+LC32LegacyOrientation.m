@@ -17,13 +17,23 @@ static uint64_t LC32HostLegacyControllerOrientation;
     const uint64_t sdkFunction = LC32Dlsym(
         "LC32GetGuestExecutableSDKVersion", YES);
     const uint32_t sdk = sdkFunction ? LC32InvokeHostCRet32(sdkFunction) : 0;
+    /* The declared-universal canvas class is classified on the host from
+     * the plist plus the live device idiom, so resolve its answer here too;
+     * an older host without the entry keeps NO. */
+    const uint64_t declaredCanvasFunction = LC32Dlsym(
+        "LC32UIKitUsesNativeDeclaredLandscapePhoneCanvas", YES);
+    const BOOL declaredLandscapePhoneCanvas = declaredCanvasFunction &&
+        LC32InvokeHostCRet32(declaredCanvasFunction) != 0;
     /* Canvas hosts pair a controller's orientation with the wrapped scene for
      * their SDK-1..7 executables, exactly as before. A binary with no SDK
-     * version marker inherits the same contract under native legacy rotation:
-     * modern UIKit reports geometry that such a binary was never built for. */
+     * version marker inherits the same contract under native legacy rotation,
+     * as does a pre-iOS-8 universal executable declaring a landscape-only
+     * phone policy while executing in the phone idiom: modern UIKit reports
+     * geometry that such binaries were never built for. */
     if(!LC32GuestSDKUsesLegacyGeometryContract(
             sdk, LC32GuestUIKitLegacyCompatibilityEnabled(),
-            LC32GuestNativeLegacyRotationEnabled())) return;
+            LC32GuestNativeLegacyRotationEnabled(),
+            declaredLandscapePhoneCanvas)) return;
     LC32HostLegacyControllerOrientation = LC32Dlsym(
         "LC32UIKitGetLegacyControllerOrientation", YES);
     if(!LC32HostLegacyControllerOrientation) return;

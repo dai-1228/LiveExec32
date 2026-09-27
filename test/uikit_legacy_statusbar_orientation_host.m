@@ -198,23 +198,43 @@ BOOL LC32GuestNativeLegacyRotationEnabled(void) {
 int main(void) {
     @autoreleasepool {
         /* Shared SDK gate: SDK-0 inherits the pre-iOS-8 geometry contract
-         * under native rotation, every established population is unchanged. */
-        check(LC32GuestSDKUsesLegacyGeometryContract(0, NO, YES),
+         * under native rotation, every established population is unchanged.
+         * The fourth argument is the host's live answer for the
+         * declared-universal landscape phone-canvas class. */
+        check(LC32GuestSDKUsesLegacyGeometryContract(0, NO, YES, NO),
               "sdk0-inherits-legacy-geometry-under-native-rotation");
-        check(!LC32GuestSDKUsesLegacyGeometryContract(0, NO, NO),
+        check(!LC32GuestSDKUsesLegacyGeometryContract(0, NO, NO, NO),
               "sdk0-without-legacy-modes-stays-modern");
-        check(!LC32GuestSDKUsesLegacyGeometryContract(0, YES, NO),
+        check(!LC32GuestSDKUsesLegacyGeometryContract(0, YES, NO, NO),
               "sdk0-stays-excluded-on-canvas-hosts");
-        check(LC32GuestSDKUsesLegacyGeometryContract(0x00060000, YES, NO),
+        check(LC32GuestSDKUsesLegacyGeometryContract(0x00060000, YES, NO, NO),
               "sdk6-canvas-population-unchanged");
-        check(LC32GuestSDKUsesLegacyGeometryContract(0x00060000, YES, YES),
+        check(LC32GuestSDKUsesLegacyGeometryContract(0x00060000, YES, YES, NO),
               "sdk6-canvas-answer-wins-over-native");
-        check(!LC32GuestSDKUsesLegacyGeometryContract(0x00060000, NO, YES),
+        check(!LC32GuestSDKUsesLegacyGeometryContract(0x00060000, NO, YES, NO),
               "sdk6-native-stays-excluded");
-        check(!LC32GuestSDKUsesLegacyGeometryContract(0x00080000, YES, NO),
+        check(!LC32GuestSDKUsesLegacyGeometryContract(0x00080000, YES, NO, NO),
               "sdk8-executable-excluded");
-        check(!LC32GuestSDKUsesLegacyGeometryContract(0x000B0000, YES, YES),
+        check(!LC32GuestSDKUsesLegacyGeometryContract(0x000B0000, YES, YES, NO),
               "sdk11-executable-excluded");
+
+        /* The declared-universal canvas class inherits the same contract in
+         * native legacy rotation: SDK-1..7 executables with a live class
+         * answer qualify, and no other population changes. */
+        check(LC32GuestSDKUsesLegacyGeometryContract(0x00070000, NO, YES, YES),
+              "sdk7-declared-canvas-class-inherits-under-native-rotation");
+        check(LC32GuestSDKUsesLegacyGeometryContract(0x00010000, NO, YES, YES),
+              "sdk1-declared-canvas-class-inherits-under-native-rotation");
+        check(!LC32GuestSDKUsesLegacyGeometryContract(0x00070000, NO, YES, NO),
+              "sdk7-native-without-canvas-class-stays-excluded");
+        check(!LC32GuestSDKUsesLegacyGeometryContract(0x00070000, NO, NO, YES),
+              "canvas-class-without-legacy-modes-stays-modern");
+        check(LC32GuestSDKUsesLegacyGeometryContract(0x00070000, YES, YES, YES),
+              "canvas-answer-stays-unchanged-for-declared-class");
+        check(!LC32GuestSDKUsesLegacyGeometryContract(0x00080000, NO, YES, YES),
+              "sdk8-executable-excluded-even-in-declared-canvas-class");
+        check(!LC32GuestSDKUsesLegacyGeometryContract(0x000B0000, NO, YES, YES),
+              "sdk11-executable-excluded-even-in-declared-canvas-class");
 
         /* The controller override installs for the load-time configuration. */
         UIViewController *controller = [[UIViewController alloc] init];

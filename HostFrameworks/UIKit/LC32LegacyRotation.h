@@ -34,19 +34,25 @@ BOOL LC32NativeLegacyRotationWindowIsGuest(UIWindow *window);
  * (uniform MIN scale plus centering composed onto the window layer's
  * sublayer transform) for a window that just reported a geometry or
  * orientation event.  The adapter re-checks the runtime-declared landscape
- * phone-canvas class, the controller-less shape, and the live viewport, and
- * coalesces the work onto the main queue; the call is cheap for processes
- * outside the class, which never leave the static gates. */
+ * phone-canvas class and the declared-universal class, the window shape
+ * each class serves (controller-less for the former, both for the latter),
+ * and the live viewport, and coalesces the work onto the main queue; the
+ * call is cheap for processes outside the classes, which never leave the
+ * static gates. */
 void LC32ScheduleNativeLegacyCanvasFit(UIWindow *window);
 
-/* Supplied by the UIKit adapter: adopt the canonical 320x480 canvas bounds
+/* Supplied by the UIKit adapter: adopt the canonical phone-canvas bounds
  * for the drawable view that is about to allocate CAEAGLLayer renderbuffer
  * storage.  The runtime-declared canvas class can reach this allocation
  * with scene-sized launch bounds because the application's first UIScreen
  * read precedes the status-bar request that defines the class; the adapter
  * re-fits the view before storage is allocated so the renderbuffer, the
- * read-back viewport, and the engine's fixed projection agree.  Returns
- * whether the view was re-fitted. */
+ * read-back viewport, and the engine's fixed projection agree.  The
+ * declared-universal class re-fits to its own 480/568-point canvas the
+ * same way, leaves views authored at or below canvas size untouched, and
+ * records the drawable layer so the measured fit can target the rendered
+ * content of controller-backed windows.  Returns whether the view was
+ * re-fitted. */
 BOOL LC32UIKitAdoptNativeLegacyCanvasDrawable(CAEAGLLayer *drawable);
 
 /* React to a newly recorded pre-iOS-8 status-bar request. Safe to call from

@@ -75,10 +75,11 @@ typedef NS_ENUM(NSUInteger, LC32LegacyIPadGeometryMode) {
 @end
 
 /*
- * Presentation state for a controller-less window of the runtime-declared
- * landscape phone-canvas class.  The window layer's sublayer transform and
- * background are the only owned pieces; everything else about the window is
- * left exactly as the application and UIKit authored it.
+ * Presentation state for a window of the runtime-declared landscape
+ * phone-canvas class (controller-less) or of the declared-universal class
+ * (controller-less or controller-backed).  The window layer's sublayer
+ * transform and background are the only owned pieces; everything else about
+ * the window is left exactly as the application and UIKit authored it.
  */
 @interface LC32NativeCanvasFitState : NSObject {
 @public
@@ -103,6 +104,15 @@ typedef NS_ENUM(NSUInteger, LC32LegacyIPadGeometryMode) {
 }
 
 @end
+
+/* The declared-universal canvas class records the layer backing the
+ * adopted drawable on the owning window; the measured fit below reads it
+ * back through a weak-value map table.  The record must never extend the
+ * layer's lifetime — a retired view must leave the fit without a dangling
+ * record — and this file is compiled with manual reference counting, where
+ * neither synthesized weak properties nor __weak declarations are
+ * available, so the zeroing happens through NSMapTable's weak-value
+ * option instead. */
 
 /*
 symbol = r0 + r1 << 32
@@ -147,6 +157,8 @@ const void *LC32NativeCanvasFitStateKey =
     &LC32NativeCanvasFitStateKey;
 const void *LC32NativeCanvasFitAutoresizingKey =
     &LC32NativeCanvasFitAutoresizingKey;
+const void *LC32NativeCanvasDrawableLayerKey =
+    &LC32NativeCanvasDrawableLayerKey;
 
 struct LC32GuestUIKitPolicy {
     UIInterfaceOrientationMask declaredOrientations;
@@ -810,6 +822,7 @@ bool LC32TransformNearlyEquals(
     CGAffineTransform left, CGAffineTransform right);
 bool LC32ObjectUsesGuestClass(id object);
 bool LC32NativeLegacyFixedPhoneCanvasClassActive(void);
+bool LC32NativeDeclaredLandscapePhoneCanvasClassActive(void);
 LC32SupportedDeviceFamilies LC32NativeLegacyCanvasBundleFamilies(void);
 bool LC32NativeLegacyCanvasWindowEligible(UIWindow *window);
 void LC32FitNativeLegacyCanvasWindow(UIWindow *window);
@@ -838,11 +851,15 @@ struct LC32LegacyCanvasPolicy {
     bool usesFixedLandscapeIPadCanvas;
     bool usesFixedLandscapePhoneCanvas;
     bool mayRetainLegacyLandscapePhoneCanvas;
+    bool usesDeclaredLandscapePhoneCanvas;
+    bool containsTallPhoneLaunchArt;
 };
 
 const LC32LegacyCanvasPolicy& LC32GuestLegacyCanvasPolicy(void) {
     static LC32LegacyCanvasPolicy result = {
         LC32LegacyIPadCanvasNone,
+        false,
+        false,
         false,
         false,
         false,
@@ -858,6 +875,7 @@ const LC32LegacyCanvasPolicy& LC32GuestLegacyCanvasPolicy(void) {
             getenv("LC32_GUEST_EXECUTABLE")];
         NSBundle *bundle = [NSBundle bundleWithPath:
             path.stringByDeletingLastPathComponent];
+        NSDictionary *info = bundle.infoDictionary;
         result.kind = LC32BundleLegacyIPadCanvasKind(
             bundle, LC32GetGuestExecutableSDKVersion());
         result.usesFixedLandscapeIPadCanvas =
@@ -868,6 +886,14 @@ const LC32LegacyCanvasPolicy& LC32GuestLegacyCanvasPolicy(void) {
         result.mayRetainLegacyLandscapePhoneCanvas =
             LC32BundleMayRetainLegacyLandscapePhoneCanvas(
                 bundle, LC32GetGuestExecutableSDKVersion());
+        /* The declared-universal classifier's bundle-level terms only;
+         * the runtime phone-idiom execution is a live property and is
+         * applied by LC32NativeDeclaredLandscapePhoneCanvasClassActive. */
+        result.usesDeclaredLandscapePhoneCanvas =
+            LC32BundleUsesDeclaredLandscapePhoneCanvasInPhoneIdiom(
+                bundle, LC32GetGuestExecutableSDKVersion(), YES);
+        result.containsTallPhoneLaunchArt =
+            LC32BundleContainsTallPhoneLaunchArt(bundle, info);
     });
     return result;
 }
@@ -892,6 +918,15 @@ bool LC32GuestUsesFixedLandscapePhoneCanvas(void) {
 bool LC32GuestMayRetainLegacyLandscapePhoneCanvas(void) {
     return LC32GuestLegacyCanvasPolicy()
         .mayRetainLegacyLandscapePhoneCanvas;
+}
+
+bool LC32GuestUsesDeclaredLandscapePhoneCanvas(void) {
+    return LC32GuestLegacyCanvasPolicy()
+        .usesDeclaredLandscapePhoneCanvas;
+}
+
+bool LC32GuestCanvasBundleContainsTallPhoneLaunchArt(void) {
+    return LC32GuestLegacyCanvasPolicy().containsTallPhoneLaunchArt;
 }
 
 Class LC32NativeWindowDispatchClass(UIWindow *window) {
@@ -1838,22 +1873,63 @@ bool LC32NativeLegacyFixedPhoneCanvasClassActive(void) {
         (NSInteger)requested);
 }
 
+bool LC32NativeDeclaredLandscapePhoneCanvasClassActive(void) {
+    /* The declared-universal landscape phone canvas class: a pre-iOS-8
+     * bundle supporting both device families that declares a landscape-only
+     * phone policy, while it executes in the phone idiom. The bundle terms
+     * are cached once like every plist classifier; only the idiom is a
+     * live property, because the same universal binary legitimately wants
+     * the larger canvas under iPad-idiom execution. Every process outside
+     * the class leaves after the static rotation load, the cached bundle
+     * predicate, or the idiom property. */
+    if(!LC32NativeLegacyRotationEnabled()) return false;
+    if(!LC32GuestUsesDeclaredLandscapePhoneCanvas()) return false;
+    return UIDevice.currentDevice.userInterfaceIdiom ==
+        UIUserInterfaceIdiomPhone;
+}
+
 bool LC32NativeLegacyCanvasWindowEligible(UIWindow *window) {
-    /* Only the controller-less shape that native legacy rotation already
-     * serves: a guest window with no root view controller. The rotation
-     * unit's controller-less turn and legacy backing keep producing the
-     * upright presentation; this presentation only adds the fill scale. */
-    return window && window.guest_selfOrNull && window.windowScene &&
-        !LC32NativeWindowRootViewController(window);
+    /* The controller-less shape that native legacy rotation serves keeps
+     * its existing meaning: the rotation unit's controller-less turn and
+     * legacy backing already produce the upright presentation, and this
+     * presentation only adds the fill scale.  The declared-universal class
+     * also presents through a window whose application installed its own
+     * root view controller (the engine-controller shape of that era), so
+     * controller-backed windows qualify exactly while that class is
+     * active; the runtime-declared class keeps requiring the
+     * controller-less window, so its behavior is unchanged. */
+    if(!window || !window.guest_selfOrNull || !window.windowScene) {
+        return false;
+    }
+    if(LC32NativeWindowRootViewController(window)) {
+        return LC32NativeDeclaredLandscapePhoneCanvasClassActive();
+    }
+    return true;
 }
 
 void LC32FreezeNativeLegacyCanvasSubviews(UIWindow *window) {
     /* The canvas fit grows the window to the live presentation viewport; the
-     * 320x480 canvas subviews must keep their authored geometry through that
+     * canvas subviews must keep their authored geometry through that
      * resize. Freeze every direct guest subview's autoresizing mask, with the
      * same ownership semantics as the canvas-mode rootless renderer: a guest
      * that later claims its own mask (anything other than None) wins and is
-     * never frozen again. */
+     * never frozen again.  The declared-universal class additionally freezes
+     * the root controller's own view: it is a direct subview that UIKit
+     * created on the host side for the application's controller (no guest
+     * mirror), and without freezing it the window growth auto-resizes the
+     * content root to the viewport, so the fit would measure the screen
+     * instead of the canvas.  UIKit's rotation turn sizes the root view
+     * explicitly rather than through autoresizing, so freezing does not
+     * interfere with the turn itself.  Restoring the saved masks cannot
+     * undo a converged fit: the fit lives on the window layer's
+     * sublayerTransform and never touches view frames, and the restore
+     * only runs beside the fit's own teardown (class deactivation) in
+     * LC32FitNativeLegacyCanvasWindow. */
+    UIView *contentRoot = nil;
+    if(LC32NativeDeclaredLandscapePhoneCanvasClassActive()) {
+        LC32NativeViewIfLoaded(
+            LC32NativeWindowRootViewController(window), &contentRoot);
+    }
     NSMapTable<UIView *, LC32LegacyRendererAutoresizingState *> *saved =
         objc_getAssociatedObject(
             window, LC32NativeCanvasFitAutoresizingKey);
@@ -1868,7 +1944,8 @@ void LC32FreezeNativeLegacyCanvasSubviews(UIWindow *window) {
             saved, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     for(UIView *view in LC32NativeViewSubviews(window)) {
-        if(!view.guest_selfOrNull || [saved objectForKey:view]) continue;
+        if((!view.guest_selfOrNull && view != contentRoot) ||
+                [saved objectForKey:view]) continue;
         LC32LegacyRendererAutoresizingState *state =
             [LC32LegacyRendererAutoresizingState new];
         state.originalMask = LC32NativeViewAutoresizingMask(view);
@@ -1900,15 +1977,72 @@ void LC32RestoreNativeLegacyCanvasSubviews(UIWindow *window) {
         nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+void LC32RecordNativeLegacyCanvasDrawable(UIView *owner, CALayer *drawable) {
+    /* The declared-universal class measures its rendered content through
+     * the layer backing the adopted drawable: a controller-backed window's
+     * only direct subview is the root controller's view, so the
+     * direct-subview union would measure the window's content root rather
+     * than the engine's surface. Record the drawable layer on the window
+     * that owns it; the fit validates the layer is still mounted before
+     * measuring. Only that class ever reads the record, and the recorded
+     * layer is host-backed (a guest-class layer would make the fit's
+     * CoreAnimation reads unsafe off the guest thread). */
+    UIWindow *window = LC32NativeViewWindow(owner);
+    if(!window || !window.guest_selfOrNull ||
+            LC32ObjectUsesGuestClass(drawable)) {
+        return;
+    }
+    NSMapTable<NSNull *, CALayer *> *record = objc_getAssociatedObject(
+        window, LC32NativeCanvasDrawableLayerKey);
+    if(!record) {
+        /* The factory result is autoreleased and this function does not
+         * own it: the association's retain is the only ownership taken. */
+        record = [NSMapTable mapTableWithKeyOptions:
+            NSPointerFunctionsOpaquePersonality
+            valueOptions:(NSPointerFunctionsWeakMemory |
+                NSPointerFunctionsObjectPersonality)];
+        objc_setAssociatedObject(window, LC32NativeCanvasDrawableLayerKey,
+            record, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    [record setObject:drawable forKey:[NSNull null]];
+}
+
+CGRect LC32NativeLegacyCanvasDrawableContentRect(
+        UIWindow *window, CALayer *windowLayer) {
+    NSMapTable<NSNull *, CALayer *> *record = objc_getAssociatedObject(
+        window, LC32NativeCanvasDrawableLayerKey);
+    CALayer *drawable = [record objectForKey:[NSNull null]];
+    if(!drawable || LC32ObjectUsesGuestClass(drawable)) return CGRectNull;
+    CALayer *ancestor = drawable.superlayer;
+    while(ancestor && ancestor != windowLayer) {
+        ancestor = ancestor.superlayer;
+    }
+    /* The layer may have left this window's model tree; converting across
+     * unrelated trees is meaningless, so the caller falls back to the
+     * direct-subview union. */
+    if(!ancestor) return CGRectNull;
+    const CGRect presented = [windowLayer convertRect:drawable.bounds
+                                           fromLayer:drawable];
+    if(!isfinite(presented.origin.x) || !isfinite(presented.origin.y) ||
+            !isfinite(presented.size.width) ||
+            !isfinite(presented.size.height) ||
+            !(presented.size.width > 0) || !(presented.size.height > 0)) {
+        return CGRectNull;
+    }
+    return presented;
+}
+
 void LC32FitNativeLegacyCanvasWindow(UIWindow *window) {
-    /* Present the canonical 320x480 canvas of the runtime-declared class
-     * rotated by the existing native-mode backing (which already yields the
-     * upright content) and uniformly scaled to fill the live viewport.  The
-     * composed transform sits on the window layer's sublayer transform:
-     * the window keeps its exact UIView-level bounds, frame, and transform,
-     * the rotation lifecycle never inspects it, and UIKit hit-testing applies
-     * its inverse before delivering touches, exactly as for the canvas-mode
-     * rootless compositor. */
+    /* Present the canonical phone canvas of the runtime-declared class
+     * (320x480) or of the declared-universal class (320x480 or 320x568,
+     * from the bundle's launch art) rotated by the existing native-mode
+     * backing (which already yields the upright content) and uniformly
+     * scaled to fill the live viewport.  The composed transform sits on the
+     * window layer's sublayer transform: the window keeps its exact
+     * UIView-level bounds, frame, and transform, the rotation lifecycle
+     * never inspects it, and UIKit hit-testing applies its inverse before
+     * delivering touches, exactly as for the canvas-mode rootless
+     * compositor. */
     if(!LC32NativeLegacyCanvasWindowEligible(window)) return;
     CALayer *windowLayer = LC32NativeViewLayer(window);
     if(!windowLayer || LC32ObjectUsesGuestClass(windowLayer)) return;
@@ -1916,10 +2050,12 @@ void LC32FitNativeLegacyCanvasWindow(UIWindow *window) {
     LC32NativeCanvasFitState *state = objc_getAssociatedObject(
         window, LC32NativeCanvasFitStateKey);
     if(state && state->yielded) return;
-    if(!LC32NativeLegacyFixedPhoneCanvasClassActive()) {
-        /* The recorded request defines the class; a later non-landscape
-         * request must not leave a stale fit behind. Restore only the pieces
-         * still ours, mirroring the rootless placement reconciliation. */
+    if(!LC32NativeLegacyFixedPhoneCanvasClassActive() &&
+            !LC32NativeDeclaredLandscapePhoneCanvasClassActive()) {
+        /* Whichever class defined the fit must still be active; a class
+         * that went away must not leave a stale fit behind. Restore only the
+         * pieces still ours, mirroring the rootless placement
+         * reconciliation. */
         if(!state) return;
         if(!state->hasTransform) {
             /* The fill transform never engaged; the window growth may still
@@ -2055,9 +2191,15 @@ void LC32FitNativeLegacyCanvasWindow(UIWindow *window) {
      * Screen rect: the topmost ancestor layer's bounds, converted into the
      * window layer's space — this applies any rotation living above the
      * window exactly as the renderer sees it.
-     * Content rect: the union of the direct guest subview layers' bounds,
-     * converted into the window layer's space — this applies any rotation
-     * living inside the window, plus the fit transform itself. */
+     * Content rect: for a controller-backed window of the declared-universal
+     * class, the rendered rect of the layer backing the adopted drawable —
+     * its only direct subview is the root controller's view, which covers
+     * the window after growth, so the union below would measure the screen
+     * instead of the content. Every other window (and any controller-backed
+     * window without an adopted drawable) uses the union of the direct guest
+     * subview layers' bounds, converted into the window layer's space —
+     * this applies any rotation living inside the window, plus the fit
+     * transform itself. */
     CALayer *sceneLayer = windowLayer;
     while(sceneLayer.superlayer) sceneLayer = sceneLayer.superlayer;
     CGRect targetRect = CGRectNull;
@@ -2093,20 +2235,27 @@ void LC32FitNativeLegacyCanvasWindow(UIWindow *window) {
     [CATransaction setDisableActions:YES];
 
     CGRect contentRect = CGRectNull;
-    for(UIView *subview in LC32NativeViewSubviews(window)) {
-        if(!subview.guest_selfOrNull) continue;
-        CALayer *sublayer = LC32NativeViewLayer(subview);
-        if(!sublayer || LC32ObjectUsesGuestClass(sublayer)) continue;
-        const CGRect presented = [windowLayer convertRect:
-            sublayer.bounds fromLayer:sublayer];
-        if(!isfinite(presented.origin.x) ||
-                !isfinite(presented.origin.y) ||
-                !isfinite(presented.size.width) ||
-                !isfinite(presented.size.height) ||
-                !(presented.size.width > 0) ||
-                !(presented.size.height > 0)) continue;
-        contentRect = CGRectIsNull(contentRect)
-            ? presented : CGRectUnion(contentRect, presented);
+    if(LC32NativeDeclaredLandscapePhoneCanvasClassActive() &&
+            LC32NativeWindowRootViewController(window)) {
+        contentRect = LC32NativeLegacyCanvasDrawableContentRect(
+            window, windowLayer);
+    }
+    if(CGRectIsNull(contentRect)) {
+        for(UIView *subview in LC32NativeViewSubviews(window)) {
+            if(!subview.guest_selfOrNull) continue;
+            CALayer *sublayer = LC32NativeViewLayer(subview);
+            if(!sublayer || LC32ObjectUsesGuestClass(sublayer)) continue;
+            const CGRect presented = [windowLayer convertRect:
+                sublayer.bounds fromLayer:sublayer];
+            if(!isfinite(presented.origin.x) ||
+                    !isfinite(presented.origin.y) ||
+                    !isfinite(presented.size.width) ||
+                    !isfinite(presented.size.height) ||
+                    !(presented.size.width > 0) ||
+                    !(presented.size.height > 0)) continue;
+            contentRect = CGRectIsNull(contentRect)
+                ? presented : CGRectUnion(contentRect, presented);
+        }
     }
     if(CGRectIsNull(contentRect)) {
         [CATransaction commit];
@@ -3747,9 +3896,19 @@ extern "C" BOOL LC32UIKitUsesNativeFixedPhoneCanvas(void) {
     return LC32NativeLegacyFixedPhoneCanvasClassActive();
 }
 
+extern "C" BOOL LC32UIKitUsesNativeDeclaredLandscapePhoneCanvas(void) {
+    /* Serves the guest UIScreen overrides and the load-time geometry
+     * contract for the declared-universal class. The plist terms are fixed
+     * for the process lifetime, but keep the live query shape of the
+     * runtime-class answer above: the guest caches its own decision, and
+     * an older host without this entry keeps the modern geometry. */
+    return LC32NativeDeclaredLandscapePhoneCanvasClassActive();
+}
+
 extern "C" void LC32ScheduleNativeLegacyCanvasFit(UIWindow *window) {
     if(!LC32NativeLegacyCanvasWindowEligible(window)) return;
     if(!LC32NativeLegacyFixedPhoneCanvasClassActive() &&
+            !LC32NativeDeclaredLandscapePhoneCanvasClassActive() &&
             !objc_getAssociatedObject(window, LC32NativeCanvasFitStateKey)) {
         return;
     }
@@ -3767,19 +3926,35 @@ extern "C" void LC32ScheduleNativeLegacyCanvasFit(UIWindow *window) {
 
 extern "C" BOOL LC32UIKitAdoptNativeLegacyCanvasDrawable(CAEAGLLayer *drawable) {
     /* The application sizes its renderer from the spoofed UIScreen bounds.
-     * For this class the defining status-bar request is still in the future
-     * at that first read, so the drawable can arrive scene-sized.  Re-fit
-     * the owning view to the canonical canvas before storage is allocated:
-     * the renderbuffer, the read-back viewport, and the engine's fixed
-     * 320x480 projection then agree exactly as they would have on the
-     * 2009-era device whose geometry the class reproduces.  Only native
-     * UIView implementations are invoked; engines of this shape never
-     * re-read their own view geometry after the drawable exists. */
-    if(!drawable || !LC32NativeLegacyFixedPhoneCanvasClassActive()) return NO;
+     * For the runtime-declared class the defining status-bar request is
+     * still in the future at that first read, so the drawable can arrive
+     * scene-sized.  Re-fit the owning view to the canonical canvas before
+     * storage is allocated: the renderbuffer, the read-back viewport, and
+     * the engine's fixed 320x480 projection then agree exactly as they
+     * would have on the 2009-era device whose geometry the class
+     * reproduces.  The declared-universal class re-fits the same way to
+     * its own canvas (480 or 568 points tall, from the bundle's launch
+     * art), except that a view authored smaller than the canvas keeps its
+     * bounds: that era's engines hardcode the drawable to the view's own
+     * frame, and iOS sized the renderbuffer from that frame, so the
+     * authored geometry is the contract.  Only native UIView
+     * implementations are invoked; engines of this shape never re-read
+     * their own view geometry after the drawable exists. */
+    if(!drawable) return NO;
+    const bool runtimeClass = LC32NativeLegacyFixedPhoneCanvasClassActive();
+    const bool declaredClass = !runtimeClass &&
+        LC32NativeDeclaredLandscapePhoneCanvasClassActive();
+    if(!runtimeClass && !declaredClass) return NO;
     UIView *owner = (UIView *)drawable.delegate;
     if(![owner isKindOfClass:UIView.class] ||
             !LC32ObjectUsesGuestClass(owner)) {
         return NO;
+    }
+    if(declaredClass) {
+        /* The measured fit reads the content through this layer (see
+         * LC32RecordNativeLegacyCanvasDrawable); record it even when the
+         * bounds below need no adoption. */
+        LC32RecordNativeLegacyCanvasDrawable(owner, drawable);
     }
     const CGRect bounds = LC32NativeViewBounds(owner);
     if(!LC32TransformNearlyEquals(LC32NativeViewTransform(owner),
@@ -3787,21 +3962,44 @@ extern "C" BOOL LC32UIKitAdoptNativeLegacyCanvasDrawable(CAEAGLLayer *drawable) 
         return NO;
     }
     constexpr CGFloat epsilon = 0.5;
-    /* Portrait-ordered launch bounds that cover the canonical canvas but
-     * are not already exactly it. */
+    if(runtimeClass) {
+        /* Portrait-ordered launch bounds that cover the canonical canvas but
+         * are not already exactly it. */
+        if(!(bounds.size.height > bounds.size.width) ||
+                bounds.size.width < 320 - epsilon ||
+                bounds.size.height < 480 - epsilon ||
+                (fabs(bounds.size.width - 320) < epsilon &&
+                 fabs(bounds.size.height - 480) < epsilon)) {
+            return NO;
+        }
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        LC32NativeSetViewBounds(owner, CGRectMake(
+            bounds.origin.x, bounds.origin.y, 320, 480));
+        LC32NativeSetViewCenter(owner, CGPointMake(
+            bounds.origin.x + 160, bounds.origin.y + 240));
+        [CATransaction commit];
+        return YES;
+    }
+    /* Declared-universal class: same portrait-ordered launch-bounds shape,
+     * measured against this bundle's own canvas height.  A view at or below
+     * canvas size is authored geometry (hardcoded frames included) and is
+     * left untouched, so the drawable keeps matching the view's bounds. */
+    const CGFloat canvasHeight =
+        LC32GuestCanvasBundleContainsTallPhoneLaunchArt() ? 568.0 : 480.0;
     if(!(bounds.size.height > bounds.size.width) ||
             bounds.size.width < 320 - epsilon ||
-            bounds.size.height < 480 - epsilon ||
+            bounds.size.height < canvasHeight - epsilon ||
             (fabs(bounds.size.width - 320) < epsilon &&
-             fabs(bounds.size.height - 480) < epsilon)) {
+             fabs(bounds.size.height - canvasHeight) < epsilon)) {
         return NO;
     }
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     LC32NativeSetViewBounds(owner, CGRectMake(
-        bounds.origin.x, bounds.origin.y, 320, 480));
+        bounds.origin.x, bounds.origin.y, 320, canvasHeight));
     LC32NativeSetViewCenter(owner, CGPointMake(
-        bounds.origin.x + 160, bounds.origin.y + 240));
+        bounds.origin.x + 160, bounds.origin.y + canvasHeight * 0.5));
     [CATransaction commit];
     return YES;
 }

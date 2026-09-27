@@ -20,13 +20,18 @@ BOOL LC32GuestNativeLegacyRotationEnabled(void);
  * geometry and keep their existing SDK-1..7 executable population. A binary
  * with no SDK version marker predates the iOS 8 geometry change whenever the
  * effective process SDK does, so it inherits the pre-iOS-8 contract under
- * native legacy rotation. SDK-8+ executables never use legacy geometry. */
+ * native legacy rotation. A pre-iOS-8 universal executable that declares a
+ * landscape-only phone policy inherits the same contract while it executes
+ * in the phone idiom: declaredLandscapePhoneCanvas is the host's live
+ * answer for that class, and iPad-idiom execution keeps the normal universal
+ * path. SDK-8+ executables never use legacy geometry. */
 static inline BOOL LC32GuestSDKUsesLegacyGeometryContract(
         uint32_t executableSDK, BOOL canvasCompatibility,
-        BOOL nativeLegacyRotation) {
+        BOOL nativeLegacyRotation, BOOL declaredLandscapePhoneCanvas) {
     if(executableSDK >= 0x00080000) return NO;
     if(canvasCompatibility) return executableSDK != 0;
-    return nativeLegacyRotation && executableSDK == 0;
+    if(nativeLegacyRotation && executableSDK == 0) return YES;
+    return nativeLegacyRotation && declaredLandscapePhoneCanvas;
 }
 
 #endif
