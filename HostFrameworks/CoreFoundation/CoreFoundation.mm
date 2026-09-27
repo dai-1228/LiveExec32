@@ -3742,13 +3742,6 @@ u32 LC32_CoreFoundation_Dispatch(u32 opcodeValue, u32 guestCall, u32) {
             return WriteGuestCreatedObject(
                 guestWriteStream, writeStream);
         }
-        case LC32CoreFoundationOpReadStreamCreateWithFile: {
-            if(!RequireSlots(call, 1)) return 0;
-            CFURLRef url = SlotHostObject<CFURLRef>(call, 0);
-            if(!url) return 0;
-            return GuestForCreatedObject(
-                CFReadStreamCreateWithFile(kCFAllocatorDefault, url));
-        }
         case LC32CoreFoundationOpGetTypeID: {
             if(!RequireSlots(call, 1)) return 0;
             CFTypeRef object = SlotHostObject<CFTypeRef>(call, 0);
