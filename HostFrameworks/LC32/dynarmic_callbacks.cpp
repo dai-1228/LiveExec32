@@ -2600,3 +2600,164 @@ static Dynarmic::A32::UserCallbacks *CurrentUserCallbacks() {
 Dynarmic::A32::UserCallbacks *Dynarmic_current_user_callbacks() {
     return CurrentUserCallbacks();
 }
+
+/*
+ * Cross-thread snapshot of the emulated machine for the host hang
+ * watchdog: a blocked guest main thread freezes the whole application
+ * without raising any signal the crash machinery observes.  Halting the
+ * JITs makes blocked threads' register files stable; each registered
+ * thread's registers, wait state, and frame chain are then read with the
+ * safe crash-walker primitives and symbolicated against the guest image
+ * list.  The full report goes to stderr; the return value is a compact
+ * one-line description suitable for the process abort reason.
+ */
+std::string LC32GuestHangSnapshot() {
+    HaltAllGuestJits(LC32HaltReasonTrap);
+
+    const std::vector<GuestImageSnapshot> images = SnapshotGuestImages();
+
+    std::string report;
+    AppendCrashReportText(report,
+        "LiveExec32 guest hang report\n"
+        "Every guest thread is listed with its registry wait state, "
+        "registers, and frame chain; the main thread is debugger id 1.\n");
+    std::string compact = "LiveExec32 guest main thread stalled";
+
+    std::lock_guard<std::recursive_mutex> registryLock(guestThreadMutex);
+    for (const GuestThreadContext &thread : guestThreads) {
+        if (!thread.alive) continue;
+
+        const unsigned long long debuggerId =
+            static_cast<unsigned long long>(thread.debuggerId);
+        const int waitKind = static_cast<int>(thread.waitKind);
+        AppendCrashReportFormat(report,
+            "\nGuest thread %llu: wait kind %d at 0x%08x\n",
+            debuggerId, waitKind, thread.waitAddress);
+
+        if (!thread.nativeJit || !thread.nativeJit->jit) {
+            AppendCrashReportText(report,
+                "  no live JIT for this thread\n");
+            continue;
+        }
+
+        Dynarmic::A32::Jit *jit = thread.nativeJit->jit;
+        const auto registers = jit->Regs();
+        const u32 cpsrValue = jit->Cpsr();
+        AppendCrashReportFormat(report,
+            "  pc 0x%08x  lr 0x%08x  sp 0x%08x  r7 0x%08x\n"
+            "  r0 0x%08x  r1 0x%08x  r2 0x%08x  r3 0x%08x  "
+            "cpsr 0x%08x\n",
+            registers[Reg::PC], registers[Reg::LR],
+            registers[Reg::SP], registers[7],
+            registers[0], registers[1], registers[2], registers[3],
+            cpsrValue);
+
+        std::array<symbolicated_call, 0x100> callStack{};
+        int callStackLength = 0;
+        const auto appendAddress = [&](u32 address) {
+            if (address == 0 || callStackLength >=
+                    static_cast<int>(callStack.size())) {
+                return;
+            }
+            callStack[callStackLength++].address = address & ~1u;
+        };
+        const auto appendReturnAddress = [&](u32 returnAddress) {
+            if (returnAddress == 0) {
+                return;
+            }
+            const u32 instructionSize =
+                (returnAddress & 1u) != 0 ? 2u : 4u;
+            const u32 normalizedAddress = returnAddress & ~1u;
+            appendAddress(normalizedAddress >= instructionSize
+                ? normalizedAddress - instructionSize
+                : normalizedAddress);
+        };
+        appendAddress(registers[Reg::PC]);
+        appendReturnAddress(registers[Reg::LR]);
+
+        std::unordered_set<u32> visitedFramePointers;
+        std::string unwindMessage;
+        u32 framePointer = registers[7];
+        while (framePointer != 0 &&
+                callStackLength < static_cast<int>(callStack.size())) {
+            if ((framePointer & 3) != 0 ||
+                    framePointer > UINT32_MAX - 8) {
+                AppendCrashReportFormat(unwindMessage,
+                    "unwind stopped at invalid frame pointer 0x%08x",
+                    framePointer);
+                break;
+            }
+            if (!visitedFramePointers.insert(framePointer).second) {
+                AppendCrashReportFormat(unwindMessage,
+                    "unwind stopped at cyclic frame pointer 0x%08x",
+                    framePointer);
+                break;
+            }
+            u32 nextFramePointer = 0;
+            u32 returnAddress = 0;
+            if (!read_guest_memory_with_permissions(
+                    framePointer, &nextFramePointer,
+                    sizeof(nextFramePointer), PROT_READ) ||
+                    !read_guest_memory_with_permissions(
+                    framePointer + 4, &returnAddress,
+                    sizeof(returnAddress), PROT_READ)) {
+                AppendCrashReportFormat(unwindMessage,
+                    "unwind stopped at unreadable frame pointer 0x%08x",
+                    framePointer);
+                break;
+            }
+            appendReturnAddress(returnAddress);
+            framePointer = nextFramePointer;
+        }
+        if (framePointer != 0 &&
+                callStackLength == static_cast<int>(callStack.size()) &&
+                unwindMessage.empty()) {
+            unwindMessage = "unwind stopped at the 256-frame limit";
+        }
+        symbolicate_call_stack(
+            callStack.data(), callStackLength, images);
+
+        AppendCrashReportText(report, "  Call stack:\n");
+        for (int index = 0; index < callStackLength; ++index) {
+            const symbolicated_call &call = callStack[index];
+            AppendCrashReportFormat(report,
+                "  %3d: 0x%08x", index, call.address);
+            if (!call.imageName.empty()) {
+                const char *symbolName = call.symbolName.c_str();
+                if (symbolName[0] == '_') {
+                    ++symbolName;
+                }
+                AppendCrashReportFormat(report,
+                    " %s`%s + 0x%x",
+                    call.imageName.c_str(),
+                    call.symbolName.empty()
+                        ? "(unknown symbol)"
+                        : symbolName,
+                    call.symbolOffset);
+            }
+            AppendCrashReportText(report, "\n");
+        }
+        if (!unwindMessage.empty()) {
+            AppendCrashReportFormat(report,
+                "  [%s]\n", unwindMessage.c_str());
+        }
+
+        if (thread.debuggerId == 1) {
+            std::string oneLine;
+            AppendCrashReportFormat(oneLine,
+                "LiveExec32 guest main thread stalled: "
+                "pc 0x%08x, wait kind %d at 0x%08x",
+                registers[Reg::PC], waitKind, thread.waitAddress);
+            if (oneLine.size() > LC32_OS_REASON_STRING_MAX) {
+                oneLine.resize(LC32_OS_REASON_STRING_MAX);
+            }
+            compact = std::move(oneLine);
+        }
+    }
+
+    AppendCrashReportText(report,
+        "\nEnd of guest hang report\n");
+    fwrite(report.data(), 1, report.size(), stderr);
+    fflush(stderr);
+    return compact;
+}
