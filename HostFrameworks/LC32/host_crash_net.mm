@@ -245,6 +245,10 @@ void LC32HostUncaughtExceptionHandler(NSException *exception) {
     }
 }
 
+/* Defined below the uncaught-exception and signal reporters; declared
+ * early so the install sequence can arm the watchdog first. */
+void LC32InstallHangWatchdog();
+
 void LC32InstallHostCrashNetOnce(void) {
     if(lc32HostCrashNetInstalled) return;
     lc32HostCrashNetInstalled = true;
