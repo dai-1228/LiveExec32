@@ -4301,6 +4301,50 @@ extern "C" u32 LC32UIKitGetLegacyStatusBarOrientation(void) {
 
 @end
 
+@interface UIWindow (LC32NativeLegacyCanvasForeground)
++ (void)lc32_nativeLegacyCanvasApplicationDidBecomeActive:(NSNotification *)notification;
+@end
+
+@implementation UIWindow (LC32NativeLegacyCanvasForeground)
+
++ (void)load {
+    /* Native legacy rotation only: the canvas-mode become-active observer
+     * above stays in its own mode, so no container adoption machinery is
+     * imported here. */
+    if(!LC32NativeLegacyRotationEnabled()) return;
+    if(LC32UIKitLegacyCompatibilityEnabled()) return;
+    [NSNotificationCenter.defaultCenter
+        addObserver:self
+        selector:@selector(lc32_nativeLegacyCanvasApplicationDidBecomeActive:)
+        name:UIApplicationDidBecomeActiveNotification
+        object:nil];
+}
+
++ (void)lc32_nativeLegacyCanvasApplicationDidBecomeActive:(NSNotification *)notification {
+    /* A plain foreground return drives none of the fit's re-arm events (no
+     * rotation turn, no view move, no new drawable adoption), yet the host
+     * scene geometry can re-settle across the resume. Schedule the fit for
+     * every window of the declared-universal class; the schedule's own
+     * eligibility, class-active, and pending gates coalesce the work, a
+     * converged pass applies nothing, and a yielded fit stays yielded. The
+     * runtime-declared class keeps its existing (device-verified) resume
+     * behavior, so this handler answers nothing for it. */
+    if(!LC32NativeDeclaredLandscapePhoneCanvasClassActive()) return;
+    UIApplication *application =
+        [notification.object isKindOfClass:UIApplication.class]
+            ? (UIApplication *)notification.object
+            : UIApplication.sharedApplication;
+    if(!application) return;
+    for(UIScene *scene in application.connectedScenes) {
+        if(![scene isKindOfClass:UIWindowScene.class]) continue;
+        for(UIWindow *window in ((UIWindowScene *)scene).windows) {
+            LC32ScheduleNativeLegacyCanvasFit(window);
+        }
+    }
+}
+
+@end
+
 /*
  * Sentinel returned to the guest UIApplicationMain shim when the host run
  * loop was interrupted by a guest-debugger all-stop. The guest shim loops

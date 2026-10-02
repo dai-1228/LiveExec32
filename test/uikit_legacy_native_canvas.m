@@ -101,9 +101,9 @@ static BOOL closeScalar(CGFloat a, CGFloat b) {
     [_context renderbufferStorage:GL_RENDERBUFFER_OES
                       fromDrawable:drawableLayer];
     glGetRenderbufferParameterivOES(GL_RENDERBUFFER_OES,
-        GL_RENDERBUFFER_WIDTH, &_backingWidth);
+        GL_RENDERBUFFER_WIDTH_OES, &_backingWidth);
     glGetRenderbufferParameterivOES(GL_RENDERBUFFER_OES,
-        GL_RENDERBUFFER_HEIGHT, &_backingHeight);
+        GL_RENDERBUFFER_HEIGHT_OES, &_backingHeight);
 
     [_window addSubview:_renderer];
     [_window makeKeyAndVisible];

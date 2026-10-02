@@ -1,5 +1,6 @@
 #import <Foundation/Foundation+LC32.h>
 #import <CoreFoundation/CoreFoundation.h>
+#import <objc/objc-exception.h>
 
 #include <malloc/malloc.h>
 #include <pthread.h>
@@ -230,6 +231,17 @@ void NSLog(NSString *format, ...) {
  * native Foundation would make an arm64 exception path branch into guest
  * code directly. The legacy Foundation contract only requires process-wide
  * set/get storage; guest exception machinery can retrieve and invoke it.
+ *
+ * The guest ramdisk libobjc also exposes its own uncaught-exception slot
+ * through objc_setUncaughtExceptionHandler, and its terminate path consults
+ * that slot when a guest NSException goes uncaught.  Mirror the guest-visible
+ * handler into libobjc's slot so a stored handler actually runs and the abort
+ * report carries the exception's name and reason instead of only the generic
+ * libc abort message.  The slot holds a guest ARM32 function pointer and is
+ * only ever invoked from guest execution, never from host code, so no host
+ * bridge is involved.  iOS libobjc exports no matching getter, but the
+ * Foundation-side static above remains the single source of the current
+ * value for NSGetUncaughtExceptionHandler.
  */
 static NSUncaughtExceptionHandler *LC32UncaughtExceptionHandler;
 
@@ -241,6 +253,8 @@ NSUncaughtExceptionHandler *NSGetUncaughtExceptionHandler(void) {
 void NSSetUncaughtExceptionHandler(NSUncaughtExceptionHandler *handler) {
     __atomic_store_n(
         &LC32UncaughtExceptionHandler, handler, __ATOMIC_RELEASE);
+    objc_setUncaughtExceptionHandler(
+        (objc_uncaught_exception_handler)handler);
 }
 
 static pthread_once_t LC32FoundationFunctionsOnce = PTHREAD_ONCE_INIT;

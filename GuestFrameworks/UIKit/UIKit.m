@@ -899,6 +899,53 @@ compatibleWithTraitCollection:nil];
 
 @end
 
+@interface UIApplication (LC32LegacyCanvas)
+- (CGRect)lc32_statusBarFrame;
+@end
+
+@implementation UIApplication (LC32LegacyCanvas)
+
++ (void)load {
+    /* Pair the status-bar frame with the canvas geometry the classes serve,
+     * exactly like the paired orientation getter: the generated forwarder
+     * keeps answering for every other population, and the method below
+     * passes the host frame through unchanged for them. */
+    Method original = class_getInstanceMethod(self,
+        @selector(statusBarFrame));
+    Method compatibility = class_getInstanceMethod(self,
+        @selector(lc32_statusBarFrame));
+    if(original && compatibility) {
+        method_exchangeImplementations(original, compatibility);
+    }
+}
+
+- (CGRect)lc32_statusBarFrame {
+    /* Forward the public selector explicitly (the exchanged generated
+     * method derives its host selector from _cmd), mirroring the paired
+     * orientation getter in UIApplication+LC32LegacyOrientation.m. */
+    static uint64_t hostSelector __attribute__((aligned(8)));
+    const uint64_t selector = LC32CachedHostSelector(
+        &hostSelector, @selector(statusBarFrame), YES);
+    CGRect_64 hostResult;
+    LC32InvokeHostSelector(self.host_self, selector,
+                           &hostResult, sizeof(hostResult), (uint64_t)0);
+    CGRect frame = LC32GuestCGRect(hostResult);
+    if(LC32RequiresNativeDeclaredLandscapePhoneCanvas()) {
+        /* The declared-universal canvas serves its own portrait 320x480/568
+         * coordinate space, and a scene-sized host frame would offset every
+         * menu computed as winSize - statusBarFrame.height. The class's own
+         * plist answers: a hidden bar is CGRectZero; a visible one is the
+         * 20-point bar paired with the applicationFrame branch above
+         * (UIKit.m:870-877 subtracts the same 20 points). */
+        return LC32NativeDeclaredCanvasStatusBarHidden()
+            ? CGRectZero
+            : CGRectMake(0, 0, 320, 20);
+    }
+    return frame;
+}
+
+@end
+
 @implementation UIView (LC32LegacyAnimationContext)
 
 + (void)beginAnimations:(NSString *)animationID context:(void *)context {

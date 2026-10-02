@@ -3,8 +3,13 @@
 
 const CFAllocatorRef kCFAllocatorDefault = NULL;
 
-// Set CF version to iOS 10.3.3
-double kCFCoreFoundationVersionNumber = (double)1349.7;
+/*
+ * Match the real iOS 10.3 guest runtime: Apple's published table gives
+ * kCFCoreFoundationVersionNumber_iOS_10_3 = 1349.56. mfm's only reader
+ * (SDURLCache cachedResponseForRequest:) compares against 478.61, so the
+ * legacy cache-format branch is skipped either way.
+ */
+double kCFCoreFoundationVersionNumber = (double)1349.56;
 
 @implementation __NSCFType
 @end
