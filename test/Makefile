@@ -256,7 +256,15 @@ ROOTFS ?= $(abspath ../Resources/RootFS)
 
 include ../module-cache.mk
 
+# -Wno-deprecated-module-dot-map exists only in Apple clang 21+ (macOS CI);
+# on other hosts the toolchain's clang treats it as an unknown option, which
+# per-instance -Werror flags then promote to a fatal error. Keep it on Darwin
+# so macOS keeps its exact toolchain behavior (2ef53a0 pattern).
+ifneq ($(shell uname -s 2>/dev/null),Darwin)
+ADDITIONAL_CFLAGS :=
+else
 ADDITIONAL_CFLAGS := -Wno-deprecated-module-dot-map
+endif
 ADDITIONAL_LDFLAGS := -fno-autolink $(LC32_GUEST_LINKER_FLAGS)
 
 include $(THEOS)/makefiles/common.mk
@@ -324,6 +332,11 @@ $(eval $(call lc32_guest_test,lc32-audio-converter,audio_converter.c,AudioToolbo
 $(eval $(call lc32_guest_test,lc32-audio-file-create-packets,audio_file_create_packets.c,AudioToolbox CoreFoundation LC32))
 $(eval $(call lc32_guest_test,lc32-audio-file-smoke,audio_file_smoke.c,AudioToolbox CoreFoundation LC32))
 $(eval $(call lc32_guest_test,lc32-ext-audio-file-wrap,ext_audio_file_wrap.c,AudioToolbox CoreFoundation LC32))
+# mfm (Mutant Fridge Mayhem) CocosDenshion one-shot effect decoder:
+# ExtAudioFile open + stack-built client ASBD (garbage reserved field,
+# exactly as sub_A9880 builds it) + property set + whole-file read +
+# dispose against a synthesized .caf.
+$(eval $(call lc32_guest_test,lc32-audio-extaudiofile-decode,audio_extaudiofile_decode.m,AudioToolbox CoreFoundation LC32))
 $(eval $(call lc32_guest_test,lc32-audio-queue-input,audio_queue_input.c,AudioToolbox CoreFoundation LC32))
 $(eval $(call lc32_guest_test,lc32-audio-queue-output,audio_queue_output.c,AudioToolbox CoreFoundation LC32))
 $(eval $(call lc32_guest_test,lc32-audio-session,audio_session.c,AudioToolbox CoreFoundation LC32))
@@ -336,6 +349,12 @@ $(eval $(call lc32_guest_test,lc32-nsuuid-bytes,nsuuid_bytes.m,Foundation))
 $(eval $(call lc32_guest_test,lc32-arc-proxy-lifetime,arc_proxy_lifetime.m arc_proxy_lifetime_support.m,Foundation UIKit LC32))
 $(eval $(call lc32_guest_test,lc32-block-bridge,block_bridge.m,Foundation LC32))
 $(eval $(call lc32_guest_test,lc32-dispatch-main-queue,dispatch_main_queue.m,Foundation CoreFoundation AVFoundation))
+# mfm (Mutant Fridge Mayhem) intro-video chain: AVURLAsset key load with
+# failure statuses, AVPlayerItem/AVPlayer creation, guest-side status/rate/
+# currentItem KVO with the app's self-referential context slots, the
+# AVPlayerItemDidPlayToEndTimeNotification round trip, CMTime ABI values,
+# and the VideoCompleted convergence the app's failure exits post.
+$(eval $(call lc32_guest_test,lc32-avfoundation-kvo-chain,avfoundation_kvo_chain.m,Foundation CoreFoundation AVFoundation CoreMedia))
 $(eval $(call lc32_guest_test,lc32-dispatch-timers,dispatch_timers.m,Foundation CoreFoundation))
 $(eval $(call lc32_guest_test,lc32-cfarray-callbacks,cfarray_callbacks.m,Foundation CoreFoundation LC32))
 $(eval $(call lc32_guest_test,lc32-cfdictionary-callbacks,cfdictionary_callbacks.m,Foundation CoreFoundation LC32))
@@ -401,6 +420,18 @@ $(eval $(call lc32_guest_test,lc32-ownership-publication-race,ownership_publicat
 $(eval $(call lc32_guest_test,lc32-pointer-out-params,pointer_out_params.m,Foundation LC32))
 $(eval $(call lc32_guest_test,lc32-predicate-variadic,predicate_variadic.m,Foundation))
 $(eval $(call lc32_guest_test,lc32-property-list-serialization,property_list_serialization.m,Foundation CoreFoundation))
+# Keyed-archiver persistence roundtrip (mfm save chain, manifest 11): a
+# custom NSCoding class through initForWritingWithMutableData: +
+# atomic file write, re-read through NSKeyedUnarchiver so the guest class
+# must resolve through the bridge's class mirror; plus the NSFileManager
+# first-run copy, NSStream file roundtrip, and NSUserDefaults contracts.
+$(eval $(call lc32_guest_test,lc32-foundation-keyed-archive-roundtrip,foundation_keyed_archive_roundtrip.m,Foundation CoreFoundation))
+foundation_keyed_archive_roundtrip_CFLAGS := -fno-objc-arc
+# NSKeyedUnarchiver save-graph roundtrip (mfm GumballSaveState.dat shape):
+# custom NSCoding class tree through a temp-file roundtrip plus the
+# first-launch absent-file contract, per the fixture header.
+$(eval $(call lc32_guest_test,lc32-nskeyedunarchiver-roundtrip,nskeyedunarchiver_roundtrip.m,Foundation CoreFoundation))
+nskeyedunarchiver_roundtrip_CFLAGS := -fno-objc-arc
 $(eval $(call lc32_guest_test,lc32-string-bytes,string_bytes.m,Foundation))
 $(eval $(call lc32_guest_test,lc32-string-format,string_format.m,Foundation))
 $(eval $(call lc32_guest_test,lc32-vm-protect,vm_protect.c,))
@@ -441,6 +472,11 @@ $(eval $(call lc32_guest_test,lc32-uikit-legacy-phone-canvas,uikit_legacy_phone_
 # Runtime-declared canvas: run keyless under a pre-iOS-8 effective process
 # SDK (native legacy rotation) as described in the fixture header.
 $(eval $(call lc32_guest_test,lc32-uikit-legacy-native-canvas,uikit_legacy_native_canvas.m,Foundation UIKit QuartzCore OpenGLES LC32))
+# Declared-universal canvas: run under a pre-iOS-8 effective process SDK
+# (native legacy rotation) with UIDeviceFamily [1,2], plist landscape keys,
+# 4-inch launch art, a rootViewController-wrapped ES2 renderer, and NO
+# runtime status-bar call, as described in the fixture header.
+$(eval $(call lc32_guest_test,lc32-uikit-legacy-declared-canvas,uikit_legacy_declared_universal_canvas.m,Foundation UIKit QuartzCore OpenGLES LC32))
 $(eval $(call lc32_guest_test,lc32-uikit-legacy-rotation-duration,uikit_legacy_rotation_duration.m,Foundation UIKit LC32))
 $(eval $(call lc32_guest_test,lc32-uikit-legacy-nested-renderer,uikit_legacy_nested_renderer.m,Foundation UIKit QuartzCore CoreGraphics LC32))
 $(eval $(call lc32_guest_test,lc32-uikit-legacy-direct-renderer,uikit_legacy_direct_renderer.m,Foundation UIKit QuartzCore CoreGraphics LC32))
@@ -462,6 +498,7 @@ lc32-ownership-publication-race_CFLAGS := -fobjc-arc
 ownership_publication_race.m_CFLAGS := -fno-objc-arc
 
 lc32-block-bridge_CFLAGS := -fblocks
+lc32-avfoundation-kvo-chain_CFLAGS := -fblocks -fno-objc-arc -Wall -Wextra -Werror -Wno-deprecated-declarations
 lc32-dispatch-main-queue_CFLAGS := -fblocks -fno-objc-arc -Wall -Wextra -Werror -Wno-deprecated-declarations
 lc32-dispatch-timers_CFLAGS := -fblocks -fno-objc-arc -Wall -Wextra -Werror
 lc32-thread-modes_CFLAGS := -fblocks
@@ -512,6 +549,11 @@ lc32-uikit-legacy-native-canvas_USE_MODULES := 1
 lc32-uikit-legacy-native-canvas_CFLAGS := -fno-objc-arc -target armv7s-apple-ios7.0 \
 	-I$(abspath ../GuestFrameworks) -I$(abspath ../include)
 lc32-uikit-legacy-native-canvas_LDFLAGS += -target armv7s-apple-ios7.0
+# Exercise the declared-universal canvas in native legacy rotation.
+lc32-uikit-legacy-declared-canvas_USE_MODULES := 1
+lc32-uikit-legacy-declared-canvas_CFLAGS := -fno-objc-arc -target armv7s-apple-ios7.0 \
+	-I$(abspath ../GuestFrameworks) -I$(abspath ../include)
+lc32-uikit-legacy-declared-canvas_LDFLAGS += -target armv7s-apple-ios7.0 -Wl,-sdk_version,7.0
 # Run under a launcher with effective SDK < 8 to exercise the native adapter.
 lc32-uikit-legacy-rotation-duration_USE_MODULES := 1
 lc32-uikit-legacy-rotation-duration_CFLAGS := -fno-objc-arc -target armv7s-apple-ios7.0 \
@@ -648,7 +690,8 @@ SHORT_TESTS := $(patsubst lc32-%,%,$(TOOL_NAME))
   check-foundation-runtime-symbols \
   check-corefoundation-low-risk-symbols corefoundation-low-risk-framework \
   foundation-runtime-framework coremedia-time-values-framework \
-  check-coremedia-time-values check-corevideo check-accelerate check-messenger $(SHORT_TESTS)
+  check-coremedia-time-values check-corevideo check-accelerate check-messenger \
+  check-mfm $(SHORT_TESTS)
 
 # Theos' per-instance convenience targets bypass the top-level `all` target,
 # which normally creates the Clang module validation stamp first.
@@ -769,6 +812,17 @@ check-messenger:
 		exit 2; \
 	}
 	./messenger_eager_symbols.sh "$(MESSENGER)" "$(ROOTFS)"
+
+# mfm (Mutant Fridge Mayhem 4.1.1) undefined-symbol audit: resolves every
+# undefined symbol of the armv7 app binary against the built guest world,
+# reexport chains included; the five ramdisk-resident dylibs are annotated
+# MAC-OS-VERIFY instead of resolved (pack-ramdisk.sh runs on macOS/CI).
+check-mfm:
+	@test -n "$(MFM)" || { \
+		echo 'usage: gmake -C test check-mfm MFM=/path/to/mfm.app/mfm' >&2; \
+		exit 2; \
+	}
+	MFM="$(MFM)" ./audit_mfm_symbols.sh
 
 # Remove only the explicitly enumerated compatibility copies. Theos' normal
 # clean target remains responsible for test/.theos.

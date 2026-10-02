@@ -5,6 +5,25 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * Reachability verdict policy (documented design choice):
+ *
+ * Every SCNetworkReachability registration and SCNetworkReachabilityGetFlags
+ * call answers synchronously with kSCNetworkReachabilityFlagsReachable — a
+ * definite answer that can never block the caller (no host syscall is made,
+ * so no registration can hang). The verdict is deliberately optimistic rather
+ * than host-informed: the emulator exposes no host reachability bridge, and
+ * legacy 32-bit clients (GameReachability-style gates that skip IAP /
+ * GameCenter UI when NotReachable, plus the Chartboost/comScore/Crittercism
+ * reachability clones) treat "reachable" as permission to *attempt* a
+ * connection; every consumer implements its own app-side failure handling,
+ * so the honest failure surfaces one hop later, exactly as on a device that
+ * loses connectivity mid-request. Reporting NotReachable instead would silently
+ * disable the shop/leaderboard gates on a networked host, so the
+ * always-reachable contract is the one that matches deployed behavior.
+ * Consumers needing a true verdict should rely on their own connection
+ * failures, which remain app-visible.
+ */
 static const SCNetworkReachabilityFlags LC32ReachableFlags =
     kSCNetworkReachabilityFlagsReachable;
 

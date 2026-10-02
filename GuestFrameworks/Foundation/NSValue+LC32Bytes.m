@@ -79,7 +79,9 @@ static void LC32RejectUnsupportedValueType(const char *operation,
     CRSetCrashLogMessage(message);
 }
 
-/* Guest (ARM32) struct encodings whose layout differs on the ARM64 host. */
+/* Guest (ARM32) struct encodings whose layout differs on the ARM64 host.
+ * Converters may be NULL when the guest and host layouts are byte-identical;
+ * such entries copy verbatim between the two representations. */
 typedef struct LC32ValueLayout {
     const char *guestEncoding;
     const char *hostEncoding;
@@ -207,6 +209,48 @@ static const LC32ValueLayout LC32ValueLayouts[] = {
         .hostSize = 16,
         .guestToHost = LC32ConvertNSRange,
         .hostToGuest = LC32NarrowNSRangeValue,
+    },
+    /* The guest SDK never declared the ccColor/ccBlendFunc cocos2d structs, so
+     * no host framework type exists for them either.  Unlike CGPoint (whose
+     * CGFloat widens to double on ARM64), these fields are plain C types with
+     * identical widths on both ABIs: ccColor3B/ccColor4B carry GLubyte ('C')
+     * and ccColor4F carries GLfloat ('f'), while ccBlendFunc carries two
+     * GLenum ('I') values.  Publish the bytes verbatim under the app's own
+     * type string so the host NSValue reports the same width the guest
+     * allocated; consumers such as the host-mirror KVC path copy exactly that
+     * many bytes, so a widened host layout would overflow their buffers.
+     * CCBReader builds these values with the literal cocos2d type strings. */
+    {
+        .guestEncoding = "{_ccColor3B=CCC}",
+        .hostEncoding = "{_ccColor3B=CCC}",
+        .guestSize = 3,
+        .hostSize = 3,
+        .guestToHost = NULL,
+        .hostToGuest = NULL,
+    },
+    {
+        .guestEncoding = "{_ccColor4B=CCCC}",
+        .hostEncoding = "{_ccColor4B=CCCC}",
+        .guestSize = 4,
+        .hostSize = 4,
+        .guestToHost = NULL,
+        .hostToGuest = NULL,
+    },
+    {
+        .guestEncoding = "{_ccColor4F=ffff}",
+        .hostEncoding = "{_ccColor4F=ffff}",
+        .guestSize = 16,
+        .hostSize = 16,
+        .guestToHost = NULL,
+        .hostToGuest = NULL,
+    },
+    {
+        .guestEncoding = "{_ccBlendFunc=II}",
+        .hostEncoding = "{_ccBlendFunc=II}",
+        .guestSize = 8,
+        .hostSize = 8,
+        .guestToHost = NULL,
+        .hostToGuest = NULL,
     },
 };
 
@@ -483,7 +527,13 @@ static id LC32InstallGuestValueStorage(id value, const void *bytes,
         }
         hostValueStorage = malloc(layout->hostSize);
         if(!hostValueStorage) return nil;
-        layout->guestToHost(bytes, hostValueStorage);
+        if(layout->guestToHost) {
+            layout->guestToHost(bytes, hostValueStorage);
+        } else {
+            /* Byte-identical layout: guest and host sizes must agree. */
+            if(layout->guestSize != layout->hostSize) return nil;
+            memcpy(hostValueStorage, bytes, layout->hostSize);
+        }
         guestValueSize = layout->guestSize;
         hostValueSize = layout->hostSize;
         hostEncoding = layout->hostEncoding;
@@ -597,7 +647,14 @@ static id LC32InstallGuestValueStorage(id value, const void *bytes,
         LC32HostSizedIndirectArgument(&descriptor), (uint64_t)0);
 
     if(layout) {
-        layout->hostToGuest(hostBytes, value);
+        if(layout->hostToGuest) {
+            layout->hostToGuest(hostBytes, value);
+        } else if(layout->guestSize == layout->hostSize) {
+            /* Byte-identical layout: copy the shared width back. */
+            memcpy(value, hostBytes, layout->guestSize);
+        } else {
+            LC32RejectUnsupportedValueType("getValue:", type);
+        }
     } else if(!LC32ConvertHostScalarToGuest(
                   unqualifiedType, hostBytes, value)) {
         LC32RejectUnsupportedValueType("getValue:", type);

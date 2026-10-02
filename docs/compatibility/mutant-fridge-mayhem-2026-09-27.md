@@ -29,9 +29,11 @@ IPA). The first two build attempts failed compiling the host UIKit
 adapter: clang refuses weak references of every spelling in a manual
 reference counting file, so the drawable record now takes its zeroing
 semantics from an NSMapTable with weak values; earlier failed runs are
-superseded and are not claimed as evidence. Device verification, and the
-guest end-to-end regression test that would make the controller-backed
-fit path CI-checkable, remain open (see Verification and Handoff).
+superseded and are not claimed as evidence. Device verification remains
+open; the guest end-to-end regression test that would make the
+controller-backed fit path CI-checkable now **exists**
+(`test/uikit_legacy_declared_universal_canvas.m`, delivered by the
+30 September wave below) but has never executed on any runner.
 
 ## App profile
 
@@ -79,9 +81,13 @@ From the wave-1 IDA manifest (`mfm.i64`, IDA Pro 9.4; image base 0x4000):
   rotation swaps its bounds and applies the transform. All geometry derives
   from `[UIScreen mainScreen]`; `winSize = view.bounds / pointScaleFactor`.
   Frame loop is CADisplayLink in common modes, paused for the video.
-- **GCD-paced launch**: `dispatch_after` chains didFinishLaunching →
-  (100 ms) initIAP + title scene → (~3.5 s) `playIntroVideo` → (2 s)
-  `initGameCenter`; texture loading uses `dispatch_sync`/`dispatch_async`
+- **GCD-paced launch** (numbers corrected by the 30 September analysis wave,
+  see the next section): `dispatch_after` drives didFinishLaunching →
+  (100 ms) initIAP + title scene → (2 s after the menu appears)
+  `initGameCenter`; the **~3.5 s** delay before `playIntroVideo` is
+  **cocos2d CCSequence timer pacing (`CCDelayTime`), not `dispatch_after`**
+  — a hang before that point is not the video chain. Texture loading uses
+  `dispatch_sync`/`dispatch_async`
   on custom queues; 309 stack-block sites with copy/dispose helpers. The
   save file (`GumballSaveState.dat`, a deep `NSKeyedUnarchiver` graph) is
   loaded in `-init`, before `didFinishLaunching`.
@@ -308,13 +314,18 @@ effective value):
 - GameCenter/IAP/ads: documented dead-or-degraded features (auth stubbed
   NO, products request skipped when unreachable, ad flows never at
   launch) — expected inert, not verified.
-- `make -C test check-symbols` and the guest framework link run on the
-  macOS CI side as usual; the guest end-to-end regression test for this
-  class (modeled on `test/uikit_legacy_native_canvas.m`, with
-  `UIDeviceFamily [1,2]`, plist landscape keys, 4-inch launch art, a
-  `rootViewController`-wrapped renderer, and no runtime status-bar call)
-  is deliberately **not** in this commit — it needs Theos + the guest SDK
-  + built frameworks, and is the recommended first follow-up.
+- `gmake -C test check-symbols` runs only as a **manual** invocation on the
+  macOS host; it is **not** part of the nightly CI build (corrected by the
+  30 September audit of the workflows — the nightly runs generate-shims,
+  guest build, pack-ramdisk, package ×2 with no `gmake -C test` step, and
+  the host-test workflow runs only the four pre-existing host checks). The
+  guest end-to-end regression test for this class — modeled on
+  `test/uikit_legacy_native_canvas.m`, with `UIDeviceFamily [1,2]`, plist
+  landscape keys, 4-inch launch art, a `rootViewController`-wrapped renderer,
+  and no runtime status-bar call — **now exists**
+  (`test/uikit_legacy_declared_universal_canvas.m`, registered as
+  `gmake -C test uikit-legacy-declared-canvas`); see the 30 September
+  section below.
 
 ## Remaining risks
 
@@ -358,9 +369,17 @@ Ranked; the first five are the device-pass checkpoints.
 8. **Canvas-mode population left as-is** (documented): if a clamped
    runtime ever becomes the primary target, the canvas-mode container
    needs its own universal-class work.
-9. **Expected `winSize` {568,320}** on the 4-inch-art canvas: if the game
-   instead reads 480-tall geometry, the tall-art detection path is the
-   first thing to re-check.
+9. **Expected first-scene `winSize` {320,480}** on the 4-inch-art canvas
+   (corrected by the 30 September adjudication — see the next section for
+   the full correction of this document's earlier {568,320} expectation):
+   `winSize` comes from the authored `CCGLView` bounds
+   (`reshapeProjection:` re-reads `view.bounds`, never `UIScreen`), and
+   CCGLView is hardcoded {0,0,320,480}, so the value is 320x480 on both
+   3.5- and 4-inch real hardware. The 568-tall `UIScreen.bounds` answer
+   still drives the window frame, the 568h launch-art branch, and the ~40
+   `bounds.height==568` HUD/menu position forks. If the device instead
+   observes {568,320}, escalate through the GEO-02 contingency table in
+   the 30 September runbook — do not ad-hoc patch.
 
 ## Handoff
 
@@ -375,11 +394,18 @@ Recommended device-install flow (LiveContainer, mirroring the Zenonia
 passes): import the LiveExec32 **nightly** build, set LiveExec32 as the
 default app, import the game IPA, launch — with the per-app SDK override
 left unclamped so the effective process SDK stays pre-iOS-8 (native legacy
-rotation). Before the first launch, on the macOS build host, confirm the
-RootFS check in risk 6. Expected geometry on the 4-inch-art canvas:
+rotation). Before the first launch, on the macOS build host, run the
+manual RootFS content check in the 30 September runbook below (the
+phrase "the RootFS check in risk 6" below originally implied a scripted
+check exists — none does; `pack-ramdisk.sh` asserts only
+`System/Library`). Expected geometry on the 4-inch-art canvas
+(**corrected** by the 30 September adjudication — the original
+{568,320}/{1136,640} expectation printed here was wrong):
 `UIScreen.bounds` {0,0,320,568} portrait-ordered, `scale` 2.0,
-`applicationFrame` {0,0,320,568} (plist-hidden status bar), `winSize`
-{568,320} / `winSizeInPixels` {1136,640}; expected presentation: the
+`applicationFrame` {0,0,320,568} (plist-hidden status bar), first-scene
+`winSize` **{320,480}** / `winSizeInPixels` **{640,960}**, GL backing
+**640x960** — identical to real 4-inch hardware running the game's own
+320x480 world; expected presentation: the
 320x568 portrait canvas turned to landscape (568x320 points, 1136x640
 pixels at the clamped 2x) MIN-scaled onto the live viewport, centered
 with letterbox bars — on a ~2.4:1 Classic-Mode viewport the 16:9-class
@@ -390,13 +416,15 @@ the first-scene `winSize` numbers, music + effect playback, and the
 letterboxed centered presentation.
 
 Follow-up list, in order: (1) the first device pass against the
-expectations above, then update this document with observed results;
+expectations above, then update this document with observed results
+(the 30 September section below supersedes the rest of this list);
 (2) the guest end-to-end regression test modeled on
-`uikit_legacy_native_canvas.m` (needs Theos + guest frameworks on macOS)
-to make the controller-backed fit path CI-checkable; (3) canvas-mode
+`uikit_legacy_native_canvas.m` — **delivered** as
+`test/uikit_legacy_declared_universal_canvas.m`; (3) canvas-mode
 wiring for the universal population only if a clamped runtime becomes a
 real target; (4) the usual `check-symbols`/framework audits on the macOS
-side, which are already part of the nightly build.
+side — note these are manual invocations, not part of the nightly
+(see the correction above).
 
 ## Device feedback iteration 2 — the post-intro crash and the completion wave
 
@@ -503,7 +531,14 @@ the full report to stderr, and terminates with a compact description
 installed as the process abort reason — so a freeze now leaves the
 same evidence a crash does, and the device's crash log (Settings ->
 Privacy & Security -> Analytics Data) carries the stalled PC and wait
-state for exact offline symbolication.
+state for exact offline symbolication. **(Two limitations found by the
+30 September audit, which the runbook below restates: a pre-runloop
+stall produces no watchdog report at all, and in native mode the
+snapshot prints "no live JIT for this thread" for exactly the guest
+main thread — the main registry entry never sets `nativeJit`, so the
+main thread's register dump and compact abort line are currently
+missing from the report's most important case. Both are host-side,
+NEEDS-OWNER, MAC-OS-VERIFY.)**
 
 Expected device behavior after this wave: launch → upright
 letterboxed title → intro video (fullscreen, native presentation) →
@@ -515,3 +550,498 @@ faults), the host-bridge report (bridged-call exceptions), or writes
 the report to stderr and the OS abort reason (everything else) —
 export whichever appears and the next iteration starts from evidence.
 
+
+## Port-completion wave — 30 September 2026
+
+**Still not device-verified.** Everything in this section is analysis-,
+build-, or audit-verified on the macOS-less Linux build box and by
+adversarial review of the working tree; nothing has been run on a device,
+and no CI workflow has executed any of the new guest tests (the nightly
+build has no `gmake -C test` step of any kind — verified by walking
+`.github/workflows/nightly.yml`; the host-test workflow runs only the four
+pre-existing host checks). Every statement below about runtime behavior is
+a prediction until the first device pass lands. The wave's changes sit
+uncommitted in the working tree on `zenonia-compat` (9 modified, 17 new
+files at HEAD `6692780`, +262/−9 tracked lines plus the new sources), by
+design — no commit is made from this analysis pass.
+
+### What the effort was
+
+A five-wave, 25-implementer pass over the full wave-1 behavioral contract
+(662 imports / 26 linked dylibs / 615 classes / 4,142 selectors): an
+adjudicated gap register, implementer waves 01–25, an adversarial review
+wave (18 area reviews), a repair pass on the review's build findings, an
+independent critic pass, and this documentation. The app binary remains
+untouched; "port" here means completing the guest framework surface and
+host bridge behavior, and building the instruments that turn the next
+device run into evidence instead of guesswork.
+
+### Corrections to this document (all made in place above)
+
+- **winSize**: the 27 September handoff expected first-scene
+  `winSize {568,320}` / `winSizeInPixels {1136,640}`. Adversarially
+  upheld analysis proves that wrong: `CCDirectorIOSUniversal
+  reshapeProjection:` re-reads the authored `view.bounds` (never
+  `UIScreen`), CCGLView is hardcoded {0,0,320,480}, and the
+  declared-class adoption rule deliberately leaves an at-or-below-canvas
+  authored view untouched. Correct expectation: `winSize {320,480}`,
+  `winSizeInPixels {640,960}`, GL backing 640x960 — identical to real
+  4-inch hardware. The 568-tall `UIScreen` answer still drives the window
+  frame, the 568h launch-art branch, and the ~40 `bounds.height==568`
+  HUD/menu position forks (authentic behavior, not a bug to chase).
+- **Launch pacing**: the ~3.5 s `playIntroVideo` delay is cocos2d
+  CCSequence timer pacing (`CCDelayTime`), not `dispatch_after` — a hang
+  before that point is not the video chain.
+- **CI claims**: `check-symbols` is a manual macOS invocation, not part of
+  the nightly (the earlier text claimed it was).
+- **Watchdog**: the "carries the stalled PC and wait state" promise is
+  currently false for exactly the guest main thread (see risk 3 below);
+  and a pre-runloop stall produces no report at all.
+
+### What the wave verified and fixed
+
+Verified clean (no change needed): CoreGraphics (51/51 imports, struct
+ABI sound, PVR data-provider semantics), SystemConfiguration (the
+always-reachable verdict is the documented design; the IAP/StoreKit gates
+open correctly), CoreMedia/MediaPlayer (CMTime ABI exact; no change),
+Security (SecKeyEncrypt stub unreachable via the BlockSize>3 gate),
+libSystem remainder + CFNetwork (two-level binding, statfs layout,
+ServerTrust chain — all re-derived from primary evidence), the GKScore
+crash claim from the gap register's raw audits (REFUTED: `value`/
+`setValue:` are auto-synthesized direct guest-ivar accessors —
+`0001e802`/`0001e808` in the built framework — so the abort path never
+fires).
+
+Fixed (all guest-side unless marked; every fix build-verified on the box,
+host units MAC-OS-VERIFY):
+
+- **Declared-universal regression test (REGTEST-01, was P0)** —
+  `test/uikit_legacy_declared_universal_canvas.m` +
+  `lc32-uikit-legacy-declared-canvas` registration, with the load-bearing
+  `-Wl,-sdk_version,7.0` link flag: 19 assertions pinning bounds
+  {320,568}, scale 2.0, `winSize` {320,480}/{640,960}, 640x960 backing,
+  touch round-trip, and the declared-class geometry gates. Builds to
+  Mach-O armv7s PIE; **has never executed anywhere** (no runner exists
+  for guest binaries off-device, and CI runs no guest test).
+- **mfm symbol audit (ROOTFS-01 instrument half, was P0)** —
+  `test/audit_mfm_symbols.sh` behind `gmake -C test check-mfm MFM=…`:
+  re-export-aware resolution of all 662 imports across 87 built images
+  (457 built-framework resolved, 203 ramdisk-resident across the 5
+  RootFS dylibs, **0 missing framework symbols**, exit 0 on the real
+  binary; negative tests all exit 1). The pack-ramdisk/CI half of
+  ROOTFS-01 remains NO-OWNER: nothing anywhere asserts the packed RootFS
+  `usr/lib` contents.
+- **GKScore empty score reports (GKSCORE-01)** —
+  `GuestFrameworks/GameKit/GKScore+LC32HostValue.m`: category overrides
+  the synthesized accessors to forward the int64 (r2/r3) value to the
+  host GKScore so `reportScoreWithCompletionHandler:` submits what the
+  game set.
+- **AVAudioSession interruption (AUD-01/03)** —
+  `GuestFrameworks/AVFAudio/AVAudioSessionInterruptionAdapter.m`:
+  converts the host AVAudioSessionInterruptionNotification into the
+  legacy `beginInterruption`/`endInterruption` delegate calls
+  (mfm's only live interruption path) plus player-level resume; swallows
+  `setDelegate:` so the host-visible session delegate stays nil by design.
+- **UIAlertView on scene-based hosts (UKG-01)** —
+  `GuestFrameworks/UIKit/UIAlertView+LC32LegacyAlerts.m`: guest-side
+  adapter to UIAlertController. **Two P1 holes survive it** (risk 6).
+- **SKPayment legacy identifier vocabulary (N-G2)** —
+  `GuestFrameworks/StoreKit/SKPayment+LC32LegacyPayments.m`:
+  `paymentWithProductIdentifier:` rebuilt through SKMutablePayment
+  guest-locally, tolerating a host without StoreKit loaded.
+- **CCB struct encodings (OG-03)** — `NSValue+LC32Bytes.m`: the
+  `{_ccColor3B=CCC}`/`{_ccColor4B=CCCC}`/`{_ccColor4F=ffff}`/
+  `{_ccBlendFunc=II}` layout entries (NULL-converter verbatim copies), so
+  CCBReader color/blend properties set instead of silently rejecting.
+- **Uncaught-exception handler forward (C-G2)** — `Foundation.m`
+  mirrors the stored guest handler into guest libobjc's
+  `objc_setUncaughtExceptionHandler` slot so abort reports can carry the
+  exception name/reason. Likely inert for mfm's bridge-raised path (the
+  host unwind consults the host slot, already netted) — no regression;
+  device checkpoint.
+- **Guest-local defaults suite (SAVES-02 fix half)** —
+  `CoreFoundation/NSUserDefaults+LC32SuiteDefaults.m`: standard defaults
+  route to a per-bundle-id suite (kills cross-title key collisions). **No
+  migration exists — the data-wipe half of SAVES-02 stays open** (risk 5).
+- **statusBarFrame canvas pairing (UKG-02)** — `UIKit.m` swizzle returns
+  the class-consistent frame (zero when hidden, {0,0,320,20} otherwise)
+  so CCMenu positioning agrees with the canvas coordinate space.
+- **Foreground fit re-arm (LC-01)** — `HostFrameworks/UIKit/UIKit.mm`
+  (+44 lines, MAC-OS-VERIFY: never compiled — Linux cannot build the host
+  side): `DidBecomeActive` schedules the fit for declared-class windows,
+  so a plain resume cannot leave the letterbox mis-fitted.
+- **CADisplayLink legacy pacing (LC-05)** —
+  `GuestFrameworks/QuartzCore/CADisplayLink+LC32LegacyPacing.m`: caps the
+  effective link rate at 60 Hz for interval-1 links on ProMotion hosts so
+  fixed-step engines keep their tuning.
+- **AVPlayer probe forwarding (V-G3)** —
+  `GuestFrameworks/AVFoundation/AVPlayer+LC32HostProbing.m`: forwards
+  `respondsToSelector:` to the host peer (so deprecated-but-dropped
+  selectors answer honestly). **Over-broad — see risk 8.**
+- **AspectFill gravity host bind (V-G4)** — AVFoundation constants:
+  `AVLayerVideoGravityResizeAspectFill` bound to the native constant
+  object (identity-safe).
+- **kCFCoreFoundationVersionNumber** — 1349.7 → 1349.56 (Apple's iOS 10.3
+  value; mfm's only reader compares <478.61 either way — zero behavioral
+  delta).
+- **Guest sysctl/utsname answer table (SYSCTL-01 guest half)** —
+  `GuestFrameworks/LC32/LC32GuestSysctlValues.{h,m}`: canonical guest
+  answers as data + self-checks, no hook. **The host-side consumers do
+  not exist yet** (NEEDS-OWNER ticket); the uts release/version pair is
+  internally inconsistent ("16.6.0" vs "…16.7.0…") — align before the
+  host ticket consumes the file.
+
+New tests beyond the regression pair (all build to Mach-O armv7s PIE on
+this box; all are guest binaries needing the macOS/CI runtime to run):
+
+- `audio_extaudiofile_decode.m` — CocosDenshion one-shot decoder chain
+  against a synthesized .caf (open + garbage-reserved-field client ASBD +
+  property set + whole-file read). **CAF-only — this is NOT MP3
+  coverage**; the menu-jingle MP3 decode path remains device-only.
+- `avfoundation_kvo_chain.m` — intro-video chain shapes: asset key load
+  failure exits, status/rate/currentItem KVO, CMTime ABI,
+  DidPlayToEndTime round trip (posted guest-side; the host→guest relay
+  remains ungated). The positive-path fixture
+  (`/tmp/mfm100/impl/avplayer_intro_chain.m`, gating `[player play]`)
+  **never landed in the repo**.
+- `foundation_keyed_archive_roundtrip.m` +
+  `nskeyedunarchiver_roundtrip.m` — the SAVES-01 probes (custom-class
+  archive→unarchive through the bridge class mirror, save-graph shape,
+  first-launch absent-file contract). **These are the instruments that
+  decide the crash-after-first-save verdict; both are registered but
+  neither has ever executed.** Known fixture weakness: the absent-file
+  streaming check self-disarms (nil guard) and no zero-length-file
+  corrupt-save case exists.
+- `dispatch_concurrency.m` — the launch-critical GCD topology
+  (dispatch_once ×13 sites, queue-create, group, sync shapes) — source
+  landed at `test/dispatch_concurrency.m` but **unregistered in the
+  Makefile** (registration was outside every implementer's ownership
+  anchor).
+- `uikit_legacy_native_canvas.m` repaired (ES1 `_OES` enum names) — the
+  pre-existing model test had never compiled at HEAD.
+
+Test-infra repairs from the review wave: the Apple-clang-only
+`-Wno-deprecated-module-dot-map` is host-guarded in `test/Makefile`
+(Darwin keeps identical behavior; Linux clang-13 no longer fatal-errors
+all nine -Werror guest tests); `check-mfm` added to `.PHONY`; the audit's
+PASS banner now prints only on passing runs with a derived missing count
+(it previously printed "PASS / missing: 0" even on failures);
+`foundation-keyed-archive-roundtrip` registered.
+
+How to run everything (macOS; on Linux only the build works — always
+`gmake`, never `make`):
+
+```
+export THEOS=/home/kasm-user/theos          # box-specific; on macOS use the real Theos root
+gmake -C GuestMakefile generate-shims      # stamp required before guest build
+gmake -C GuestMakefile -j8
+gmake -C test uikit-legacy-declared-canvas   # the 19-pin regression (REGTEST-01)
+gmake -C test check-mfm MFM=/path/to/Payload/mfm.app/mfm
+gmake -C test foundation-keyed-archive-roundtrip nskeyedunarchiver-roundtrip
+gmake -C test avfoundation-kvo-chain audio-extaudiofile-decode
+gmake -C test check-symbols                 # manual, as before
+```
+
+Three fixtures remain stranded outside `test/Makefile` or the repo:
+`dispatch_concurrency.m` (present in `test/`, no registration line),
+`avfaudio_interruption.m` and `avplayer_intro_chain.m` (deposited at
+`/tmp/mfm100/impl/`, never landed). **Run the registered guest tests on
+macOS before the device pass** — the first device run is currently also
+the first-ever execution of the regression test, both persistence probes,
+and the KVO chain.
+
+### Final P0/P1/P2 state after review + repair
+
+No P0 code defect was found in any shipped change (adversarial review of
+all 25 implementer surfaces: 12 of 18 areas PASS outright, 6 ISSUES; all
+fixes traced to the app's actual IDB call sites; ownership discipline
+held — zero `.generated/` edits, zero Zenonia-path changes, zero build
+convention changes, zero commits). What remains:
+
+**P0-class (both are "instrument exists, verdict pending," not code
+defects):**
+
+- **SAVES-01 verdict undecided**: whether the second launch after a save
+  crashes in `-[AppDelegate init]` (host NSKeyedUnarchiver resolving
+  `$classname GameSaveState` through the bridge's objc_getClass hook)
+  rides entirely on the two registered-but-never-executed roundtrip
+  probes above.
+- **ROOTFS-01 pack half unasserted**: no script or CI step asserts the
+  packed RootFS `usr/lib` set (`libz.1`, `libsqlite3` — existence-only,
+  no guest build rule — plus libobjc.A, libstdc++.6, libSystem.B,
+  libgcc_s.1, dyld). The audit script covers the symbol-drift half only,
+  and no CI step invokes even that.
+
+**P1 (open):** SAVES-02 upgrade data-wipe (no defaults migration);
+UIAlertView present-during-dismissal loss and off-main `-show` weak-hop
+loss; AVPlayer blanket probe override (two wrong-answer modes); the
+unlanded/unregistered fixtures above; no CI invocation for any guest test;
+G08-08 main-thread watchdog snapshot defect + LC-02 pre-runloop dead zone
+(both host, NEEDS-OWNER); UNAME-01 (no SYS_uname case → uninitialized
+utsname; host ticket with the data file ready); G08-04 latent semaphore
+parking (unreachable for mfm).
+
+**P2 (representative):** the sysctl data-file 16.6.0/16.7.0 pair; the
+GKScore category has no CI pin; StoreKit Restore shows a wrong
+parental-controls message (the only live Restore caller);
+`lc32-corefoundation-string-transform` link failure and two sibling test
+defects (pre-existing at HEAD, verified by stash); the KVO test's
+`alarm(60)` is beatable on a slow runner; C-G2 effectiveness and OG-04
+(host-mirror KVC struct ivars) are device checkpoints.
+
+**Recorded contracts (deliberate, not to be "fixed" for this app):**
+host-raised ObjC exceptions in bridged calls convert to **fatal crash
+reports** by design (EH-01's cheapest option was taken; the app's 186
+objc-personality catch frames in Crittercism/Chartboost/CBJson do not
+unwind — one malformed-JSON response that the real device would have
+caught now aborts); PLCrashReporter's signal handlers are recorded and
+never delivered — **a missing .plcrash file is the designed contract**
+(LiveExec32's own crash net is the reporter); sigaction is recorded but
+guest signals are never delivered; `UIDevice.systemVersion` answers the
+host version (all 17 app gates are `>=` floors, none can flip);
+`uniqueIdentifier` answers a guest UUID; the CoreTelephony carrier probe
+returns `(null)`.
+
+### Top-10 device-pass risks (independently re-ranked; use this list)
+
+1. **Post-intro/title freeze with a registerless report** — the only
+   previously observed device failure (V-G2), cause never diagnosed; the
+   positive path (`[player play]` → ReadyToPlay KVO → end notification)
+   has zero executed coverage anywhere; the tap-skip exit routes through
+   the un-fixtured fit hit-test; and when the watchdog fires its snapshot
+   prints "no live JIT for this thread" for exactly the stalled main
+   thread (G08-08) — plus a pre-runloop stall produces no report at all
+   (LC-02).
+2. **Instant dyld abort on a ramdisk packing regression** — 203 imports
+   bind to the 5 RootFS residents, asserted nowhere; a missing libz.1
+   instead aborts at the first `.pvr.ccz` load (black screen then crash);
+   libsqlite3 is existence-only with no build rule and no audit naming it.
+3. **Cold-launch geometry cluster** — the deciding regression test has
+   never executed; the host foreground re-arm (+44 lines) has never been
+   compiled; the contentScaleFactor *write* path and the fit inverse
+   hit-test are bypassed/uncovered, so a wrong backing or offset touches
+   would pass every test while failing on device.
+4. **SAVES-01** — crash-on-every-launch-after-first-save remains
+   formally undecided; it would brick the install and, to the user, look
+   identical to risk 2.
+5. **SAVES-02 data wipe** — an upgraded install silently resets
+   `firstRun`/`firstRunCoins`/`IAProductPurchased-*` (IAP gates re-lock);
+   unguarded suite creation can crash the very first
+   `standardUserDefaults` call if a host ever throws.
+6. **UIAlertView adapter holes** — the IAP error alert is lost when it
+   lands one frame after the spinner dismissal; the Crittercism
+   "Message from Developer"/rate alert never appears (off-main
+   `-show` + weak capture).
+7. **Audio chain** — the interruption adapter (the wave's only audio
+   behavior change) has no landed gating test; a real interruption
+   suspending/restoring music+effects is device-only; MP3 jingle decode
+   is not covered by the landed CAF test; `prepareToPlay` stall is
+   covered only by the degraded watchdog.
+8. **AVPlayer blanket probe override** — pre-bind probes
+   (host_self==0) answer NO for everything; guest-implemented /
+   host-dropped selectors answer NO; class-wide on a hot NSObject surface
+   with zero gating.
+9. **Exception evidence cluster** — host-raised exceptions are fatal by
+   contract and the report may lack the NSException name/reason; the
+   guest uncaught-handler mirror is likely inert; Crittercism's first
+   exercise under the JIT is unobserved and a stall there is in the
+   no-report dead zone.
+10. **comScore host-side effects** — SecItemDelete+SecItemAdd against
+    the real HOST login keychain recurs **every cold start, forever**
+    (not "until cached" as earlier analyses said — the stubbed
+    SecKeyGetBlockSize forces re-encryption nil every launch); possible
+    first-launch keychain prompt; UNAME-01's uninitialized utsname feeds
+    `stringWithCString:` a garbage-length walk that can `abort()` (bounded
+    lottery).
+
+Cross-cutting amplifier: **gating debt.** Nine of the wave's 13
+behavior-changing fixes have no test; the deciding instruments for the
+three biggest verdicts (SAVES-01, geometry, the video chain) are built
+and never executed. Any regression in the wave's fixes ships silently.
+
+### Device-pass runbook (supersedes the 27 September handoff flow)
+
+**macOS pre-flight** (every step below is MAC-OS-VERIFY; the Linux box
+cannot run any of it):
+
+1. `git submodule update --init --recursive`, then build in the fixed
+   order: `gmake`; `gmake -C GuestMakefile generate-shims`;
+   `gmake -C GuestMakefile`; `bash GuestMakefile/pack-ramdisk.sh`;
+   `gmake package`. Re-run `pack-ramdisk.sh` after **any** guest framework
+   change (this wave changed several — the packed ramdisk must contain
+   the rebuilt frameworks). Frozen conventions unchanged:
+   `FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 GO_EASY_ON_ME=1 TARGET_CODESIGN=`.
+   Also: **rebuild the guest obj dir before packing if in doubt** — a
+   stale binary was caught in review (the built Foundation predated a
+   wave fix until a critic rebuilt it).
+2. **Manual RootFS content check** (nothing asserts it; run it):
+   `for lib in libz.1.dylib libsqlite3.dylib libobjc.A.dylib
+   libstdc++.6.dylib libSystem.B.dylib libgcc_s.1.dylib libiconv.2.dylib;
+   do test -f Resources/RootFS/usr/lib/$lib || echo MISSING: $lib; done`;
+   plus `test -f Resources/RootFS/usr/lib/dyld`, the
+   `LC32.framework/LC32` native-thread marker under
+   `System/Library/Frameworks`, and the three existence-only framework
+   bundles (CoreLocation, MobileCoreServices, CoreData).
+3. **Run the guest tests before the pass** (see the command block above)
+   — this is the first execution of the regression test, both
+   persistence probes, and the KVO chain. If `dispatch_concurrency.m`'s
+   registration line is added first, run it too.
+4. Optional audits: `gmake -C test check-mfm MFM=…`,
+   `check-uikit-legacy-canvas-fit`,
+   `check-uikit-legacy-statusbar-orientation`, `check-symbols`.
+5. Confirm the imported mfm IPA is stock (armv7-only slice, no arm64
+   shim inside the bundle).
+
+**LiveContainer import**: nightly IPA in → LiveExec32 default app →
+import the mfm IPA → configure per-app settings **before the first
+launch** (the SDK gates are once-per-launch static locals) → launch.
+
+**Launch configuration:**
+
+- `spoofSDKVersion`: **leave unclamped** (LiveContainer's 2.0* fallback).
+  An 8+/11.0 clamp = canvas mode = the declared-universal class
+  intentionally does nothing → scene-sized ~440x956 bounds, scale 3,
+  mispositioned HUD, no letterbox. This is the single most likely
+  accidental failure; detection is the geometry table below.
+- `LCOrientationLock`: off for the primary pass (on only as an A/B
+  diagnostic).
+- Classic Mode: on (the device class the Zenonia passes used).
+- Env: `LC32_DISABLE_UIKIT_COMPATIBILITY` must NOT be set;
+  `NATIVE_GUEST_THREADS` must be left unset entirely (explicit `=0`
+  silently disables native guest threads and breaks mfm's GCD contract);
+  `SIMULATOR_UDID`/`SIMULATOR_DEVICE_NAME` absent (their presence
+  triggers the silent-OpenAL fallback); on the deb route only,
+  `LC32_PRESERVE_GUEST_SDK=1` (the default; `=0` behaves like an SDK-11
+  clamp). **Never debug mfm in cooperative mode** — condition waits
+  return ETIMEDOUT and the workqueue serializes; any stall there is
+  expected mode behavior, not a game bug.
+- Forwards: `LC32_GUEST_ENV_NSUnbufferedIO=YES` on every pass (reports
+  land unbuffered); `LC32_GUEST_ENV_DYLD_PRINT_SEGMENTS=1` for one cold
+  launch only (all 26 dylibs binding), then remove. The watchdog
+  threshold is fixed at 45 s, compile-time, no env override — the ~40 s
+  intro video on a slow device could approach it (grace + background
+  stand-down mitigate; a watchdog hit with the video playing is a
+  threshold artifact, not a hang).
+
+**What to watch, in launch order**: (1) the startup line — confirm the
+build is at/beyond `6692780` plus this wave's changes; (2) all 26 dylibs
+bind, no "Library not loaded"; (3) `LC32: enabling native guest threads
+for shim frameworks` present (its absence means the RootFS is missing the
+LC32 marker or someone set NATIVE_GUEST_THREADS); (4) cold-launch
+geometry per the table below; (5) Crittercism init completing
+(NSLog-and-continue internal failures benign; expect repeated
+`LC32: cannot relay foreign-thread guest callback -[SDURLCache
+cachedResponseForRequest:]: <reason>` lines — the designed foreign-thread
+drop, note the `: <reason>` suffix when grepping; expect one
+"unimplemented Darwin syscall"-class line while the uname host ticket is
+open); (6) the first `standardUserDefaults` call
+(`-[AppDelegate detectLanguage]`) does not crash — the highest-priority
+SAVES checkpoint; (7) title scene → ~100 ms initIAP + title → **~3.5 s**
+(CCSequence, not dispatch_after) `playIntroVideo` → 2 s after the menu,
+`initGameCenter`; (8) intro video ~40 s, fullscreen, aspect-fill; **if
+the video stalls, tap first**, then debug AVFoundation; (9) the
+post-video transition — the previously-observed freeze shape: modal
+dismiss, fit restore, GameMenuScene replaceScene — if it freezes, export
+the watchdog report before touching anything; (10) menu at 2x, 4-inch
+layout branch, Game Center "Leaderboards Unavailable" alert; StoreKit
+products request always fires and fails app-side; Restore shows the
+wrong parental-controls warning (known, don't chase); (11) audio: menu
+loop, effects, the MP3 jingle — a silent game is tolerated, a missing
+jingle is an MP3 decode issue; (12) letterboxed centered presentation
+(568x320 pt, 1136x640 px at the clamped 2x), touches landing on the
+centered canvas; (13) background/foreground: the letterbox must stay
+fitted after a plain resume (the new re-arm).
+
+**Expected geometry (corrected contract):** `UIScreen.bounds`
+{0,0,320,568} portrait-ordered (tall art), `scale` 2.0 (clamped),
+`applicationFrame` {0,0,320,568} (hidden status bar), `statusBarFrame`
+{0,0,0,0} (or {0,0,320,20} if visible), **`winSize` {320,480},
+`winSizeInPixels` {640,960}, GL backing 640x960**, window frame and HUD
+forks 568-class. Contingencies (escalate, never ad-hoc patch): observed
+`renderer.bounds {0,0,320,568}` + 640x1136 backing → the
+at-or-below-canvas adoption rule starved; observed `winSize {568,320}`
+→ the old handoff model won, the adoption+freeze+turn-wait triad needs
+re-audit; 640x960 backing but HUD mispositioned → the 568 forks are
+authentic, look elsewhere first (e.g. the statusBarFrame offset).
+Canvas-mode detection: scene-sized ~440x956 bounds, unclamped scale 3,
+no letterbox → remove the spoofSDKVersion clamp and relaunch.
+
+**Expected audio:** 6 AVAudioPlayer mp3s; 168 .caf effects +
+`music_intro.mp3` + `sfx_ending.mp3` through ExtAudioFile (the landed
+decode test is CAF-only — the MP3 jingle is device-only evidence);
+`alcOpenDevice(NULL)` non-NULL; `alcGetProcAddress` for
+`alcMacOSXMixerOutputRate` returning NULL is correct (cached, never
+called); SoloAmbient/Ambient category by string value; a real
+interruption (call/Siri) suspends and restores both effects and music —
+**this is the unproven behavior the new adapter exists to deliver**.
+Tolerated failures: silent effects, missing BGM — never a crash.
+
+**Expected video:** fullscreen native aspect-fill `VideoPlayerView`
+modal, ~40 s, then `VideoCompleted` → `firstRealScene`; watchdog silent
+throughout (the cocos display link is paused, not the main queue);
+built-in exits on asset-Failed / `isPlayable` NO / raw tap.
+
+**Expected Crittercism:** init completes; `hw.machine`/`hw.cputype` show
+Mac/arm64 host answers in dead-service metadata until the sysctl/uname
+host ticket lands (cosmetic); dyld add/remove-image callbacks fire for
+all ~25 images; **a missing .plcrash file is the designed contract**
+(PLCrashReporter records, never delivers); the known
+`LC32GuestSysctlValues.h` 16.6.0/16.7.0 pair inconsistency should be
+aligned before the host ticket consumes it.
+
+**Exporting the report — whichever channel fires:**
+
+- *Guest crash report* (guest CPU faults): printed to **stderr** —
+  capture the whole launch's syslog (Console.app / `idevicesyslog` /
+  LiveContainer log collection, with NSUnbufferedIO set) and pull the
+  matching OS crash log from Settings → Privacy & Security → Analytics
+  Data.
+- *Host-bridge report* (exceptions raised in host code during a bridged
+  call): the dispatch shield converts to the reported crash channel with
+  the throw-site stack, to stderr; the final-net handler covers raises
+  outside the bridge and additionally writes the process abort reason.
+- *Watchdog freeze report* (stalled main thread): after 45 s (grace
+  re-verify, background stand-down) — stderr + abort reason. **Read it
+  with two known limitations**: a pre-runloop stall (Crittercism
+  mod_init, AppDelegate init/save unarchive) produces **no report at
+  all** — absence of a report is not proof the main thread was healthy;
+  and the snapshot prints "no live JIT for this thread" for the guest
+  main thread, so the stalled thread's own registers/PC may be missing —
+  the wait-kind list and abort reason still carry information. The
+  report's triage tree: PC in asset-load / never reached `playIntroVideo`
+  → the chain never fired (bridge/Foundation); stuck with the video
+  presented → the end notification was lost (alias machinery, host);
+  stuck at the title, video never presented → the status KVO is dead;
+  snapshot in the fit/hit-test path → geometry owner; no watchdog at all
+  → pre-runloop dead zone (LC-02), not the video chain.
+
+**Save/defaults notes:** prefer a **fresh install** — on an existing
+install the suite move silently resets `firstRun`/`firstRunCoins`/
+`IAProductPurchased-*` (record it as the known SAVES-02 reset, not a
+game bug), or wipe the app's container Preferences first. The first save
+(`GumballSaveState.dat`) is unarchived in `-init` at every subsequent
+launch — a crash there is the SAVES-01 verdict surfacing; export the
+guest crash report. On non-LiveContainer routes, saves may land in the
+process-owner's container (`/var/mobile` fallback) — verify before
+comparing.
+
+**Known-benign, do not chase as new bugs:** the SDURLCache
+foreign-thread relay drops; the "unimplemented Darwin syscall" uname
+line; ad-SDK NSLog noise and dead 2013-endpoint failures; the guest
+UUID for `uniqueIdentifier`; host-version `systemVersion`;
+`(null)` carrier label; the Game Center unavailable alert; StoreKit
+products firing and failing app-side; Restore's parental-controls
+warning; a missing Crittercism rate/message alert (known open P1 — an
+absent alert there is a defect, not a new finding); Chartboost prefetch
+slowness (correct throttling); a slow-device watchdog hit with the video
+playing.
+
+**Pass criteria** (one cold launch + one resume cycle): startup line ≥
+`6692780` + this wave; 26 dylibs bind; native-threads line present;
+geometry per the corrected table; Crittercism init completes; the intro
+plays or built-in-exits with the watchdog silent; letterboxed-centered
+2x menu with the 4-inch branch; Game Center unavailable alert; music and
+effects audible; touches land on the centered canvas; resume keeps the
+letterbox fitted; and any failure along the way produced one of the
+three exportable reports. Record observed values in this document,
+replacing the predictions above.

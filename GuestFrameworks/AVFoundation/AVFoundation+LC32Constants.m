@@ -186,7 +186,13 @@ LC32_DEFINE_AVFOUNDATION_STRING(AVFileTypeSunAU, @"public.au-audio")
 LC32_DEFINE_AVFOUNDATION_STRING(AVFileTypeWAVE, @"com.microsoft.waveform-audio")
 LC32_DEFINE_AVFOUNDATION_STRING(AVFoundationErrorDomain, @"AVFoundationErrorDomain")
 LC32_DEFINE_AVFOUNDATION_STRING(AVLayerVideoGravityResize, @"AVLayerVideoGravityResize")
-LC32_DEFINE_AVFOUNDATION_STRING(AVLayerVideoGravityResizeAspectFill, @"AVLayerVideoGravityResizeAspectFill")
+/*
+ * The host AVPlayerLayer compares video-gravity strings by value today, but
+ * a host that compared by identity would crop/scale the intro video wrong
+ * (cosmetic only, never a crash).  Bind the aspect-fill gravity to the
+ * native constant object below so identity also matches.
+ */
+LC32_DEFINE_AVFOUNDATION_HOST_STRING(AVLayerVideoGravityResizeAspectFill)
 LC32_DEFINE_AVFOUNDATION_STRING(AVLinearPCMIsNonInterleaved, @"AVLinearPCMIsNonInterleaved")
 LC32_DEFINE_AVFOUNDATION_HOST_STRING(AVMediaCharacteristicAudible)
 LC32_DEFINE_AVFOUNDATION_STRING(AVMediaCharacteristicContainsOnlyForcedSubtitles, @"public.subtitles.forced-only")
@@ -913,4 +919,11 @@ static void LC32BindAVFoundationNativeMediaCharacteristics(void) {
     LC32BindHostObjectConstant(
         (id)LC32_AVFOUNDATION_AVMediaCharacteristicVisual,
         "AVMediaCharacteristicVisual");
+    /* Strictly safer than a plain guest string: the helper falls back to the
+     * symbol spelling if the native constant is missing, which is exactly
+     * the status quo value.  Without the bind the failure mode is cosmetic
+     * only (wrong fill), observed on device as crop/scale, never a crash. */
+    LC32BindHostObjectConstant(
+        (id)LC32_AVFOUNDATION_AVLayerVideoGravityResizeAspectFill,
+        "AVLayerVideoGravityResizeAspectFill");
 }
